@@ -22,14 +22,17 @@ class BinanceWebSocketSource:
     - Kline (candlestick) data
     """
     
+    # Binance.com is blocked in the US (HTTP 451). Use Binance.US instead.
+    DEFAULT_WS_URL = "wss://stream.binance.us:9443/ws"
+
     def __init__(
         self,
         symbol: str = "btcusdt",
-        ws_url: str = "wss://stream.binance.com:9443/ws",
+        ws_url: str = DEFAULT_WS_URL,
     ):
         """
         Initialize Binance WebSocket source.
-        
+
         Args:
             symbol: Trading pair (lowercase)
             ws_url: WebSocket endpoint URL

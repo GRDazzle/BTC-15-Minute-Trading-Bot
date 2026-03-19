@@ -1,0 +1,26 @@
+{
+  "defaults": {
+    "initial_balance": 25.0,
+    "max_contracts_per_trade": 10,
+    "max_price_cents": 85,
+    "min_price_cents": 15
+  },
+  "assets": {
+    "BTC": {
+      "initial_balance": 50.0,
+      "max_contracts_per_trade": 20
+    },
+    "ETH": {
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10
+    },
+    "SOL": {
+      "initial_balance": 15.0,
+      "max_contracts_per_trade": 8
+    },
+    "XRP": {
+      "initial_balance": 15.0,
+      "max_contracts_per_trade": 8
+    }
+  }
+}

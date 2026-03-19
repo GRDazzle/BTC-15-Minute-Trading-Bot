@@ -68,6 +68,14 @@ htmlcov/
 # BOT SPECIFIC
 # =============================================================================
 
+# Historical data downloads (large CSVs, not source code)
+data/historical/
+data/account_state.json
+data/*.json
+
+# Output (trade logs, balance logs, sweep results)
+output/
+
 # Trade data (personal financial records)
 paper_trades.json
 trades.json
@@ -129,8 +137,14 @@ $RECYCLE.BIN/
 *~
 
 # =============================================================================
+# CLAUDE CODE
+# =============================================================================
+.claude/
+
+# =============================================================================
 # MISC
 # =============================================================================
+nul
 *.bak
 *.tmp
 *.temp

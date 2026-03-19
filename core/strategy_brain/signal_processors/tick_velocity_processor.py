@@ -126,7 +126,12 @@ class TickVelocityProcessor(BaseSignalProcessor):
             )
             return None
 
-        now = datetime.now(timezone.utc)
+        # Use latest tick timestamp as reference (works for both live and backtest)
+        last_tick = tick_buffer[-1]
+        last_ts = last_tick['ts']
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        now = last_ts
         curr = float(current_price)
 
         # Get historical prices from the buffer
@@ -148,11 +153,10 @@ class TickVelocityProcessor(BaseSignalProcessor):
             vel_first_30s = vel_60s - vel_30s
             acceleration = vel_30s - vel_first_30s  # positive = accelerating
 
+        v60 = f"{vel_60s*100:+.3f}%" if vel_60s is not None else "N/A"
+        v30 = f"{vel_30s*100:+.3f}%" if vel_30s is not None else "N/A"
         logger.info(
-            f"TickVelocity: curr={curr:.4f}, "
-            f"vel_60s={vel_60s*100:+.3f}% " if vel_60s else "vel_60s=N/A "
-            f"vel_30s={vel_30s*100:+.3f}% " if vel_30s else "vel_30s=N/A "
-            f"accel={acceleration*100:+.4f}%"
+            f"TickVelocity: curr={curr:.4f}, vel_60s={v60} vel_30s={v30} accel={acceleration*100:+.4f}%"
         )
 
         # Use best available velocity for signal decision
