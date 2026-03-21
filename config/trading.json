@@ -2,25 +2,73 @@
   "defaults": {
     "initial_balance": 25.0,
     "max_contracts_per_trade": 10,
-    "max_price_cents": 85,
-    "min_price_cents": 15
+    "max_price_cents": 90,
+    "min_price_cents": 55
   },
   "assets": {
     "BTC": {
       "initial_balance": 50.0,
-      "max_contracts_per_trade": 20
+      "max_contracts_per_trade": 20,
+      "max_price_cents": 90,
+      "min_price_cents": 55,
+      "ensemble": {
+        "ml_weight": 0.1,
+        "threshold": 0.61,
+        "min_dm": 2,
+        "accuracy": 83.3,
+        "net_correct": 12,
+        "traded_pct": 37.5,
+        "pnl_sweep_total_pnl": 48.4,
+        "pnl_sweep_source": "param_tune"
+      }
     },
     "ETH": {
       "initial_balance": 25.0,
-      "max_contracts_per_trade": 10
+      "max_contracts_per_trade": 10,
+      "max_price_cents": 90,
+      "min_price_cents": 55,
+      "ensemble": {
+        "ml_weight": 0.7,
+        "threshold": 0.55,
+        "min_dm": 2,
+        "accuracy": 100.0,
+        "net_correct": 9,
+        "traded_pct": 18.8,
+        "pnl_sweep_total_pnl": 20.9,
+        "pnl_sweep_source": "param_tune"
+      }
     },
     "SOL": {
-      "initial_balance": 15.0,
-      "max_contracts_per_trade": 8
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10,
+      "max_price_cents": 90,
+      "min_price_cents": 55,
+      "ensemble": {
+        "ml_weight": 0.35,
+        "threshold": 0.55,
+        "min_dm": 2,
+        "accuracy": 84.6,
+        "net_correct": 9,
+        "traded_pct": 28.9,
+        "pnl_sweep_total_pnl": 16.4,
+        "pnl_sweep_source": "param_tune"
+      }
     },
     "XRP": {
-      "initial_balance": 15.0,
-      "max_contracts_per_trade": 8
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10,
+      "max_price_cents": 90,
+      "min_price_cents": 55,
+      "ensemble": {
+        "ml_weight": 0.0,
+        "threshold": 0.55,
+        "min_dm": 2,
+        "accuracy": 93.3,
+        "net_correct": 13,
+        "traded_pct": 31.2,
+        "pnl_sweep_total_pnl": 24.2,
+        "pnl_sweep_source": "param_tune"
+      }
     }
   }
 }

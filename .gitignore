@@ -70,8 +70,15 @@ htmlcov/
 
 # Historical data downloads (large CSVs, not source code)
 data/historical/
+data/aggtrades/
+data/kalshi_polls/
 data/account_state.json
 data/*.json
+data/*.csv
+
+# ML training data CSVs
+ml/training_data/
+
 
 # Output (trade logs, balance logs, sweep results)
 output/

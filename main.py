@@ -241,6 +241,10 @@ async def main():
         a: get_asset_config(trading_config, a)["min_price_cents"]
         for a in assets
     }
+    per_asset_initial_balance = {
+        a: get_asset_config(trading_config, a)["initial_balance"]
+        for a in assets
+    }
 
     # Create execution adapter
     execution_adapter = KalshiExecutionAdapter(
@@ -250,6 +254,7 @@ async def main():
         max_contracts_per_trade=per_asset_max_contracts,
         max_price_cents=per_asset_max_price,
         min_price_cents=per_asset_min_price,
+        initial_balances=per_asset_initial_balance,
     )
 
     # Create strategy

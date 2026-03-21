@@ -2,10 +2,15 @@
 
 Maps signal direction to Kalshi side, calculates position sizing from
 sub-account balance and confidence, and handles dry-run simulation.
+
+Supports automatic max_contracts scaling: for every doubling of the
+sub-account balance relative to its initial balance, max_contracts
+increases by 50%.
 """
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -74,6 +79,7 @@ class KalshiExecutionAdapter:
         max_contracts_per_trade: dict[str, int] | int = 10,
         max_price_cents: dict[str, int] | int = 85,
         min_price_cents: dict[str, int] | int = 15,
+        initial_balances: dict[str, float] | None = None,
     ):
         self.client = client
         self.account_manager = account_manager
@@ -94,9 +100,40 @@ class KalshiExecutionAdapter:
             if isinstance(min_price_cents, dict)
             else {"_default": min_price_cents}
         )
+        # Per-asset initial balances for contract scaling
+        self._initial_balances: dict[str, float] = initial_balances or {}
 
     def _get_max_contracts(self, asset: str) -> int:
-        return self._max_contracts.get(asset, self._max_contracts.get("_default", self.DEFAULT_MAX_CONTRACTS))
+        """Get max contracts for an asset, scaled up by 50% per balance doubling."""
+        base = self._max_contracts.get(asset, self._max_contracts.get("_default", self.DEFAULT_MAX_CONTRACTS))
+        initial = self._initial_balances.get(asset, 0.0)
+        if initial <= 0:
+            return base
+
+        # Look up current sub-account balance
+        series = series_for_asset(asset)
+        try:
+            acct = self.account_manager.get_account(series)
+        except KeyError:
+            return base
+
+        current = acct.balance_dollars
+        if current <= initial:
+            return base
+
+        # Number of complete doublings: floor(log2(current / initial))
+        doublings = int(math.log2(current / initial))
+        if doublings < 1:
+            return base
+
+        # Scale up by 50% per doubling (compounding: 1.5^doublings)
+        scaled = int(base * (1.5 ** doublings))
+        if scaled != base:
+            logger.info(
+                "[kalshi-exec] %s max_contracts scaled: %d -> %d (%d doublings, $%.2f / $%.2f)",
+                asset, base, scaled, doublings, current, initial,
+            )
+        return scaled
 
     def _get_max_price(self, asset: str) -> int:
         return self._max_price.get(asset, self._max_price.get("_default", self.DEFAULT_MAX_PRICE))

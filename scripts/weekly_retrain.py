@@ -1,0 +1,209 @@
+"""
+Weekly retrain pipeline.
+
+Chains the full ML pipeline: download -> generate features -> train -> sweep.
+Designed to be run by Windows Task Scheduler, cron, or manually.
+The live bot hot-reloads new models/config at the next window boundary.
+
+Usage:
+    python scripts/weekly_retrain.py
+    python scripts/weekly_retrain.py --assets BTC,ETH --days 14
+    python scripts/weekly_retrain.py --skip-download
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOGS_DIR / "weekly_retrain.log"
+
+
+def log(msg: str) -> None:
+    """Print and append to log file."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"[{ts}] {msg}"
+    print(line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def run_step(name: str, cmd: list[str]) -> bool:
+    """Run a subprocess step. Returns True on success."""
+    log(f"--- {name} ---")
+    log(f"  cmd: {' '.join(cmd)}")
+    start = time.time()
+
+    result = subprocess.run(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+    )
+
+    elapsed = time.time() - start
+    if result.returncode == 0:
+        log(f"  OK ({elapsed:.0f}s)")
+        # Print last 5 lines of stdout for context
+        lines = result.stdout.strip().splitlines()
+        for line in lines[-5:]:
+            log(f"  > {line}")
+        return True
+    else:
+        log(f"  FAILED (exit {result.returncode}, {elapsed:.0f}s)")
+        # Print stderr for debugging
+        for line in result.stderr.strip().splitlines()[-10:]:
+            log(f"  ! {line}")
+        return False
+
+
+KALSHI_POLLS_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
+
+
+def purge_kalshi_polls(max_age_days: int = 14) -> None:
+    """Delete Kalshi polling JSONL files older than max_age_days.
+
+    File names encode the date: YYYY-MM-DD_HHMM_UTC.jsonl
+    """
+    if not KALSHI_POLLS_DIR.exists():
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    cutoff_date = cutoff.date()
+    removed = 0
+
+    for series_dir in KALSHI_POLLS_DIR.iterdir():
+        if not series_dir.is_dir():
+            continue
+        for jsonl_file in series_dir.glob("*.jsonl"):
+            # Parse date from filename: "2026-03-13_0400_UTC.jsonl"
+            try:
+                file_date_str = jsonl_file.name[:10]  # "2026-03-13"
+                file_date = datetime.strptime(file_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            if file_date < cutoff_date:
+                os.remove(jsonl_file)
+                removed += 1
+
+    if removed:
+        log(f"Purged {removed} Kalshi polling files older than {max_age_days} days")
+    else:
+        log(f"No Kalshi polling files older than {max_age_days} days to purge")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Weekly ML retrain pipeline")
+    parser.add_argument(
+        "--assets",
+        type=str,
+        default="BTC,ETH,SOL,XRP",
+        help="Comma-separated assets (default: BTC,ETH,SOL,XRP)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Days of data to use (default: 30)",
+    )
+    parser.add_argument(
+        "--min-dm",
+        type=int,
+        default=2,
+        help="Min decision minute for training/sweep (default: 2)",
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Skip data download (use existing data)",
+    )
+    args = parser.parse_args()
+
+    python = sys.executable
+    assets = args.assets
+    days = str(args.days)
+    min_dm = str(args.min_dm)
+
+    log("=" * 60)
+    log(f"Weekly retrain: assets={assets} days={days} min_dm={min_dm}")
+    log("=" * 60)
+
+    pipeline_start = time.time()
+    failed = []
+
+    # Step 1: Download fresh tick data
+    if not args.skip_download:
+        ok = run_step("Download aggTrades", [
+            python, "scripts/download_binance_aggtrades.py",
+            "--assets", assets,
+            "--days", days,
+        ])
+        if not ok:
+            failed.append("download")
+            log("WARNING: Download failed, continuing with existing data")
+
+    # Step 2: Generate training features
+    ok = run_step("Generate training data", [
+        python, "scripts/generate_training_data.py",
+        "--asset", assets,
+        "--days", days,
+    ])
+    if not ok:
+        failed.append("generate")
+        log("ABORT: Cannot train without training data")
+        return 1
+
+    # Step 3: Train XGBoost models
+    ok = run_step("Train XGBoost models", [
+        python, "scripts/train_xgb.py",
+        "--asset", assets,
+        "--min-dm", min_dm,
+    ])
+    if not ok:
+        failed.append("train")
+        log("ABORT: Cannot sweep without trained models")
+        return 1
+
+    # Step 4: Ensemble sweep (writes config/trading.json)
+    ok = run_step("Ensemble sweep", [
+        python, "scripts/ensemble_sweep.py",
+        "--asset", assets,
+        "--days", days,
+        "--min-dm", min_dm,
+    ])
+    if not ok:
+        failed.append("sweep")
+        log("WARNING: Sweep failed, models are updated but config unchanged")
+
+    # Step 5: Purge old Kalshi polling data (>14 days)
+    purge_kalshi_polls(max_age_days=14)
+
+    # Step 6: PnL sweep (if Kalshi data available)
+    ok = run_step("PnL sweep", [
+        python, "scripts/pnl_sweep.py",
+        "--asset", assets,
+        "--min-dm", min_dm,
+    ])
+    if not ok:
+        log("WARNING: PnL sweep failed or insufficient Kalshi data")
+
+    total = time.time() - pipeline_start
+    log("=" * 60)
+    if failed:
+        log(f"Done with warnings ({total:.0f}s). Failed steps: {failed}")
+    else:
+        log(f"Done ({total:.0f}s). All steps succeeded.")
+    log("Live bot will pick up new params at next window boundary.")
+    log("=" * 60)
+
+    return 1 if "generate" in failed or "train" in failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
