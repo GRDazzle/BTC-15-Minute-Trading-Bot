@@ -94,6 +94,7 @@ class AssetState:
 
     price_history: deque = field(default_factory=lambda: deque(maxlen=200))
     tick_buffer: deque = field(default_factory=lambda: deque(maxlen=300))
+    raw_tick_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
     current_price: Optional[Decimal] = None
 
     current_window_id: Optional[str] = None
@@ -188,6 +189,7 @@ class KalshiMultiAssetStrategy:
         model_dir: Optional[Path] = None,
         ml_confidence_threshold: float = 0.60,
         warmup_seconds: int = 90,
+        tune_delay_seconds: int = 7200,
     ):
         self.client = client
         self.account_manager = account_manager
@@ -196,6 +198,7 @@ class KalshiMultiAssetStrategy:
         self.dry_run = dry_run
         self.settlement_delay_seconds = settlement_delay_seconds
         self.warmup_seconds = warmup_seconds
+        self._tune_delay_seconds = tune_delay_seconds
         self._started_at: Optional[datetime] = None
 
         self.fusion_engine = SignalFusionEngine()
@@ -617,15 +620,19 @@ class KalshiMultiAssetStrategy:
     async def _param_tuning_loop(self):
         """Run param_tune.py every 2 hours to adapt ensemble parameters.
 
-        First run after 2 hours (needs signal data to accumulate).
+        Initial delay is configurable via tune_delay_seconds (default 7200s).
+        Set to 0 to run immediately on startup (e.g. when signal data already exists).
         On failure, logs warning and continues (non-fatal).
         """
         tune_interval = 7200  # 2 hours
         tune_script = Path(__file__).resolve().parent.parent / "scripts" / "param_tune.py"
 
-        # Wait 2 hours before first run
-        logger.info("[param-tune] First run in %ds", tune_interval)
-        await asyncio.sleep(tune_interval)
+        # Configurable initial delay before first run
+        if self._tune_delay_seconds > 0:
+            logger.info("[param-tune] First run in %ds", self._tune_delay_seconds)
+            await asyncio.sleep(self._tune_delay_seconds)
+        else:
+            logger.info("[param-tune] Running immediately (tune_delay=0)")
 
         while self._running:
             try:
@@ -684,7 +691,12 @@ class KalshiMultiAssetStrategy:
     # -- Binance streaming -----------------------------------------------------
 
     async def _binance_stream(self, asset: str, state: AssetState):
-        """Stream Binance ticker data and populate price_history/tick_buffer."""
+        """Stream Binance ticker + aggTrade data via combined stream.
+
+        Ticker updates populate price_history and tick_buffer (existing).
+        aggTrade updates populate raw_tick_buffer with qty/is_buyer fields
+        needed for volume and aggressor-ratio ML features.
+        """
         ws = state.ws_source
 
         async def _on_price(ticker: dict[str, Any]):
@@ -694,12 +706,21 @@ class KalshiMultiAssetStrategy:
             state.price_history.append(price)
             state.tick_buffer.append({"ts": ts, "price": float(price)})
 
+        async def _on_trade(trade: dict[str, Any]):
+            state.raw_tick_buffer.append({
+                "ts": trade["timestamp"],
+                "price": float(trade["price"]),
+                "qty": float(trade["quantity"]),
+                "is_buyer": trade["side"] == "buy",
+            })
+
         ws.on_price_update = _on_price
+        ws.on_trade = _on_trade
 
         while self._running:
             try:
-                logger.info("[ws-%s] Connecting to Binance...", asset)
-                await ws.stream_ticker()
+                logger.info("[ws-%s] Connecting to Binance combined stream...", asset)
+                await ws.stream_combined()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1045,6 +1066,10 @@ class KalshiMultiAssetStrategy:
         meta: dict[str, Any] = {
             "tick_buffer": list(state.tick_buffer),
         }
+
+        # Pass raw_tick_buffer (with qty/is_buyer) for ML volume features
+        if state.raw_tick_buffer:
+            meta["raw_tick_buffer"] = list(state.raw_tick_buffer)
 
         # Spot price for divergence processor
         if state.current_price is not None:

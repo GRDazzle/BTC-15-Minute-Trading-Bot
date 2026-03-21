@@ -193,6 +193,18 @@ def main():
     if not ok:
         log("WARNING: PnL sweep failed or insufficient Kalshi data")
 
+    # Step 7: Rolling param tune using last 12h of live signal data
+    # This overrides ensemble weights with the most recent live performance,
+    # so the bot uses up-to-date parameters immediately after retrain.
+    ok = run_step("Param tune (12h rolling)", [
+        python, "scripts/param_tune.py",
+        "--hours", "12",
+        "--min-dm", min_dm,
+    ])
+    if not ok:
+        log("WARNING: Param tune failed (no signal_log.csv yet?). "
+            "Using PnL sweep params instead.")
+
     total = time.time() - pipeline_start
     log("=" * 60)
     if failed:

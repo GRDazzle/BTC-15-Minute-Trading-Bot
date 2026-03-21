@@ -110,6 +110,13 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_CONFIG_PATH),
         help="Path to trading config JSON file",
     )
+    parser.add_argument(
+        "--tune-delay",
+        type=int,
+        default=7200,
+        help="Seconds before first param tune run (default: 7200 = 2h). "
+             "Set to 0 to tune immediately on startup.",
+    )
     return parser.parse_args()
 
 
@@ -264,6 +271,7 @@ async def main():
         execution_adapter=execution_adapter,
         assets=assets,
         dry_run=dry_run,
+        tune_delay_seconds=args.tune_delay,
     )
 
     # Graceful shutdown handler

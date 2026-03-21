@@ -1,7 +1,7 @@
 """
 Feature extraction for XGBoost meta-model.
 
-Extracts 29 features from tick_buffer, price_history, timestamp, and
+Extracts 31 features from tick_buffer, price_history, timestamp, and
 rule-based processor outputs. Used by both training data generation and
 live/backtest ML inference.
 """
@@ -16,7 +16,7 @@ from core.strategy_brain.signal_processors.base_processor import (
 
 # Ordered feature names (must match training and inference)
 FEATURE_NAMES = [
-    # Tick-derived (14)
+    # Tick-derived (16)
     "velocity_10s",
     "velocity_30s",
     "velocity_60s",
@@ -28,6 +28,8 @@ FEATURE_NAMES = [
     "volume_acceleration",
     "buy_volume_ratio_30s",
     "buy_volume_ratio_60s",
+    "aggressor_ratio_30s",
+    "aggressor_ratio_60s",
     "tick_intensity_30s",
     "large_trade_count",
     "vwap_deviation",
@@ -232,6 +234,12 @@ def extract_features(
     buy_60 = sum(t.get("qty", 0) for t in ticks_60 if t.get("is_buyer", False))
     features["buy_volume_ratio_30s"] = buy_30 / vol_30 if vol_30 > 0 else 0.5
     features["buy_volume_ratio_60s"] = buy_60 / vol_60 if vol_60 > 0 else 0.5
+
+    # Aggressor ratio (trade-count-based order flow)
+    buy_count_30 = sum(1 for t in ticks_30 if t.get("is_buyer", False))
+    buy_count_60 = sum(1 for t in ticks_60 if t.get("is_buyer", False))
+    features["aggressor_ratio_30s"] = buy_count_30 / len(ticks_30) if ticks_30 else 0.5
+    features["aggressor_ratio_60s"] = buy_count_60 / len(ticks_60) if ticks_60 else 0.5
 
     # Tick intensity (number of ticks in last 30s)
     features["tick_intensity_30s"] = float(len(ticks_30))

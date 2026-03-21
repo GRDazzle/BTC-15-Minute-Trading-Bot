@@ -250,6 +250,65 @@ class BinanceWebSocketSource:
         finally:
             await self.disconnect()
     
+    async def stream_combined(self) -> None:
+        """Stream ticker + aggTrade on a single combined WebSocket connection.
+
+        Routes ticker messages to on_price_update and aggTrade messages
+        to on_trade callback.  Uses the Binance combined streams endpoint.
+        """
+        streams = f"{self.symbol}@ticker/{self.symbol}@aggTrade"
+        url = f"wss://stream.binance.us:9443/stream?streams={streams}"
+
+        try:
+            self.websocket = await websockets.connect(url)
+            self._is_running = True
+            logger.info(f"Connected to Binance combined stream: {streams}")
+
+            while self._is_running and self.websocket:
+                message = await self.websocket.recv()
+                wrapper = json.loads(message)
+                stream_name = wrapper.get("stream", "")
+                data = wrapper.get("data", {})
+
+                if stream_name.endswith("@ticker"):
+                    ticker = {
+                        "timestamp": datetime.fromtimestamp(data["E"] / 1000),
+                        "symbol": data["s"],
+                        "price": Decimal(data["c"]),
+                        "open": Decimal(data["o"]),
+                        "high": Decimal(data["h"]),
+                        "low": Decimal(data["l"]),
+                        "volume": Decimal(data["v"]),
+                        "quote_volume": Decimal(data["q"]),
+                        "price_change": Decimal(data["p"]),
+                        "price_change_percent": Decimal(data["P"]),
+                    }
+                    self._last_price = ticker["price"]
+                    self._last_update = ticker["timestamp"]
+
+                    if self.on_price_update:
+                        await self.on_price_update(ticker)
+
+                elif stream_name.endswith("@aggTrade"):
+                    trade = {
+                        "timestamp": datetime.fromtimestamp(data["T"] / 1000),
+                        "price": Decimal(data["p"]),
+                        "quantity": Decimal(data["q"]),
+                        "side": "sell" if data["m"] else "buy",
+                    }
+                    self._last_price = trade["price"]
+                    self._last_update = trade["timestamp"]
+
+                    if self.on_trade:
+                        await self.on_trade(trade)
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("Binance combined stream connection closed")
+        except Exception as e:
+            logger.error(f"Error in Binance combined stream: {e}")
+        finally:
+            await self.disconnect()
+
     @property
     def last_price(self) -> Optional[Decimal]:
         """Get last received price."""
