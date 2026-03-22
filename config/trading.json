@@ -12,30 +12,28 @@
       "max_price_cents": 90,
       "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.6,
-        "threshold": 0.56,
+        "ml_weight": 0.35,
+        "threshold": 0.6,
         "min_dm": 2,
-        "accuracy": 88.9,
-        "net_correct": 7,
-        "traded_pct": 19.1,
-        "pnl_sweep_total_pnl": 35.8,
-        "pnl_sweep_source": "param_tune"
+        "accuracy": 88.4,
+        "net_correct": 477,
+        "traded_pct": 92.8,
+        "pnl_sweep_source": "ensemble_sweep_v2"
       }
     },
     "ETH": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
       "max_price_cents": 90,
-      "min_price_cents": 55,
+      "min_price_cents": 50,
       "ensemble": {
-        "ml_weight": 0.1,
-        "threshold": 0.63,
+        "ml_weight": 0.4,
+        "threshold": 0.62,
         "min_dm": 2,
-        "accuracy": 90.9,
-        "net_correct": 9,
-        "traded_pct": 23.4,
-        "pnl_sweep_total_pnl": 17.5,
-        "pnl_sweep_source": "param_tune"
+        "accuracy": 91.2,
+        "net_correct": 514,
+        "traded_pct": 93.3,
+        "pnl_sweep_source": "ensemble_sweep_v2"
       }
     },
     "SOL": {
@@ -45,13 +43,12 @@
       "min_price_cents": 55,
       "ensemble": {
         "ml_weight": 0.35,
-        "threshold": 0.57,
+        "threshold": 0.6,
         "min_dm": 2,
-        "accuracy": 91.7,
-        "net_correct": 10,
-        "traded_pct": 27.3,
-        "pnl_sweep_total_pnl": 19.2,
-        "pnl_sweep_source": "param_tune"
+        "accuracy": 88.0,
+        "net_correct": 443,
+        "traded_pct": 87.1,
+        "pnl_sweep_source": "ensemble_sweep_v2"
       }
     },
     "XRP": {
@@ -60,14 +57,13 @@
       "max_price_cents": 90,
       "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.0,
-        "threshold": 0.55,
+        "ml_weight": 0.35,
+        "threshold": 0.6,
         "min_dm": 2,
-        "accuracy": 93.3,
-        "net_correct": 13,
-        "traded_pct": 31.9,
-        "pnl_sweep_total_pnl": 30.9,
-        "pnl_sweep_source": "param_tune"
+        "accuracy": 91.3,
+        "net_correct": 514,
+        "traded_pct": 93.0,
+        "pnl_sweep_source": "ensemble_sweep_v2"
       }
     }
   }

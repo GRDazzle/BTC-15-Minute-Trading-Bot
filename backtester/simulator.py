@@ -655,7 +655,11 @@ class BacktestSimulator:
         price_history: deque,
         metadata: dict,
     ) -> float:
-        """Run fusion processors and return P(BULLISH) in [0, 1]."""
+        """Run fusion processors and return P(BULLISH) in [0, 1].
+
+        Uses contribution-based probability: the net directional contribution
+        is normalized by the total weight capacity of the fusion engine.
+        """
         signals = []
         for p in self.processors:
             try:
@@ -672,9 +676,14 @@ class BacktestSimulator:
         if not fused or not fused.is_actionable:
             return 0.5
 
-        direction_str = str(fused.direction).upper()
-        if "BULLISH" in direction_str:
-            return fused.confidence
-        elif "BEARISH" in direction_str:
-            return 1.0 - fused.confidence
-        return 0.5
+        # Contribution-based probability mapping
+        bullish_c = fused.metadata["bullish_contrib"]
+        bearish_c = fused.metadata["bearish_contrib"]
+        net = bullish_c - bearish_c
+
+        weight_sum = sum(self.fusion_engine.weights.values())
+        if weight_sum < 0.001:
+            return 0.5
+
+        fusion_p = 0.5 + (net / weight_sum) * 0.5
+        return max(0.01, min(0.99, fusion_p))

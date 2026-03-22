@@ -35,9 +35,10 @@ KALSHI_DATA_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
 CONFIG_PATH = PROJECT_ROOT / "config" / "trading.json"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "param_tune"
 
-# Sweep grid (matches pnl_sweep.py)
+# Sweep grid
 ML_WEIGHTS = [round(w * 0.05, 2) for w in range(21)]  # 0.0, 0.05, ..., 1.0
 THRESHOLDS = [round(0.55 + i * 0.01, 2) for i in range(16)]  # 0.55 to 0.70
+MIN_PRICES = [45, 48, 50, 53, 55]  # min_price_cents sweep
 
 KALSHI_FEE_CENTS = 2
 MIN_WINDOWS_DEFAULT = 20
@@ -101,10 +102,11 @@ def load_signal_checkpoints(
 
             result[asset][window_id].append(checkpoint)
 
-    # Sort checkpoints by dm within each window
+    # Sort checkpoints by dm descending (highest dm first = earliest in window,
+    # matching live bot which processes time-forward from window start)
     for asset_windows in result.values():
         for window_id in asset_windows:
-            asset_windows[window_id].sort(key=lambda c: c["dm"])
+            asset_windows[window_id].sort(key=lambda c: -c["dm"])
 
     print(f"Loaded {kept_rows}/{total_rows} signal rows (last {hours}h)")
     print(f"Assets: {sorted(result.keys())}")
@@ -197,12 +199,14 @@ def calculate_contracts(
     confidence: float,
     max_contracts: int,
 ) -> int:
-    """Determine how many contracts to buy (matches pnl_sweep.py)."""
+    """Determine how many contracts to buy (matches live execution)."""
     cost_per = (price_cents + KALSHI_FEE_CENTS) / 100.0
     if cost_per <= 0 or balance <= 0:
         return 0
     max_by_balance = int(balance / cost_per)
-    scale = min(1.0, confidence)
+    # Live: scale = confidence * (score / 100), and score = confidence * 100
+    # So scale = confidence * confidence = confidence^2
+    scale = min(1.0, confidence * confidence)
     desired = max(1, int(max_by_balance * scale))
     return min(desired, max_contracts)
 
@@ -212,17 +216,20 @@ def sweep_combo_pnl(
     threshold: float,
     enriched_windows: list[dict],
     config: dict,
+    min_dm: int = 2,
+    min_price_override: int | None = None,
 ) -> dict:
     """Evaluate one (ml_weight, threshold) combo by dollar PnL.
 
-    For each window, find first checkpoint crossing the threshold,
-    then simulate PnL using Kalshi prices from signal_log.
+    For each window, scan checkpoints (dm descending = time-forward) and
+    take the first checkpoint where threshold crosses AND price is in
+    Kelly range — matching the live bot's behavior.
     """
     fusion_weight = 1.0 - ml_weight
     balance = config["initial_balance"]
     max_contracts = config["max_contracts_per_trade"]
     max_price = config["max_price_cents"]
-    min_price = config["min_price_cents"]
+    min_price = min_price_override if min_price_override is not None else config["min_price_cents"]
 
     total_windows = len(enriched_windows)
     traded_count = 0
@@ -240,34 +247,44 @@ def sweep_combo_pnl(
         confidence = 0.0
         entry_price = 0
         side = ""
+        had_signal = False
 
         for cp in win["checkpoints"]:
+            if cp["dm"] < min_dm:
+                continue
+
             ensemble_p = ml_weight * cp["ml_p"] + fusion_weight * cp["fusion_p"]
 
             if ensemble_p >= threshold:
+                p = cp["yes_ask"]
+                if p <= 0 or p >= 100:
+                    had_signal = True
+                    continue
+                if p < min_price or p > max_price:
+                    had_signal = True
+                    continue
                 predicted = "BULLISH"
                 confidence = ensemble_p
                 side = "yes"
-                entry_price = cp["yes_ask"]
+                entry_price = p
                 break
             elif ensemble_p <= 1.0 - threshold:
+                p = cp["no_ask"]
+                if p <= 0 or p >= 100:
+                    had_signal = True
+                    continue
+                if p < min_price or p > max_price:
+                    had_signal = True
+                    continue
                 predicted = "BEARISH"
                 confidence = 1.0 - ensemble_p
                 side = "no"
-                entry_price = cp["no_ask"]
+                entry_price = p
                 break
 
         if predicted is None:
-            continue
-
-        # Validate entry price
-        if entry_price <= 0 or entry_price >= 100:
-            skipped_no_ask += 1
-            continue
-
-        # Kelly band filter
-        if entry_price > max_price or entry_price < min_price:
-            skipped_kelly += 1
+            if had_signal:
+                skipped_kelly += 1
             continue
 
         # Position sizing
@@ -298,6 +315,7 @@ def sweep_combo_pnl(
     return {
         "ml_weight": ml_weight,
         "threshold": threshold,
+        "min_price_cents": min_price,
         "total_pnl": round(total_pnl, 4),
         "win_rate": round(win_rate, 1),
         "traded_count": traded_count,
@@ -354,8 +372,8 @@ def write_tune_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
             "pnl_sweep_total_pnl": best["total_pnl"],
             "pnl_sweep_source": "param_tune",
         }
-        # Entry bands (min/max_price_cents) are set manually in trading.json
-        # and validated against real Kalshi PnL data -- do NOT overwrite them here.
+        # Update min_price_cents from sweep (max_price_cents stays fixed)
+        config["assets"][asset]["min_price_cents"] = best["min_price_cents"]
 
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
@@ -366,14 +384,13 @@ def write_tune_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
     print(f"  Params written to {CONFIG_PATH}")
     print(f"{'='*70}")
     print(f"  {'Asset':<5} | {'ML_W':>5} | {'Thresh':>6} | {'PnL':>9} | "
-          f"{'WinRate':>7} | {'Trades':>6} | {'Kelly':>10}")
-    print(f"  {'-'*65}")
+          f"{'WinRate':>7} | {'Trades':>6} | {'MinP':>5}")
+    print(f"  {'-'*60}")
     for asset, best in best_per_asset.items():
         pnl_sign = "+" if best["total_pnl"] >= 0 else ""
-        min_p, max_p = half_kelly_band(best["win_rate"])
         print(f"  {asset:<5} | {best['ml_weight']:5.2f} | {best['threshold']:6.2f} | "
               f"{pnl_sign}${best['total_pnl']:7.2f} | {best['win_rate']:6.1f}% | "
-              f"{best['traded_count']:6d} | {min_p:2d}c-{max_p:2d}c")
+              f"{best['traded_count']:6d} | {best['min_price_cents']:3d}c")
     print()
 
 
@@ -398,16 +415,20 @@ def run_asset(
     # Load config for position sizing
     config = load_config(asset)
 
-    total_combos = len(ML_WEIGHTS) * len(THRESHOLDS)
+    total_combos = len(ML_WEIGHTS) * len(THRESHOLDS) * len(MIN_PRICES)
     print(f"  Sweeping {total_combos} combos over {len(enriched_windows)} windows...")
 
-    # Phase 3: Sweep
+    # Phase 3: Sweep (ml_weight x threshold x min_price)
     t0 = time.time()
     all_results = []
     for ml_w in ML_WEIGHTS:
         for thresh in THRESHOLDS:
-            result = sweep_combo_pnl(ml_w, thresh, enriched_windows, config)
-            all_results.append(result)
+            for min_p in MIN_PRICES:
+                result = sweep_combo_pnl(
+                    ml_w, thresh, enriched_windows, config,
+                    min_dm=min_dm, min_price_override=min_p,
+                )
+                all_results.append(result)
     t_sweep = time.time() - t0
     print(f"  Sweep completed in {t_sweep:.2f}s")
 
@@ -425,7 +446,7 @@ def run_asset(
     # Print top 10
     header = (
         f"  {'Rank':>4} | {'PnL':>9} | {'WinRate':>7} | "
-        f"{'Traded':>6} | {'ML_W':>5} | {'Thresh':>6}"
+        f"{'Traded':>6} | {'ML_W':>5} | {'Thresh':>6} | {'MinP':>4}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -434,14 +455,15 @@ def run_asset(
         print(
             f"  {i:4d} | {pnl_sign}${r['total_pnl']:7.2f} | "
             f"{r['win_rate']:6.1f}% | {r['traded_count']:6d} | "
-            f"{r['ml_weight']:5.2f} | {r['threshold']:6.2f}"
+            f"{r['ml_weight']:5.2f} | {r['threshold']:6.2f} | "
+            f"{r['min_price_cents']:3d}c"
         )
 
     # Export CSV
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     csv_path = OUTPUT_DIR / f"{asset}_param_tune.csv"
     fieldnames = [
-        "ml_weight", "threshold", "total_pnl", "win_rate",
+        "ml_weight", "threshold", "min_price_cents", "total_pnl", "win_rate",
         "traded_count", "traded_pct", "win_count", "loss_count",
         "avg_pnl_per_trade", "final_balance", "total_windows",
         "skipped_kelly", "skipped_no_ask",
@@ -453,18 +475,19 @@ def run_asset(
             writer.writerow(r)
     print(f"  Exported to {csv_path}")
 
-    # Select best: highest total_pnl, tie-break on lower threshold
+    # Select best: highest total_pnl, tie-break on higher min_price (more conservative)
     if not qualifying:
         return None
 
     top_pnl = qualifying[0]["total_pnl"]
     tolerance = max(0.50, abs(top_pnl) * 0.05)
     near_top = [r for r in qualifying if r["total_pnl"] >= top_pnl - tolerance]
-    near_top.sort(key=lambda r: (r["threshold"], -r["total_pnl"]))
+    near_top.sort(key=lambda r: (-r["min_price_cents"], r["threshold"], -r["total_pnl"]))
     best = near_top[0]
 
     print(f"\n  Selected: ml_weight={best['ml_weight']:.2f} "
-          f"threshold={best['threshold']:.2f} PnL=${best['total_pnl']:+.2f} "
+          f"threshold={best['threshold']:.2f} min_price={best['min_price_cents']}c "
+          f"PnL=${best['total_pnl']:+.2f} "
           f"win_rate={best['win_rate']:.1f}% ({best['traded_count']} trades)")
     return best
 

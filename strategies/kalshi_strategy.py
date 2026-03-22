@@ -641,6 +641,7 @@ class KalshiMultiAssetStrategy:
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, str(tune_script),
                     "--hours", "12",
+                    "--min-dm", "2",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -777,14 +778,14 @@ class KalshiMultiAssetStrategy:
                             "[window-loop] Waiting for gate (%.0fs to go)", secs_to_gate,
                         )
 
-                # Sleep until next check (every 10 seconds)
-                await asyncio.sleep(10)
+                # Sleep until next check (every 2 seconds)
+                await asyncio.sleep(2)
 
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("[window-loop] Error")
-                await asyncio.sleep(10)
+                await asyncio.sleep(2)
 
     async def _process_asset_window(
         self, asset: str, state: AssetState, window_id: str,
@@ -1024,7 +1025,14 @@ class KalshiMultiAssetStrategy:
         return signals
 
     def _get_fusion_probability(self, state: AssetState, metadata: dict) -> float:
-        """Run fusion processors and return P(BULLISH) in [0, 1]."""
+        """Run fusion processors and return P(BULLISH) in [0, 1].
+
+        Uses contribution-based probability: the net directional contribution
+        is normalized by the total weight capacity of the fusion engine.
+        This produces values proportional to signal strength instead of the
+        old avg_confidence mapping which jumped from 0.50 to 0.63+ on any
+        bullish signal (causing 98% bullish bias).
+        """
         price = state.current_price
         history = list(state.price_history)
 
@@ -1054,12 +1062,23 @@ class KalshiMultiAssetStrategy:
         if not fused or not fused.is_actionable:
             return 0.5
 
-        direction_str = str(fused.direction).upper()
-        if "BULLISH" in direction_str:
-            return fused.confidence
-        elif "BEARISH" in direction_str:
-            return 1.0 - fused.confidence
-        return 0.5
+        # Contribution-based probability mapping
+        bullish_c = fused.metadata["bullish_contrib"]
+        bearish_c = fused.metadata["bearish_contrib"]
+        net = bullish_c - bearish_c
+
+        # Normalize by sum of fusion weights (theoretical max contribution
+        # if all processors fired at max strength & confidence = 1.0)
+        weight_sum = sum(self.fusion_engine.weights.values())
+        if weight_sum < 0.001:
+            return 0.5
+
+        # P(BULLISH) = 0.5 + net/weight_sum * 0.5
+        # Two WEAK bullish signals -> ~0.56  (was 0.63)
+        # Two MODERATE bullish     -> ~0.64  (was 0.65)
+        # Strong multi-processor   -> ~0.80+ (was 0.73)
+        fusion_p = 0.5 + (net / weight_sum) * 0.5
+        return max(0.01, min(0.99, fusion_p))
 
     def _build_metadata(self, state: AssetState) -> dict[str, Any]:
         """Build metadata dict consumed by signal processors."""

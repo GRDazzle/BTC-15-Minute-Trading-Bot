@@ -103,12 +103,14 @@ def calculate_contracts(
     confidence: float,
     max_contracts: int,
 ) -> int:
-    """Determine how many contracts to buy (matches backtest_kalshi_pnl.py)."""
+    """Determine how many contracts to buy (matches live execution)."""
     cost_per = (price_cents + KALSHI_FEE_CENTS) / 100.0
     if cost_per <= 0 or balance <= 0:
         return 0
     max_by_balance = int(balance / cost_per)
-    scale = min(1.0, confidence)
+    # Live: scale = confidence * (score / 100), and score = confidence * 100
+    # So scale = confidence * confidence = confidence^2
+    scale = min(1.0, confidence * confidence)
     desired = max(1, int(max_by_balance * scale))
     return min(desired, max_contracts)
 
@@ -121,8 +123,9 @@ def sweep_combo_pnl(
 ) -> dict:
     """Evaluate one (ml_weight, threshold) combo by dollar PnL.
 
-    For each window, find the first checkpoint crossing the threshold
-    (first-signal-wins), then simulate PnL using Kalshi prices.
+    For each window, scan checkpoints time-forward and take the first
+    checkpoint where threshold crosses AND price is in Kelly range —
+    matching the live bot's behavior.
     """
     fusion_weight = 1.0 - ml_weight
     balance = config["initial_balance"]
@@ -146,6 +149,7 @@ def sweep_combo_pnl(
         confidence = 0.0
         entry_price = 0
         side = ""
+        had_signal = False
 
         for cp in win["checkpoints"]:
             if cp.get("kalshi") is None:
@@ -154,29 +158,35 @@ def sweep_combo_pnl(
             ensemble_p = ml_weight * cp["ml_p"] + fusion_weight * cp["fusion_p"]
 
             if ensemble_p >= threshold:
+                p = cp["kalshi"]["yes_ask"]
+                if p <= 0 or p >= 100:
+                    had_signal = True
+                    continue
+                if p < min_price or p > max_price:
+                    had_signal = True
+                    continue
                 predicted = "BULLISH"
                 confidence = ensemble_p
                 side = "yes"
-                entry_price = cp["kalshi"]["yes_ask"]
+                entry_price = p
                 break
             elif ensemble_p <= 1.0 - threshold:
+                p = cp["kalshi"]["no_ask"]
+                if p <= 0 or p >= 100:
+                    had_signal = True
+                    continue
+                if p < min_price or p > max_price:
+                    had_signal = True
+                    continue
                 predicted = "BEARISH"
                 confidence = 1.0 - ensemble_p
                 side = "no"
-                entry_price = cp["kalshi"]["no_ask"]
+                entry_price = p
                 break
 
         if predicted is None:
-            continue
-
-        # Validate entry price
-        if entry_price <= 0 or entry_price >= 100:
-            skipped_no_ask += 1
-            continue
-
-        # Kelly band filter
-        if entry_price > max_price or entry_price < min_price:
-            skipped_kelly += 1
+            if had_signal:
+                skipped_kelly += 1
             continue
 
         # Position sizing
