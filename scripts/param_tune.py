@@ -358,9 +358,26 @@ def write_tune_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
     else:
         config = {"defaults": {}, "assets": {}}
 
+    skipped = []
     for asset, best in best_per_asset.items():
         if asset not in config.get("assets", {}):
             config.setdefault("assets", {})[asset] = {}
+
+        # Guard: don't overwrite pnl_sweep results with worse param_tune results.
+        # pnl_sweep runs on 9+ days of Kalshi data; param_tune uses 12h of
+        # signal_log which may be too small or from an unrepresentative period.
+        existing = config["assets"][asset].get("ensemble", {})
+        existing_pnl = existing.get("pnl_sweep_total_pnl", 0)
+        existing_source = existing.get("pnl_sweep_source", "")
+        new_pnl = best["total_pnl"]
+        new_trades = best["traded_count"]
+
+        if existing_source == "pnl_sweep" and (new_pnl < existing_pnl or new_trades < 10):
+            skipped.append(
+                f"  {asset}: SKIPPED (param_tune PnL=${new_pnl:+.2f}/{new_trades}trades "
+                f"< existing ${existing_pnl:+.2f} from {existing_source})"
+            )
+            continue
 
         config["assets"][asset]["ensemble"] = {
             "ml_weight": best["ml_weight"],
@@ -374,6 +391,11 @@ def write_tune_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
         }
         # Update min_price_cents from sweep (max_price_cents stays fixed)
         config["assets"][asset]["min_price_cents"] = best["min_price_cents"]
+
+    if skipped:
+        print(f"\n  Config guard -- kept existing params:")
+        for s in skipped:
+            print(s)
 
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:

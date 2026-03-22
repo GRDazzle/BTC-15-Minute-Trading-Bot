@@ -155,6 +155,7 @@ def generate_tick_windows(
     ticks: list[Tick],
     warmup_minutes: int = 5,
     min_warmup_ticks: int = 100,
+    min_during_ticks: int = 10,
 ) -> list[TickWindow]:
     """Group ticks into 15-minute windows aligned to :00/:15/:30/:45.
 
@@ -168,6 +169,7 @@ def generate_tick_windows(
         ticks: Sorted list of ticks
         warmup_minutes: Minutes of warmup data at start of window (default 5)
         min_warmup_ticks: Minimum ticks needed in warmup period
+        min_during_ticks: Minimum ticks needed in decision zone (default 10)
     """
     if not ticks:
         return []
@@ -221,7 +223,7 @@ def generate_tick_windows(
             scan_idx += 1
 
         # Need sufficient data
-        if len(warmup_ticks) < min_warmup_ticks or len(during_ticks) < 10:
+        if len(warmup_ticks) < min_warmup_ticks or len(during_ticks) < min_during_ticks:
             boundary += timedelta(minutes=15)
             continue
 

@@ -63,6 +63,42 @@ def run_step(name: str, cmd: list[str]) -> bool:
 
 
 KALSHI_POLLS_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
+AGGTRADES_DIR = PROJECT_ROOT / "data" / "aggtrades"
+
+
+def purge_old_aggtrades(max_age_days: int = 14) -> None:
+    """Delete aggTrades CSV files older than max_age_days.
+
+    File names encode the date: {SYMBOL}-aggTrades-YYYY-MM-DD.csv
+    """
+    if not AGGTRADES_DIR.exists():
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    cutoff_date = cutoff.date()
+    removed = 0
+
+    for asset_dir in AGGTRADES_DIR.iterdir():
+        if not asset_dir.is_dir():
+            continue
+        for csv_file in asset_dir.glob("*-aggTrades-*.csv"):
+            # Parse date from filename: "BTCUSDT-aggTrades-2026-03-13.csv"
+            try:
+                # Date is always the last 10 chars before ".csv"
+                stem = csv_file.stem  # "BTCUSDT-aggTrades-2026-03-13"
+                file_date_str = stem[-10:]  # "2026-03-13"
+                file_date = datetime.strptime(file_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            if file_date < cutoff_date:
+                os.remove(csv_file)
+                removed += 1
+
+    if removed:
+        log(f"Purged {removed} aggTrades files older than {max_age_days} days")
+    else:
+        log(f"No aggTrades files older than {max_age_days} days to purge")
 
 
 def purge_kalshi_polls(max_age_days: int = 14) -> None:
@@ -181,8 +217,17 @@ def main():
         failed.append("sweep")
         log("WARNING: Sweep failed, models are updated but config unchanged")
 
-    # Step 5: Purge old Kalshi polling data (>14 days)
+    # Step 5: Purge old data (>14 days)
     purge_kalshi_polls(max_age_days=14)
+    purge_old_aggtrades(max_age_days=14)
+
+    # Step 5.5: Fetch recent aggTrades via REST (fills gap if bot was offline)
+    ok = run_step("Fetch recent aggTrades (REST)", [
+        python, "scripts/fetch_recent_aggtrades.py",
+        "--assets", assets, "--hours", "48",
+    ])
+    if not ok:
+        log("WARNING: REST aggTrades fetch failed, continuing with existing data")
 
     # Step 6: PnL sweep (if Kalshi data available)
     ok = run_step("PnL sweep", [

@@ -76,6 +76,80 @@ class KalshiDataWriter:
             f.write(line + "\n")
 
 
+AGGTRADES_DIR = Path("data/aggtrades")
+
+
+class BinanceTradeWriter:
+    """Write live aggTrade data to daily CSVs (same format as Data Vision).
+
+    File layout: data/aggtrades/{ASSET}/{SYMBOL}-aggTrades-{YYYY-MM-DD}.csv
+    Columns (no header): agg_trade_id, price, qty, first_id, last_id,
+                          timestamp_us, is_buyer_maker, best_price_match
+    Timestamps stored in microseconds to match Data Vision format.
+    """
+
+    def __init__(self, data_dir: Path = AGGTRADES_DIR):
+        self._data_dir = data_dir
+        # Open file handles: "ASSET/YYYY-MM-DD" -> (file_handle, csv_writer)
+        self._files: dict[str, tuple] = {}
+        self._current_date: str = ""
+
+    def write(self, asset: str, symbol: str, trade: dict[str, Any]) -> None:
+        """Append one aggTrade to the appropriate daily CSV.
+
+        Args:
+            asset: Asset name (e.g. "BTC")
+            symbol: Binance symbol (e.g. "btcusdt")
+            trade: Trade dict from WS with raw fields (agg_trade_id, etc.)
+        """
+        ts_ms = trade.get("timestamp_ms")
+        if ts_ms is None:
+            return  # Missing raw fields, skip
+
+        trade_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        date_str = trade_dt.strftime("%Y-%m-%d")
+
+        # Close old handles on day rollover
+        if date_str != self._current_date:
+            self._close_all()
+            self._current_date = date_str
+
+        key = f"{asset}/{date_str}"
+        if key not in self._files:
+            asset_dir = self._data_dir / asset.upper()
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = asset_dir / f"{symbol.upper()}-aggTrades-{date_str}.csv"
+            fh = open(csv_path, "a", newline="", encoding="utf-8")
+            self._files[key] = (fh, csv.writer(fh))
+
+        _, writer = self._files[key]
+        ts_us = ts_ms * 1000  # ms -> us
+        writer.writerow([
+            trade["agg_trade_id"],
+            trade["price"],
+            trade["quantity"],
+            trade["first_id"],
+            trade["last_id"],
+            ts_us,
+            trade["is_buyer_maker"],
+            trade.get("best_price_match", True),
+        ])
+        # Flush after each write; volume is low (~30 trades/hr on Binance.US)
+        self._files[key][0].flush()
+
+    def _close_all(self) -> None:
+        for fh, _ in self._files.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._files.clear()
+
+    def close(self) -> None:
+        """Close all open file handles."""
+        self._close_all()
+
+
 # Binance symbols for each supported asset
 BINANCE_SYMBOLS: dict[str, str] = {
     "BTC": "btcusdt",
@@ -206,6 +280,9 @@ class KalshiMultiAssetStrategy:
         self._tasks: list[asyncio.Task] = []
         self._ml_confidence_threshold = ml_confidence_threshold
         self._csv_lock = threading.Lock()
+
+        # Live aggTrade writer (persists WS data for backtesting/tuning)
+        self._trade_writer = BinanceTradeWriter()
 
         # Resolve model directory for ML processors
         if model_dir is None:
@@ -618,14 +695,16 @@ class KalshiMultiAssetStrategy:
     # -- rolling parameter tuning ------------------------------------------------
 
     async def _param_tuning_loop(self):
-        """Run param_tune.py every 2 hours to adapt ensemble parameters.
+        """Run pnl_sweep.py every 2 hours to adapt ensemble parameters.
 
+        Uses the backtester + real Kalshi polling data (not signal_log) so
+        fusion_p is always recomputed with the latest code.
         Initial delay is configurable via tune_delay_seconds (default 7200s).
-        Set to 0 to run immediately on startup (e.g. when signal data already exists).
         On failure, logs warning and continues (non-fatal).
         """
         tune_interval = 7200  # 2 hours
-        tune_script = Path(__file__).resolve().parent.parent / "scripts" / "param_tune.py"
+        tune_script = Path(__file__).resolve().parent.parent / "scripts" / "pnl_sweep.py"
+        assets_arg = ",".join(self.assets)
 
         # Configurable initial delay before first run
         if self._tune_delay_seconds > 0:
@@ -636,12 +715,13 @@ class KalshiMultiAssetStrategy:
 
         while self._running:
             try:
-                logger.info("[param-tune] Starting rolling parameter tune...")
+                logger.info("[param-tune] Starting PnL sweep (Kalshi data)...")
 
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, str(tune_script),
-                    "--hours", "12",
+                    "--asset", assets_arg,
                     "--min-dm", "2",
+                    "--hours", "12",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -676,6 +756,9 @@ class KalshiMultiAssetStrategy:
         """Graceful shutdown."""
         logger.info("Stopping Kalshi multi-asset strategy...")
         self._running = False
+
+        # Close aggTrade writer
+        self._trade_writer.close()
 
         # Disconnect all WS sources
         for state in self.states.values():
@@ -714,6 +797,8 @@ class KalshiMultiAssetStrategy:
                 "qty": float(trade["quantity"]),
                 "is_buyer": trade["side"] == "buy",
             })
+            # Persist to daily CSV for backtesting/tuning
+            self._trade_writer.write(asset, state.binance_symbol, trade)
 
         ws.on_price_update = _on_price
         ws.on_trade = _on_trade

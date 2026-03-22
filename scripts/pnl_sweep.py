@@ -10,6 +10,11 @@ Three phases:
   2. Enrich checkpoints with Kalshi bid/ask prices and outcomes
   3. Sweep weight/threshold combos scoring by total PnL
 
+Optimizations:
+  - Pre-filters Binance windows to only those with Kalshi data (~5x Phase 1 speedup)
+  - Limits aggTrades loading to Kalshi date range (less I/O)
+  - Parallel asset processing via ProcessPoolExecutor (~4x on multi-core)
+
 Requires Kalshi polling data in data/kalshi_polls/KX{ASSET}15M/.
 
 Usage:
@@ -21,6 +26,7 @@ import csv
 import json
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -231,8 +237,16 @@ def sweep_combo_pnl(
     }
 
 
-def run_asset(asset: str, min_dm: int) -> dict | None:
+def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
     """Run PnL sweep for one asset. Returns best combo dict or None."""
+    # Configure loguru for worker processes (suppress DEBUG noise)
+    logger.remove()
+    log_path = PROJECT_ROOT / "logs" / f"pnl_sweep_{asset}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(str(log_path), mode="w", level="INFO",
+               format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}")
+    logger.add(sys.stderr, level="WARNING")
+
     from core.strategy_brain.signal_processors.ml_processor import MLProcessor
 
     config = load_config(asset)
@@ -244,23 +258,55 @@ def run_asset(asset: str, min_dm: int) -> dict | None:
         print(f"No Kalshi data for {asset}. Start the bot to collect data.")
         return None
 
-    # Check minimum days of data
+    # Filter to recent N hours if specified
+    from datetime import datetime as dt, date, timedelta as td, timezone
+    if hours is not None:
+        cutoff = dt.now(tz=timezone.utc) - td(hours=hours)
+        before = len(kalshi_windows)
+        kalshi_windows = {k: v for k, v in kalshi_windows.items() if k >= cutoff}
+        print(f"  Filtered to last {hours}h: {before} -> {len(kalshi_windows)} Kalshi windows")
+        if not kalshi_windows:
+            print(f"No Kalshi data in the last {hours}h for {asset}.")
+            return None
+
+    # Check minimum windows (relax MIN_KALSHI_DAYS when --hours is set)
     kalshi_dates = sorted(set(ct.date() for ct in kalshi_windows.keys()))
-    if len(kalshi_dates) < MIN_KALSHI_DAYS:
+    if hours is None and len(kalshi_dates) < MIN_KALSHI_DAYS:
         print(f"Only {len(kalshi_dates)} days of Kalshi data for {asset} "
               f"(need {MIN_KALSHI_DAYS}). Skipping PnL sweep.")
         return None
+    min_windows = 20
+    if len(kalshi_windows) < min_windows:
+        print(f"Only {len(kalshi_windows)} Kalshi windows for {asset} "
+              f"(need {min_windows}). Skipping PnL sweep.")
+        return None
 
-    # Load tick data
-    print(f"Loading aggTrades data for {asset}...")
-    ticks = load_aggtrades_multi(DATA_DIR, asset)
+    # Determine Kalshi date range to limit aggTrades loading
+    kalshi_min_date = kalshi_dates[0]
+    today = date.today()
+    days_back = (today - kalshi_min_date).days + 2  # +2 for buffer (warmup ticks)
+
+    # Load tick data (limited to Kalshi date coverage)
+    print(f"Loading aggTrades data for {asset} (last {days_back} days to match Kalshi)...")
+    ticks = load_aggtrades_multi(DATA_DIR, asset, days=days_back)
     if not ticks:
         print(f"No aggTrades data for {asset}. Run download_binance_aggtrades.py first.")
         return None
 
-    windows = generate_tick_windows(ticks)
+    # Lower tick thresholds for Binance.US data (~30 trades/hr vs thousands on .com)
+    windows = generate_tick_windows(ticks, min_warmup_ticks=1, min_during_ticks=1)
     if not windows:
         print(f"No valid tick windows for {asset}")
+        return None
+
+    # Pre-filter: only keep windows whose window_end matches a Kalshi close_time
+    kalshi_close_times = set(kalshi_windows.keys())
+    all_window_count = len(windows)
+    windows = [w for w in windows if w.window_end in kalshi_close_times]
+    print(f"  Pre-filtered: {all_window_count} -> {len(windows)} windows (Kalshi-matched only)")
+
+    if not windows:
+        print(f"No overlapping windows between Binance and Kalshi data for {asset}")
         return None
 
     fg_scores = load_fear_greed(FG_CSV) if FG_CSV.exists() else {}
@@ -281,7 +327,7 @@ def run_asset(asset: str, min_dm: int) -> dict | None:
     print(f"\n{'='*70}")
     print(f"  PnL Sweep: {asset}")
     print(f"  {total_combos} combos ({len(ML_WEIGHTS)} weights x {len(THRESHOLDS)} thresholds)")
-    print(f"  {len(windows)} Binance windows, {len(kalshi_windows)} Kalshi windows")
+    print(f"  {len(windows)} windows (Kalshi-matched), {len(kalshi_windows)} Kalshi windows")
     print(f"  Kalshi dates: {kalshi_dates[0]} -> {kalshi_dates[-1]} ({len(kalshi_dates)} days)")
     print(f"  Config: balance=${config['initial_balance']:.2f} "
           f"max_contracts={config['max_contracts_per_trade']} "
@@ -514,15 +560,41 @@ def main():
         help="Asset(s) to sweep, comma-separated (e.g. BTC or BTC,ETH,SOL,XRP)",
     )
     parser.add_argument("--min-dm", type=int, default=2, help="Minimum decision minute (default: 2)")
+    parser.add_argument("--hours", type=int, default=None,
+                        help="Only use the most recent N hours of Kalshi data (default: all)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Run assets sequentially instead of in parallel")
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     best_per_asset: dict[str, dict] = {}
 
-    for asset in assets:
-        best = run_asset(asset, args.min_dm)
-        if best is not None:
-            best_per_asset[asset] = best
+    if len(assets) > 1 and not args.sequential:
+        # Parallel execution: one process per asset
+        print(f"\nRunning {len(assets)} assets in parallel...")
+        if args.hours:
+            print(f"  Using last {args.hours}h of Kalshi data")
+        t_total = time.time()
+        with ProcessPoolExecutor(max_workers=len(assets)) as executor:
+            futures = {
+                executor.submit(run_asset, asset, args.min_dm, args.hours): asset
+                for asset in assets
+            }
+            for future in as_completed(futures):
+                asset = futures[future]
+                try:
+                    best = future.result()
+                    if best is not None:
+                        best_per_asset[asset] = best
+                except Exception as e:
+                    print(f"\n[ERROR] {asset} sweep failed: {e}")
+        print(f"\nAll assets completed in {time.time() - t_total:.1f}s")
+    else:
+        # Sequential execution (single asset or --sequential flag)
+        for asset in assets:
+            best = run_asset(asset, args.min_dm, args.hours)
+            if best is not None:
+                best_per_asset[asset] = best
 
     # Write config only if we have results
     if best_per_asset:

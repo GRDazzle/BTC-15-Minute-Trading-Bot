@@ -295,6 +295,13 @@ class BinanceWebSocketSource:
                         "price": Decimal(data["p"]),
                         "quantity": Decimal(data["q"]),
                         "side": "sell" if data["m"] else "buy",
+                        # Raw fields for CSV persistence
+                        "agg_trade_id": data["a"],
+                        "first_id": data["f"],
+                        "last_id": data["l"],
+                        "timestamp_ms": data["T"],
+                        "is_buyer_maker": data["m"],
+                        "best_price_match": data.get("M", True),
                     }
                     self._last_price = trade["price"]
                     self._last_update = trade["timestamp"]

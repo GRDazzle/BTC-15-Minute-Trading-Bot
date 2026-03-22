@@ -5,22 +5,29 @@ Binary options trading bot for Kalshi's 15-minute crypto price prediction market
 ## Pipeline Overview
 
 ```
-1. Download Data        download_binance_aggtrades.py
+1. Download Data        download_binance_aggtrades.py  (Data Vision, 30 days)
          |
          v
-2. Generate Features    generate_training_data.py
+2. Generate Features    generate_training_data.py      (31 features)
          |
          v
-3. Train Model          train_xgb.py
+3. Train Model          train_xgb.py                   (per-asset XGBoost)
          |
          v
 4. Backtest             backtest_ticks.py
          |
          v
-5. Ensemble Sweep       ensemble_sweep.py  -->  config/trading.json
+5. Ensemble Sweep       ensemble_sweep.py  -->  config/trading.json  (accuracy-based)
          |
          v
-6. Run Bot              main.py (dry-run or live)
+6. PnL Sweep            pnl_sweep.py  -->  config/trading.json  (dollar PnL-based)
+         |
+         v
+7. Run Bot              main.py (dry-run or live)
+         |
+         +--> Live data collection (Binance WS + Kalshi polls)
+         +--> Rolling PnL tune every 2h (auto, uses live data)
+         +--> Hot-reload config at each window boundary
 ```
 
 ---
@@ -55,7 +62,7 @@ Each CSV contains: `agg_trade_id, price, qty, first_id, last_id, timestamp, is_b
 
 ## Step 2: Generate Training Data
 
-Replays tick windows and extracts a 29-feature vector at every 10-second checkpoint within each 15-minute window (decision minutes 2-9), yielding ~60x more training samples than window-level data.
+Replays tick windows and extracts a 31-feature vector at every 10-second checkpoint within each 15-minute window (decision minutes 2-9), yielding ~60x more training samples than window-level data.
 
 ```bash
 python scripts/generate_training_data.py --asset BTC --days 30
@@ -70,17 +77,17 @@ python scripts/generate_training_data.py --asset BTC,ETH,SOL,XRP --days 30 --min
 
 **Output:** `ml/training_data/{ASSET}_features.csv`
 
-Each row is one checkpoint with 29 features (tick velocities, volume, RSI, Bollinger, etc.), a BULLISH/BEARISH label, and metadata (window_id, decision_minute).
+Each row is one checkpoint with 31 features, a BULLISH/BEARISH label, and metadata (window_id, decision_minute).
 
-### Feature Set (29 features)
+### Feature Set (31 features)
 
 | Category | Features |
 |----------|----------|
-| Tick-derived (14) | velocity_10s/30s/60s, acceleration, volatility_30s/60s, volume_30s/60s, volume_acceleration, buy_volume_ratio_30s/60s, tick_intensity_30s, large_trade_count, vwap_deviation |
+| Tick-derived (16) | velocity_5s/10s/30s/60s, acceleration, volatility_30s/60s, volume_30s/60s, volume_acceleration, buy_volume_ratio_30s/60s, tick_intensity_30s, large_trade_count, vwap_deviation, aggressor_ratio_30s/60s |
 | Price-history (4) | ma_deviation_20, momentum_5/10, price_range_20 |
 | Time (3) | hour_sin, hour_cos, minute_in_window |
 | Rule-based (2) | tickvel_direction, tickvel_confidence |
-| Additional (6) | rsi_14, bollinger_pos, velocity_5s, return_skew_60s, price_vs_open, btc_velocity_60s |
+| Additional (6) | rsi_14, bollinger_pos, return_skew_60s, price_vs_open, btc_velocity_60s |
 
 ---
 
@@ -143,7 +150,7 @@ python scripts/backtest_ticks.py --asset BTC --days 30 --ensemble --ml-weight 0.
 
 ## Step 5: Ensemble Sweep
 
-Finds the optimal ML/fusion weight and confidence threshold per asset. Pre-computes ML and fusion probabilities in one backtest pass, then sweeps 126 combos (21 weights x 6 thresholds) as pure arithmetic.
+Finds the optimal ML/fusion weight and confidence threshold per asset by **accuracy** (correct predictions). Uses Data Vision tick data (high volume, from Binance.com). Does NOT use Kalshi price data.
 
 ```bash
 python scripts/ensemble_sweep.py --asset BTC,ETH,SOL,XRP --days 30 --min-dm 2
@@ -165,15 +172,6 @@ python scripts/ensemble_sweep.py --asset BTC,ETH,SOL,XRP --days 30 --min-dm 2
 
 Results are ranked by `net_correct = correct_predictions - wrong_predictions`, which balances accuracy and trade volume.
 
-### Sweep Results (30 days, min_dm=2)
-
-| Asset | ml_weight | threshold | accuracy | net_correct | traded % |
-|-------|-----------|-----------|----------|-------------|----------|
-| BTC | 0.70 | 0.70 | 85.12% | 1921 | 95.1% |
-| ETH | 0.65 | 0.70 | 89.26% | 2119 | 93.8% |
-| SOL | 0.55 | 0.70 | 85.61% | 1911 | 93.3% |
-| XRP | 0.65 | 0.70 | 88.00% | 2095 | 95.8% |
-
 ### Half-Kelly Entry Bands
 
 Derived from backtested accuracy. Trades outside these bands have negative expected value after fees.
@@ -181,20 +179,47 @@ Derived from backtested accuracy. Trades outside these bands have negative expec
 - `max_price = floor(accuracy * 100) - 2c fee` (max YES price)
 - `min_price = ceil((1 - accuracy) * 100) + 2c fee + 1c` (min NO price)
 
-| Asset | Accuracy | YES max | NO min |
-|-------|----------|---------|--------|
-| BTC | 85.12% | 83c | 18c |
-| ETH | 89.26% | 87c | 14c |
-| SOL | 85.61% | 83c | 18c |
-| XRP | 88.00% | 86c | 15c |
+---
+
+## Step 6: PnL Sweep
+
+Finds the optimal ensemble params by **dollar PnL** using real Kalshi bid/ask prices and settlement outcomes. This step runs after the ensemble sweep and **overwrites** its config with PnL-optimized params.
+
+```bash
+python scripts/pnl_sweep.py --asset BTC,ETH,SOL,XRP --min-dm 2
+python scripts/pnl_sweep.py --asset BTC --hours 12 --sequential
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--asset` | *required* | Comma-separated assets |
+| `--min-dm` | 2 | Min decision minute |
+| `--hours` | all | Only use last N hours of Kalshi data |
+| `--sequential` | off | Run assets one at a time (vs parallel) |
+
+**Data sources:**
+- **Binance ticks:** `data/aggtrades/` (live WS data + REST-fetched data from Binance.US)
+- **Kalshi prices:** `data/kalshi_polls/` (bid/ask snapshots + settlement outcomes)
+
+**Sweep grid:** 336 combos (21 weights x 16 thresholds, finer resolution than accuracy sweep)
+
+**Output:**
+- `output/pnl_sweep/{ASSET}_pnl_sweep.csv` -- all combos with PnL metrics
+- `config/trading.json` -- auto-updated with PnL-optimized params
 
 ---
 
-## Step 6: Run the Bot
+## Step 7: Run the Bot
 
 ```bash
 # Dry run (default) -- all 4 assets
 python main.py --assets BTC,ETH,SOL,XRP
+
+# Dry run with immediate param tune
+python main.py --assets BTC,ETH,SOL,XRP --tune-delay 0
+
+# Dry run, delay first tune by 2 hours (default)
+python main.py --assets BTC,ETH,SOL,XRP --tune-delay 7200
 
 # Dry run with debug logging
 python main.py --assets BTC,ETH,SOL,XRP --log-level DEBUG
@@ -210,13 +235,14 @@ REAL_TRADE=TRUE python main.py --assets BTC,ETH,SOL,XRP
 | `--log-level` | INFO | DEBUG, INFO, WARNING, ERROR |
 | `--state-file` | data/account_state.json | Sub-account state persistence |
 | `--config` | config/trading.json | Per-asset trading config |
+| `--tune-delay` | 7200 | Seconds before first param tune (0 = immediate) |
 
 **Safety:** `DRY_RUN=True` by default. The bot fetches real Kalshi market data and outcomes but simulates orders locally. Set `REAL_TRADE=TRUE` to place real orders.
 
 ### What Happens at Runtime
 
 1. **Warmup (90s):** Collects Binance WebSocket tick data, no trades fired
-2. **Window loop (every 10s):** For each 15-min window, at decision minutes 4-9:
+2. **Window loop (every 2s):** For each 15-min window, at decision minutes 2-9:
    - Fetches current Kalshi market prices (yes_ask, no_ask)
    - Runs ensemble blend: `ensemble_p = ml_weight * ML_p + (1 - ml_weight) * fusion_p`
    - If `ensemble_p >= threshold` -> BULLISH (buy YES)
@@ -225,6 +251,11 @@ REAL_TRADE=TRUE python main.py --assets BTC,ETH,SOL,XRP
    - Sizes position by confidence and sub-account balance
 3. **Settlement loop:** Polls Kalshi outcomes after window close, credits/debits sub-accounts
 4. **Reconciliation (every 30m):** Compares local sub-account totals vs Kalshi API balance
+5. **Live data collection (continuous):**
+   - **Kalshi poller (every 5s):** Writes bid/ask snapshots + outcomes to `data/kalshi_polls/`
+   - **Binance trade writer:** Persists every WS aggTrade to `data/aggtrades/` daily CSVs
+6. **Rolling param tune (every 2h):** Runs `pnl_sweep.py --hours 12` using collected live data, updates `config/trading.json`
+7. **Hot-reload:** At each window boundary, checks config/model file timestamps and reloads if changed (no restart needed)
 
 ### Output Files
 
@@ -233,7 +264,29 @@ REAL_TRADE=TRUE python main.py --assets BTC,ETH,SOL,XRP
 | `logs/trading.log` | Full debug log (10 MB rotation, 7-day retention) |
 | `output/trades.csv` | Trade audit trail with entry, settlement, PnL |
 | `output/balance.csv` | Balance snapshots at startup, trades, settlements |
+| `output/signal_log.csv` | Every ensemble decision (ml_p, fusion_p, action, etc.) |
 | `data/account_state.json` | Persisted sub-account state (survives restarts) |
+| `data/aggtrades/{ASSET}/` | Live Binance aggTrade CSVs (auto-pruned >14 days) |
+| `data/kalshi_polls/` | Kalshi bid/ask polls + outcomes (auto-pruned >14 days) |
+
+---
+
+## Fetch Recent aggTrades (REST)
+
+Fills the gap between Data Vision daily CSVs (always 1+ day stale) and live data. Useful when the bot was offline or for bootstrapping. Uses Binance.US REST API.
+
+```bash
+python scripts/fetch_recent_aggtrades.py --assets BTC,ETH,SOL,XRP --hours 48
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--assets` | *required* | Comma-separated assets |
+| `--hours` | 12 | Hours of history to fetch |
+
+Resumes from the last timestamp in existing CSVs (handles the Binance.com vs Binance.US ID space difference). Writes to the same directory and format as Data Vision and live WS data.
+
+**Note:** When the bot is running, the live Binance trade writer handles this automatically. The REST fetcher is primarily for `weekly_retrain.py` (Step 5.5) and manual catch-up.
 
 ---
 
@@ -242,7 +295,7 @@ REAL_TRADE=TRUE python main.py --assets BTC,ETH,SOL,XRP
 The full pipeline can be run on a schedule (weekly or as needed) to retrain models on the latest data. The live bot hot-reloads new parameters at the next 15-minute window boundary -- no restart required.
 
 ```bash
-# Full retrain (download + generate + train + sweep)
+# Full retrain (download + generate + train + sweep + pnl_sweep)
 python scripts/weekly_retrain.py
 
 # Skip download (reuse existing data)
@@ -258,6 +311,17 @@ python scripts/weekly_retrain.py --assets BTC,ETH --days 14
 | `--days` | 30 | Days of data to use |
 | `--min-dm` | 2 | Min decision minute for training/sweep |
 | `--skip-download` | off | Skip data download step |
+
+### Retrain Pipeline Steps
+
+1. **Download aggTrades** -- Data Vision daily CSVs (30 days, Binance.com)
+2. **Generate training data** -- Replay tick windows into 31-feature CSVs
+3. **Train XGBoost** -- Per-asset models with walk-forward validation
+4. **Ensemble sweep** -- 126 combos, accuracy-based (Data Vision ticks only)
+5. **Purge old data** -- Kalshi polls + aggTrade CSVs older than 14 days
+6. **Fetch recent aggTrades (REST)** -- Binance.US, 48h (fills gap if bot was offline)
+7. **PnL sweep** -- 336 combos, dollar PnL-based (Binance.US ticks + Kalshi prices)
+8. **Param tune** -- 12h rolling tune from signal_log.csv
 
 **Hot-reload:** The live bot checks `config/trading.json` and `models/*.json` modification times at each window boundary. When files change, it reloads ensemble weights, price bands, and ML models without stopping. Logs all reloads to `logs/trading.log`.
 
@@ -332,7 +396,7 @@ Unregister-ScheduledTask -TaskName "Kalshi Weekly Retrain" -Confirm:$false
 
 ### config/trading.json
 
-Per-asset trading parameters. Updated automatically by `ensemble_sweep.py`.
+Per-asset trading parameters. Updated automatically by `ensemble_sweep.py` and `pnl_sweep.py`.
 
 ```json
 {
@@ -349,10 +413,11 @@ Per-asset trading parameters. Updated automatically by `ensemble_sweep.py`.
       "max_price_cents": 83,
       "min_price_cents": 18,
       "ensemble": {
-        "ml_weight": 0.70,
-        "threshold": 0.70,
+        "ml_weight": 0.45,
+        "threshold": 0.58,
         "min_dm": 2,
-        "accuracy": 85.12
+        "accuracy": 91.7,
+        "pnl_sweep_source": "pnl_sweep"
       }
     }
   }
@@ -368,6 +433,7 @@ Per-asset trading parameters. Updated automatically by `ensemble_sweep.py`.
 | `ensemble.ml_weight` | ML probability weight in blend (0.0-1.0) |
 | `ensemble.threshold` | Min blended probability to trigger trade |
 | `ensemble.min_dm` | Min decision minute for trading |
+| `ensemble.pnl_sweep_source` | Indicates params came from PnL sweep (vs accuracy sweep) |
 
 ---
 
@@ -394,32 +460,41 @@ Per-asset trading parameters. Updated automatically by `ensemble_sweep.py`.
 |   |   +-- kalshi_price_processor.py    Kalshi price as signal
 |   +-- fusion_engine/
 |       +-- signal_fusion.py             Multi-signal fusion
+|-- data_sources/binance/
+|   +-- websocket.py                     Binance WS (ticker + aggTrade combined stream)
 |-- ml/
-|   |-- features.py                     29-feature extraction (shared)
+|   |-- features.py                     31-feature extraction (shared)
 |   +-- training_data/                  Generated feature CSVs
 |-- models/                             Saved XGBoost models per asset
 |-- backtester/
 |   |-- simulator.py                    Backtest engine
 |   |-- data_loader.py                  Kline data loader
 |   |-- data_loader_ticks.py            AggTrades data loader
+|   |-- data_loader_kalshi.py           Kalshi JSONL data loader
 |   +-- reporter.py                     Results formatting + CSV export
 |-- scripts/
-|   |-- download_binance_aggtrades.py   Step 1: fetch tick data
+|   |-- download_binance_aggtrades.py   Step 1: fetch Data Vision tick data
+|   |-- fetch_recent_aggtrades.py       REST fetcher for Binance.US aggTrades
 |   |-- generate_training_data.py       Step 2: extract features
 |   |-- train_xgb.py                    Step 3: train models
-|   |-- backtest_ticks.py              Step 4: backtest
-|   |-- ensemble_sweep.py              Step 5: optimize weights
-|   |-- weekly_retrain.py              Automated retrain pipeline
-|   +-- param_sweep.py                 Signal parameter sweep (720 combos)
+|   |-- backtest_ticks.py               Step 4: backtest
+|   |-- ensemble_sweep.py               Step 5: accuracy-based weight sweep
+|   |-- pnl_sweep.py                    Step 6: PnL-based weight sweep
+|   |-- weekly_retrain.py               Automated retrain pipeline
+|   |-- param_tune.py                   Rolling param tune from signal log
+|   +-- param_sweep.py                  Signal parameter sweep (720 combos)
 |-- data/
-|   |-- aggtrades/                     Downloaded Binance tick CSVs
-|   +-- account_state.json             Dry-run sub-account state
+|   |-- aggtrades/                      Binance tick CSVs (Data Vision + live WS + REST)
+|   |-- kalshi_polls/                   Kalshi bid/ask polls + outcomes (JSONL)
+|   +-- account_state.json              Dry-run sub-account state
 |-- output/
-|   |-- trades.csv                     Live/dry-run trade log
-|   |-- balance.csv                    Balance snapshots
-|   |-- backtest_ticks/                Backtest results
-|   +-- ensemble_sweep/                Sweep results
-+-- logs/                              Runtime logs
+|   |-- trades.csv                      Live/dry-run trade log
+|   |-- balance.csv                     Balance snapshots
+|   |-- signal_log.csv                  Ensemble decisions log
+|   |-- backtest_ticks/                 Backtest results
+|   |-- ensemble_sweep/                 Accuracy sweep results
+|   +-- pnl_sweep/                      PnL sweep results
++-- logs/                               Runtime logs
 ```
 
 ---
@@ -439,16 +514,19 @@ python scripts/generate_training_data.py --asset BTC,ETH,SOL,XRP --days 30
 # 4. Train models
 python scripts/train_xgb.py --asset BTC,ETH,SOL,XRP --min-dm 2
 
-# 5. Sweep for optimal ensemble weights (writes config/trading.json)
+# 5. Accuracy sweep (writes config/trading.json)
 python scripts/ensemble_sweep.py --asset BTC,ETH,SOL,XRP --days 30 --min-dm 2
 
-# 6. Verify with backtest
+# 6. PnL sweep (overwrites with PnL-optimized params, needs Kalshi data)
+python scripts/pnl_sweep.py --asset BTC,ETH,SOL,XRP --min-dm 2
+
+# 7. Verify with backtest
 python scripts/backtest_ticks.py --asset BTC,ETH,SOL,XRP --ensemble --ml-weight 0.70 --ens-threshold 0.70 --min-dm 2
 
-# 7. Dry run
+# 8. Dry run (collects Kalshi + Binance data for future PnL sweeps)
 python main.py --assets BTC,ETH,SOL,XRP
 
-# 8. Go live (when ready)
+# 9. Go live (when ready)
 REAL_TRADE=TRUE python main.py --assets BTC,ETH,SOL,XRP
 ```
 
