@@ -1,7 +1,7 @@
 """
 Feature extraction for XGBoost meta-model.
 
-Extracts 31 features from tick_buffer, price_history, timestamp, and
+Extracts 36 features from tick_buffer, price_history, timestamp, and
 rule-based processor outputs. Used by both training data generation and
 live/backtest ML inference.
 """
@@ -51,6 +51,12 @@ FEATURE_NAMES = [
     "velocity_5s",
     "return_skew_60s",
     "price_vs_open",
+    # Polymarket-inspired features (5)
+    "obv_pvt_divergence",
+    "vpt_trend",
+    "decay_buy_ratio_60s",
+    "mtf_convergence",
+    "delta_vol_vs_avg",
     # Cross-asset (1)
     "btc_velocity_60s",
 ]
@@ -160,6 +166,138 @@ def _compute_return_skewness(ticks: list[dict]) -> float:
         return 0.0
     skew = sum((r - mean_r) ** 3 for r in returns) / (n * std ** 3)
     return skew
+
+
+def _compute_obv_pvt_divergence(ticks: list[dict]) -> float:
+    """OBV vs PVT momentum residual.
+
+    OBV = cumsum(qty if price_up, -qty if price_down)
+    PVT = cumsum((price_change / prev_price) * qty)
+    Normalize both, take residual, compute momentum (recent third vs early third).
+    Catches when volume commitment doesn't match price change magnitude.
+    """
+    if len(ticks) < 3:
+        return 0.0
+    obv = [0.0]
+    pvt = [0.0]
+    for i in range(1, len(ticks)):
+        price = ticks[i]["price"]
+        prev_price = ticks[i - 1]["price"]
+        qty = ticks[i].get("qty", 1.0)
+        price_change = price - prev_price
+        # OBV: full volume in direction of price change
+        if price_change > 0:
+            obv.append(obv[-1] + qty)
+        elif price_change < 0:
+            obv.append(obv[-1] - qty)
+        else:
+            obv.append(obv[-1])
+        # PVT: proportional volume
+        if prev_price != 0:
+            pvt.append(pvt[-1] + (price_change / prev_price) * qty)
+        else:
+            pvt.append(pvt[-1])
+    # Normalize both to [0, 1] range
+    obv_range = max(obv) - min(obv)
+    pvt_range = max(pvt) - min(pvt)
+    if obv_range == 0 or pvt_range == 0:
+        return 0.0
+    obv_norm = [(v - min(obv)) / obv_range for v in obv]
+    pvt_norm = [(v - min(pvt)) / pvt_range for v in pvt]
+    # Residual
+    residual = [o - p for o, p in zip(obv_norm, pvt_norm)]
+    # Momentum: mean of recent third minus mean of early third
+    n = len(residual)
+    third = max(1, n // 3)
+    early = sum(residual[:third]) / third
+    recent = sum(residual[-third:]) / third
+    return recent - early
+
+
+def _compute_vpt_trend(ticks: list[dict]) -> float:
+    """VPT vs its short-term moving average, normalized by VPT range.
+
+    VPT = cumsum(return * qty). Compare current VPT to window average.
+    Positive = volume-weighted price momentum accelerating.
+    """
+    if len(ticks) < 4:
+        return 0.0
+    vpt = [0.0]
+    for i in range(1, len(ticks)):
+        price = ticks[i]["price"]
+        prev_price = ticks[i - 1]["price"]
+        qty = ticks[i].get("qty", 1.0)
+        if prev_price != 0:
+            ret = (price - prev_price) / prev_price
+        else:
+            ret = 0.0
+        vpt.append(vpt[-1] + ret * qty)
+    vpt_range = max(vpt) - min(vpt)
+    if vpt_range == 0:
+        return 0.0
+    vpt_mean = sum(vpt) / len(vpt)
+    trend = (vpt[-1] - vpt_mean) / vpt_range
+    return max(-1.0, min(1.0, trend))
+
+
+def _compute_decay_buy_ratio(ticks: list[dict], decay: float = 0.75) -> float:
+    """Recency-weighted buy volume ratio with exponential decay.
+
+    Newest tick gets highest weight. decay=0.75 means newest tick weight
+    is ~18x the oldest tick weight in a 60s window with ~40 ticks.
+    """
+    if not ticks:
+        return 0.5
+    n = len(ticks)
+    weighted_buy = 0.0
+    weighted_total = 0.0
+    for i, tick in enumerate(ticks):
+        weight = decay ** (n - 1 - i)
+        qty = tick.get("qty", 1.0)
+        weighted_total += qty * weight
+        if tick.get("is_buyer", False):
+            weighted_buy += qty * weight
+    if weighted_total == 0:
+        return 0.5
+    return weighted_buy / weighted_total
+
+
+def _compute_mtf_convergence(ticks: list[dict], now, timedelta_cls=timedelta) -> float:
+    """Multi-timeframe agreement score using 15s and 45s sub-windows.
+
+    Each sub-signal: price direction + volume direction agreement.
+    Both bullish = 1.0, both bearish = 0.0, mixed = 0.5.
+    """
+    if len(ticks) < 4:
+        return 0.5
+
+    def _sub_signal(sub_ticks: list[dict]) -> float:
+        """Returns 1.0 (bullish), -1.0 (bearish), or 0.0 (neutral)."""
+        if len(sub_ticks) < 2:
+            return 0.0
+        price_dir = 1.0 if sub_ticks[-1]["price"] > sub_ticks[0]["price"] else (
+            -1.0 if sub_ticks[-1]["price"] < sub_ticks[0]["price"] else 0.0
+        )
+        buy_vol = sum(t.get("qty", 1.0) for t in sub_ticks if t.get("is_buyer", False))
+        sell_vol = sum(t.get("qty", 1.0) for t in sub_ticks if not t.get("is_buyer", False))
+        vol_dir = 1.0 if buy_vol > sell_vol else (-1.0 if sell_vol > buy_vol else 0.0)
+        if price_dir == vol_dir and price_dir != 0:
+            return price_dir
+        return 0.0
+
+    cutoff_15 = now - timedelta_cls(seconds=15)
+    cutoff_45 = now - timedelta_cls(seconds=45)
+    ticks_15 = [t for t in ticks if t["ts"] >= cutoff_15]
+    ticks_45 = [t for t in ticks if t["ts"] >= cutoff_45]
+
+    sig_15 = _sub_signal(ticks_15)
+    sig_45 = _sub_signal(ticks_45)
+
+    if sig_15 > 0 and sig_45 > 0:
+        return 1.0
+    if sig_15 < 0 and sig_45 < 0:
+        return 0.0
+    return 0.5
 
 
 def extract_features(
@@ -327,6 +465,35 @@ def extract_features(
         features["price_vs_open"] = (current_price - window_open_price) / window_open_price
     else:
         features["price_vs_open"] = 0.0
+
+    # ---- Polymarket-inspired features ----
+
+    # OBV vs PVT divergence (hidden accumulation/distribution)
+    features["obv_pvt_divergence"] = _compute_obv_pvt_divergence(ticks_60)
+
+    # VPT trend (volume-weighted price momentum acceleration)
+    features["vpt_trend"] = _compute_vpt_trend(ticks_60)
+
+    # Decay-weighted buy ratio (recency-biased order flow)
+    features["decay_buy_ratio_60s"] = _compute_decay_buy_ratio(ticks_60)
+
+    # Multi-timeframe convergence (15s + 45s agreement)
+    # Ensure ticks have tz-aware timestamps for comparison
+    ticks_for_mtf = []
+    for t in ticks_60:
+        ts = t["ts"]
+        if ts.tzinfo is None:
+            t_copy = dict(t)
+            t_copy["ts"] = ts.replace(tzinfo=timezone.utc)
+            ticks_for_mtf.append(t_copy)
+        else:
+            ticks_for_mtf.append(t)
+    features["mtf_convergence"] = _compute_mtf_convergence(ticks_for_mtf, timestamp)
+
+    # Delta volume vs average (buying pressure change)
+    features["delta_vol_vs_avg"] = (
+        features["buy_volume_ratio_30s"] - features["buy_volume_ratio_60s"]
+    )
 
     # Cross-asset BTC velocity
     features["btc_velocity_60s"] = btc_velocity_60s if btc_velocity_60s is not None else 0.0
