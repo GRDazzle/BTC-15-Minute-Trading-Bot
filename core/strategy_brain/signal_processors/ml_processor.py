@@ -40,12 +40,15 @@ class MLProcessor(BaseSignalProcessor):
         model_dir: Path,
         confidence_threshold: float = 0.60,
         tickvel_proc: Optional[TickVelocityProcessor] = None,
+        model_suffix: str = "",
     ):
-        super().__init__(f"ML-{asset}")
+        suffix_label = f"-{model_suffix.strip('_')}" if model_suffix else ""
+        super().__init__(f"ML-{asset}{suffix_label}")
         self.asset = asset
+        self.model_suffix = model_suffix
         self.confidence_threshold = confidence_threshold
 
-        model_path = model_dir / f"{asset.upper()}_xgb.json"
+        model_path = model_dir / f"{asset.upper()}{model_suffix}_xgb.json"
         if not model_path.exists():
             raise FileNotFoundError(f"No model file for {asset}: {model_path}")
 
@@ -163,7 +166,7 @@ class MLProcessor(BaseSignalProcessor):
             metadata={
                 "p_bullish": round(p_bullish, 4),
                 "tickvel_signal": tickvel_signal is not None,
-                "model": f"{self.asset}_xgb",
+                "model": f"{self.asset}{self.model_suffix}_xgb",
                 "dm": dm,
             },
         )

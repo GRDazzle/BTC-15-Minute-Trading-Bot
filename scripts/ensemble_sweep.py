@@ -9,6 +9,7 @@ Usage:
   python scripts/ensemble_sweep.py --asset XRP --days 30
   python scripts/ensemble_sweep.py --asset BTC,ETH,SOL,XRP --days 30
   python scripts/ensemble_sweep.py --asset BTC --days 30 --min-dm 2
+  python scripts/ensemble_sweep.py --asset BTC --days 30 --min-dm 2 --max-dm 3 --model-suffix _early
 """
 import argparse
 import csv
@@ -59,7 +60,7 @@ def build_processors() -> list:
     ]
 
 
-def sweep_combo(ml_weight: float, threshold: float, window_data: list[dict]) -> dict:
+def sweep_combo(ml_weight: float, threshold: float, window_data: list[dict], max_dm: int | None = None) -> dict:
     """Evaluate one (ml_weight, threshold) combo over pre-computed probabilities.
 
     For each window, find the first checkpoint where the blended probability
@@ -79,6 +80,10 @@ def sweep_combo(ml_weight: float, threshold: float, window_data: list[dict]) -> 
         dm = -1
 
         for cp in win["checkpoints"]:
+            # Skip checkpoints outside max_dm range
+            if max_dm is not None and cp["dm"] > max_dm:
+                continue
+
             ensemble_p = ml_weight * cp["ml_p"] + fusion_weight * cp["fusion_p"]
 
             if ensemble_p >= threshold:
@@ -121,7 +126,56 @@ def sweep_combo(ml_weight: float, threshold: float, window_data: list[dict]) -> 
     }
 
 
-def run_asset(asset: str, days: int | None, min_dm: int) -> dict | None:
+CANDIDATE_ACCURACY_FLOOR = 74.0  # breakeven at typical entry prices with 2c fee
+CANDIDATE_MIN_TRADES = 50        # statistical reliability
+CANDIDATE_MAX_COUNT = 50         # top N candidates to export
+
+
+def export_candidates(asset: str, model_suffix: str, all_results: list[dict]) -> None:
+    """Export filtered candidate set for pnl_sweep consumption.
+
+    Filters: accuracy >= 74%, traded_count >= 50
+    Ranks by net_correct, takes top 50.
+    Writes JSON to output/ensemble_sweep/{ASSET}{suffix}_candidates.json
+    """
+    qualified = [
+        r for r in all_results
+        if r["accuracy"] >= CANDIDATE_ACCURACY_FLOOR
+        and r["traded_count"] >= CANDIDATE_MIN_TRADES
+    ]
+
+    if not qualified:
+        print(f"  No candidates met filters (acc>={CANDIDATE_ACCURACY_FLOOR}%, "
+              f"trades>={CANDIDATE_MIN_TRADES}) -- skipping candidate export")
+        return
+
+    qualified.sort(key=lambda r: r["net_correct"], reverse=True)
+    candidates = qualified[:CANDIDATE_MAX_COUNT]
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = OUTPUT_DIR / f"{asset}{model_suffix}_candidates.json"
+
+    export = [
+        {
+            "ml_weight": c["ml_weight"],
+            "threshold": c["threshold"],
+            "accuracy": round(c["accuracy"], 2),
+            "net_correct": c["net_correct"],
+            "traded_count": c["traded_count"],
+        }
+        for c in candidates
+    ]
+
+    with open(out_path, "w") as f:
+        json.dump(export, f, indent=2)
+        f.write("\n")
+
+    print(f"  Exported {len(export)} candidates to {out_path}")
+    print(f"  Accuracy range: {candidates[-1]['accuracy']:.1f}% - {candidates[0]['accuracy']:.1f}%")
+    print(f"  Net correct range: {candidates[-1]['net_correct']} - {candidates[0]['net_correct']}")
+
+
+def run_asset(asset: str, days: int | None, min_dm: int, max_dm: int | None = None, model_suffix: str = "") -> dict | None:
     """Run ensemble sweep for one asset. Returns best combo dict or None."""
     from core.strategy_brain.signal_processors.ml_processor import MLProcessor
 
@@ -139,24 +193,27 @@ def run_asset(asset: str, days: int | None, min_dm: int) -> dict | None:
 
     fg_scores = load_fear_greed(FG_CSV) if FG_CSV.exists() else {}
 
-    # Load ML model
-    print(f"Loading ML model for {asset}...")
+    # Load ML model (with optional suffix for early model)
+    model_label = f"{asset}{model_suffix}" if model_suffix else asset
+    print(f"Loading ML model for {model_label}...")
     try:
         ml_processor = MLProcessor(
             asset=asset,
             model_dir=MODEL_DIR,
             confidence_threshold=0.60,
+            model_suffix=model_suffix,
         )
     except FileNotFoundError as e:
-        print(f"ML model not found for {asset}: {e} -- skipping")
+        print(f"ML model not found for {model_label}: {e} -- skipping")
         return None
 
+    dm_range = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
     days_str = f"last {days}d" if days else "all"
     total_combos = len(ML_WEIGHTS) * len(THRESHOLDS)
     print(f"\n{'='*70}")
-    print(f"  Ensemble Sweep: {asset}")
+    print(f"  Ensemble Sweep: {model_label}")
     print(f"  {total_combos} combos ({len(ML_WEIGHTS)} weights x {len(THRESHOLDS)} thresholds)")
-    print(f"  {len(windows)} windows ({days_str}), min_dm={min_dm}")
+    print(f"  {len(windows)} windows ({days_str}), {dm_range}")
     print(f"{'='*70}")
 
     # Phase 1: Collect probabilities in one backtest pass
@@ -184,7 +241,7 @@ def run_asset(asset: str, days: int | None, min_dm: int) -> dict | None:
     all_results = []
     for ml_w in ML_WEIGHTS:
         for thresh in THRESHOLDS:
-            result = sweep_combo(ml_w, thresh, window_data)
+            result = sweep_combo(ml_w, thresh, window_data, max_dm=max_dm)
             all_results.append(result)
 
     t_sweep = time.time() - t1
@@ -254,7 +311,7 @@ def run_asset(asset: str, days: int | None, min_dm: int) -> dict | None:
 
     # Export CSV
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = OUTPUT_DIR / f"{asset}_ensemble_sweep.csv"
+    csv_path = OUTPUT_DIR / f"{asset}{model_suffix}_ensemble_sweep.csv"
     fieldnames = [
         "ml_weight", "threshold", "accuracy", "traded_pct",
         "traded_count", "correct_count", "wrong_count", "net_correct",
@@ -267,6 +324,9 @@ def run_asset(asset: str, days: int | None, min_dm: int) -> dict | None:
             writer.writerow(r)
 
     print(f"\nExported {len(all_results)} rows to {csv_path}")
+
+    # Export candidate set for pnl_sweep consumption
+    export_candidates(asset, model_suffix, all_results)
 
     # Select best combo: among top results by net_correct, favor the lowest
     # threshold. Lower thresholds produce more trades (higher participation)
@@ -333,7 +393,7 @@ def half_kelly_fraction(accuracy: float, price_cents: int) -> float:
     return max(0.0, kelly / 2.0)
 
 
-def write_ensemble_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
+def write_ensemble_config(best_per_asset: dict[str, dict], min_dm: int, max_dm: int | None = None, config_key: str = "ensemble") -> None:
     """Write best ensemble params + half-Kelly bands per asset into config/trading.json."""
     # Load existing config
     if CONFIG_PATH.exists():
@@ -349,7 +409,7 @@ def write_ensemble_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
         acc = best["accuracy"]
         min_price, max_price = half_kelly_band(acc)
 
-        config["assets"][asset]["ensemble"] = {
+        ens_data = {
             "ml_weight": best["ml_weight"],
             "threshold": best["threshold"],
             "min_dm": min_dm,
@@ -357,6 +417,10 @@ def write_ensemble_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
             "net_correct": best["net_correct"],
             "traded_pct": round(best["traded_pct"], 1),
         }
+        if max_dm is not None:
+            ens_data["max_dm"] = max_dm
+
+        config["assets"][asset][config_key] = ens_data
         # Entry bands (min/max_price_cents) are set manually in trading.json
         # and validated against real Kalshi PnL data -- do NOT overwrite them here.
 
@@ -365,8 +429,9 @@ def write_ensemble_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
         json.dump(config, f, indent=2)
         f.write("\n")
 
+    dm_label = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
     print(f"\n{'='*70}")
-    print(f"  Ensemble params + half-Kelly bands written to {CONFIG_PATH}")
+    print(f"  Ensemble params ({config_key}, {dm_label}) written to {CONFIG_PATH}")
     print(f"{'='*70}")
     print(f"  {'Asset':<5} | {'ML_W':>5} | {'Thresh':>6} | {'Acc':>6} | "
           f"{'Net':>5} | {'Band':>10} | {'HK@30c':>6} | {'HK@50c':>6} | {'HK@70c':>6}")
@@ -399,18 +464,25 @@ def main():
     )
     parser.add_argument("--days", type=int, default=None, help="Limit to last N days of data")
     parser.add_argument("--min-dm", type=int, default=2, help="Minimum decision minute (default: 2)")
+    parser.add_argument("--max-dm", type=int, default=None,
+                        help="Maximum decision minute (e.g. 3 for dm 2-3 early model)")
+    parser.add_argument("--model-suffix", type=str, default="",
+                        help="Model filename suffix (e.g. '_early' -> {ASSET}_early_xgb.json)")
     args = parser.parse_args()
+
+    # Determine config key: 'ensemble_early' for early models, 'ensemble' for standard
+    config_key = "ensemble_early" if args.model_suffix == "_early" else "ensemble"
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     best_per_asset: dict[str, dict] = {}
     for asset in assets:
-        best = run_asset(asset, args.days, args.min_dm)
+        best = run_asset(asset, args.days, args.min_dm, max_dm=args.max_dm, model_suffix=args.model_suffix)
         if best is not None:
             best_per_asset[asset] = best
 
     # Write best params to config/trading.json
     if best_per_asset:
-        write_ensemble_config(best_per_asset, args.min_dm)
+        write_ensemble_config(best_per_asset, args.min_dm, max_dm=args.max_dm, config_key=config_key)
 
 
 if __name__ == "__main__":

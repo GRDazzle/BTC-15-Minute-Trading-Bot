@@ -20,6 +20,7 @@ Requires Kalshi polling data in data/kalshi_polls/KX{ASSET}15M/.
 Usage:
   python scripts/pnl_sweep.py --asset BTC
   python scripts/pnl_sweep.py --asset BTC,ETH,SOL,XRP --min-dm 2
+  python scripts/pnl_sweep.py --asset BTC --min-dm 2 --max-dm 3 --model-suffix _early
 """
 import argparse
 import csv
@@ -50,15 +51,42 @@ OUTPUT_DIR = PROJECT_ROOT / "output" / "pnl_sweep"
 MODEL_DIR = PROJECT_ROOT / "models"
 CONFIG_PATH = PROJECT_ROOT / "config" / "trading.json"
 
-# Sweep grid: finer threshold resolution than accuracy sweep
+# Sweep grid: finer threshold resolution than accuracy sweep (fallback when no candidates)
 ML_WEIGHTS = [round(w * 0.05, 2) for w in range(21)]  # 0.0, 0.05, ..., 1.0
 THRESHOLDS = [round(0.55 + i * 0.01, 2) for i in range(16)]  # 0.55 to 0.70
+
+# Max price sweep values (cents): entry price ceiling for YES bets
+MAX_PRICES = [60, 65, 70, 75, 80, 85, 90, 95]
+
+# Ensemble sweep candidate directory
+ENSEMBLE_CANDIDATE_DIR = PROJECT_ROOT / "output" / "ensemble_sweep"
 
 # Kalshi fee per contract in cents
 KALSHI_FEE_CENTS = 2
 
 # Minimum days of Kalshi data required to run PnL sweep
 MIN_KALSHI_DAYS = 3
+
+
+def load_candidates(asset: str, model_suffix: str = "") -> list[tuple[float, float]] | None:
+    """Load ensemble sweep candidate set for an asset.
+
+    Returns list of (ml_weight, threshold) tuples, or None if no candidate file.
+    """
+    cand_path = ENSEMBLE_CANDIDATE_DIR / f"{asset}{model_suffix}_candidates.json"
+    if not cand_path.exists():
+        return None
+
+    try:
+        with open(cand_path, "r") as f:
+            data = json.load(f)
+        if not data:
+            return None
+        combos = [(c["ml_weight"], c["threshold"]) for c in data]
+        return combos
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"  Warning: Failed to parse {cand_path}: {e}")
+        return None
 
 
 def build_processors() -> list:
@@ -126,6 +154,7 @@ def sweep_combo_pnl(
     threshold: float,
     enriched_windows: list[dict],
     config: dict,
+    max_dm: int | None = None,
 ) -> dict:
     """Evaluate one (ml_weight, threshold) combo by dollar PnL.
 
@@ -159,6 +188,10 @@ def sweep_combo_pnl(
 
         for cp in win["checkpoints"]:
             if cp.get("kalshi") is None:
+                continue
+
+            # Skip checkpoints outside max_dm range
+            if max_dm is not None and cp["dm"] > max_dm:
                 continue
 
             ensemble_p = ml_weight * cp["ml_p"] + fusion_weight * cp["fusion_p"]
@@ -237,11 +270,12 @@ def sweep_combo_pnl(
     }
 
 
-def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
+def run_asset(asset: str, min_dm: int, hours: int | None = None, max_dm: int | None = None, model_suffix: str = "") -> dict | None:
     """Run PnL sweep for one asset. Returns best combo dict or None."""
     # Configure loguru for worker processes (suppress DEBUG noise)
     logger.remove()
-    log_path = PROJECT_ROOT / "logs" / f"pnl_sweep_{asset}.log"
+    model_label = f"{asset}{model_suffix}" if model_suffix else asset
+    log_path = PROJECT_ROOT / "logs" / f"pnl_sweep_{model_label}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger.add(str(log_path), mode="w", level="INFO",
                format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}")
@@ -311,24 +345,42 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
 
     fg_scores = load_fear_greed(FG_CSV) if FG_CSV.exists() else {}
 
-    # Load ML model
-    print(f"Loading ML model for {asset}...")
+    # Load ML model (with optional suffix for early model)
+    print(f"Loading ML model for {model_label}...")
     try:
         ml_processor = MLProcessor(
             asset=asset,
             model_dir=MODEL_DIR,
             confidence_threshold=0.60,
+            model_suffix=model_suffix,
         )
     except FileNotFoundError as e:
-        print(f"ML model not found for {asset}: {e} -- skipping")
+        print(f"ML model not found for {model_label}: {e} -- skipping")
         return None
 
-    total_combos = len(ML_WEIGHTS) * len(THRESHOLDS)
+    dm_range = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
+
+    # Try to load candidate set from ensemble_sweep
+    candidates = load_candidates(asset, model_suffix)
+    using_candidates = candidates is not None
+
+    if using_candidates:
+        sweep_combos = candidates
+        total_combos = len(sweep_combos) * len(MAX_PRICES)
+        combo_desc = f"{len(sweep_combos)} candidates x {len(MAX_PRICES)} max_prices"
+        print(f"\n  Loaded {len(sweep_combos)} candidates from ensemble_sweep")
+    else:
+        sweep_combos = [(ml_w, thresh) for ml_w in ML_WEIGHTS for thresh in THRESHOLDS]
+        total_combos = len(sweep_combos)
+        combo_desc = f"{len(ML_WEIGHTS)} weights x {len(THRESHOLDS)} thresholds"
+        print(f"\n  No candidate file found, using full grid ({combo_desc})")
+
     print(f"\n{'='*70}")
-    print(f"  PnL Sweep: {asset}")
-    print(f"  {total_combos} combos ({len(ML_WEIGHTS)} weights x {len(THRESHOLDS)} thresholds)")
+    print(f"  PnL Sweep: {model_label}")
+    print(f"  {total_combos} combos ({combo_desc})")
     print(f"  {len(windows)} windows (Kalshi-matched), {len(kalshi_windows)} Kalshi windows")
     print(f"  Kalshi dates: {kalshi_dates[0]} -> {kalshi_dates[-1]} ({len(kalshi_dates)} days)")
+    print(f"  {dm_range}")
     print(f"  Config: balance=${config['initial_balance']:.2f} "
           f"max_contracts={config['max_contracts_per_trade']} "
           f"Kelly=[{config['min_price_cents']}c,{config['max_price_cents']}c]")
@@ -403,9 +455,19 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
     t2 = time.time()
 
     all_results = []
-    for ml_w in ML_WEIGHTS:
-        for thresh in THRESHOLDS:
-            result = sweep_combo_pnl(ml_w, thresh, enriched_windows, config)
+    if using_candidates:
+        # Candidate mode: sweep (ml_w, thresh) x max_price
+        for ml_w, thresh in sweep_combos:
+            for max_p in MAX_PRICES:
+                combo_config = {**config, "max_price_cents": max_p}
+                result = sweep_combo_pnl(ml_w, thresh, enriched_windows, combo_config, max_dm=max_dm)
+                result["max_price_cents"] = max_p
+                all_results.append(result)
+    else:
+        # Fallback: original full grid (no max_price sweep)
+        for ml_w, thresh in sweep_combos:
+            result = sweep_combo_pnl(ml_w, thresh, enriched_windows, config, max_dm=max_dm)
+            result["max_price_cents"] = config["max_price_cents"]
             all_results.append(result)
 
     t_sweep = time.time() - t2
@@ -423,13 +485,13 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
         qualifying.sort(key=lambda r: r["total_pnl"], reverse=True)
 
     # Print top 20 by PnL
-    print(f"\n{'='*130}")
+    print(f"\n{'='*140}")
     print(f"  {asset} -- Top 20 by TOTAL PnL -- {matched_count} Kalshi windows")
-    print(f"{'='*130}")
+    print(f"{'='*140}")
     header = (
         f"{'Rank':>4} | {'PnL':>9} | {'AvgPnL':>8} | {'WinRate':>7} | "
         f"{'Traded':>6} | {'Trd%':>5} | {'Wins':>4} | {'Loss':>4} | "
-        f"{'Final$':>8} | {'ML_W':>5} | {'Thresh':>6}"
+        f"{'Final$':>8} | {'ML_W':>5} | {'Thresh':>6} | {'MaxP':>4}"
     )
     print(header)
     print("-" * len(header))
@@ -441,7 +503,8 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
             f"{i:4d} | {pnl_sign}${r['total_pnl']:7.2f} | {avg_sign}${r['avg_pnl_per_trade']:6.3f} | "
             f"{r['win_rate']:6.1f}% | {r['traded_count']:6d} | {r['traded_pct']:4.1f}% | "
             f"{r['win_count']:4d} | {r['loss_count']:4d} | "
-            f"${r['final_balance']:7.2f} | {r['ml_weight']:5.2f} | {r['threshold']:6.2f}"
+            f"${r['final_balance']:7.2f} | {r['ml_weight']:5.2f} | {r['threshold']:6.2f} | "
+            f"{r.get('max_price_cents', ''):>4}"
         )
 
     # Also show top 10 by win rate for reference
@@ -450,9 +513,9 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
         key=lambda r: r["win_rate"], reverse=True,
     )
     if by_wr:
-        print(f"\n{'='*130}")
+        print(f"\n{'='*140}")
         print(f"  {asset} -- Top 10 by WIN RATE (for reference)")
-        print(f"{'='*130}")
+        print(f"{'='*140}")
         print(header)
         print("-" * len(header))
         for i, r in enumerate(by_wr[:10], 1):
@@ -462,14 +525,15 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
                 f"{i:4d} | {pnl_sign}${r['total_pnl']:7.2f} | {avg_sign}${r['avg_pnl_per_trade']:6.3f} | "
                 f"{r['win_rate']:6.1f}% | {r['traded_count']:6d} | {r['traded_pct']:4.1f}% | "
                 f"{r['win_count']:4d} | {r['loss_count']:4d} | "
-                f"${r['final_balance']:7.2f} | {r['ml_weight']:5.2f} | {r['threshold']:6.2f}"
+                f"${r['final_balance']:7.2f} | {r['ml_weight']:5.2f} | {r['threshold']:6.2f} | "
+                f"{r.get('max_price_cents', ''):>4}"
             )
 
     # Export CSV
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = OUTPUT_DIR / f"{asset}_pnl_sweep.csv"
+    csv_path = OUTPUT_DIR / f"{asset}{model_suffix}_pnl_sweep.csv"
     fieldnames = [
-        "ml_weight", "threshold", "total_pnl", "win_rate",
+        "ml_weight", "threshold", "max_price_cents", "total_pnl", "win_rate",
         "traded_count", "traded_pct", "win_count", "loss_count",
         "avg_pnl_per_trade", "final_balance", "total_windows",
         "skipped_kelly", "skipped_no_ask",
@@ -494,16 +558,17 @@ def run_asset(asset: str, min_dm: int, hours: int | None = None) -> dict | None:
     near_top.sort(key=lambda r: (r["threshold"], -r["total_pnl"]))
     best = near_top[0]
 
+    max_p_str = f" max_price={best.get('max_price_cents', 'N/A')}c" if using_candidates else ""
     print(f"\nSelected best: threshold={best['threshold']:.2f} "
           f"ml_weight={best['ml_weight']:.2f} PnL=${best['total_pnl']:+.2f} "
-          f"win_rate={best['win_rate']:.1f}% ({best['traded_count']} trades)")
+          f"win_rate={best['win_rate']:.1f}% ({best['traded_count']} trades){max_p_str}")
     return best
 
 
-def write_pnl_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
+def write_pnl_config(best_per_asset: dict[str, dict], min_dm: int, max_dm: int | None = None, config_key: str = "ensemble") -> None:
     """Write PnL-optimized ensemble params to config/trading.json.
 
-    Only updates ensemble section; preserves all other config.
+    Only updates the specified config key; preserves all other config.
     """
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "r") as f:
@@ -515,7 +580,7 @@ def write_pnl_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
         if asset not in config.get("assets", {}):
             config.setdefault("assets", {})[asset] = {}
 
-        config["assets"][asset]["ensemble"] = {
+        ens_data = {
             "ml_weight": best["ml_weight"],
             "threshold": best["threshold"],
             "min_dm": min_dm,
@@ -525,23 +590,31 @@ def write_pnl_config(best_per_asset: dict[str, dict], min_dm: int) -> None:
             "pnl_sweep_total_pnl": best["total_pnl"],
             "pnl_sweep_source": "pnl_sweep",
         }
+        if max_dm is not None:
+            ens_data["max_dm"] = max_dm
+        if "max_price_cents" in best:
+            ens_data["max_price_cents"] = best["max_price_cents"]
+
+        config["assets"][asset][config_key] = ens_data
 
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
 
+    dm_label = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
     print(f"\n{'='*70}")
-    print(f"  PnL sweep params written to {CONFIG_PATH}")
+    print(f"  PnL sweep params ({config_key}, {dm_label}) written to {CONFIG_PATH}")
     print(f"{'='*70}")
     print(f"  {'Asset':<5} | {'ML_W':>5} | {'Thresh':>6} | {'PnL':>9} | "
-          f"{'WinRate':>7} | {'Trades':>6}")
-    print(f"  {'-'*55}")
+          f"{'WinRate':>7} | {'Trades':>6} | {'MaxP':>4}")
+    print(f"  {'-'*62}")
     for asset, best in best_per_asset.items():
         pnl_sign = "+" if best["total_pnl"] >= 0 else ""
+        max_p = best.get("max_price_cents", "")
         print(f"  {asset:<5} | {best['ml_weight']:5.2f} | {best['threshold']:6.2f} | "
               f"{pnl_sign}${best['total_pnl']:7.2f} | {best['win_rate']:6.1f}% | "
-              f"{best['traded_count']:6d}")
+              f"{best['traded_count']:6d} | {max_p:>4}")
     print()
 
 
@@ -560,11 +633,18 @@ def main():
         help="Asset(s) to sweep, comma-separated (e.g. BTC or BTC,ETH,SOL,XRP)",
     )
     parser.add_argument("--min-dm", type=int, default=2, help="Minimum decision minute (default: 2)")
+    parser.add_argument("--max-dm", type=int, default=None,
+                        help="Maximum decision minute (e.g. 3 for dm 2-3 early model)")
+    parser.add_argument("--model-suffix", type=str, default="",
+                        help="Model filename suffix (e.g. '_early' -> {ASSET}_early_xgb.json)")
     parser.add_argument("--hours", type=int, default=None,
                         help="Only use the most recent N hours of Kalshi data (default: all)")
     parser.add_argument("--sequential", action="store_true",
                         help="Run assets sequentially instead of in parallel")
     args = parser.parse_args()
+
+    # Determine config key: 'ensemble_early' for early models, 'ensemble' for standard
+    config_key = "ensemble_early" if args.model_suffix == "_early" else "ensemble"
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     best_per_asset: dict[str, dict] = {}
@@ -577,7 +657,7 @@ def main():
         t_total = time.time()
         with ProcessPoolExecutor(max_workers=len(assets)) as executor:
             futures = {
-                executor.submit(run_asset, asset, args.min_dm, args.hours): asset
+                executor.submit(run_asset, asset, args.min_dm, args.hours, args.max_dm, args.model_suffix): asset
                 for asset in assets
             }
             for future in as_completed(futures):
@@ -592,13 +672,13 @@ def main():
     else:
         # Sequential execution (single asset or --sequential flag)
         for asset in assets:
-            best = run_asset(asset, args.min_dm, args.hours)
+            best = run_asset(asset, args.min_dm, args.hours, max_dm=args.max_dm, model_suffix=args.model_suffix)
             if best is not None:
                 best_per_asset[asset] = best
 
     # Write config only if we have results
     if best_per_asset:
-        write_pnl_config(best_per_asset, args.min_dm)
+        write_pnl_config(best_per_asset, args.min_dm, max_dm=args.max_dm, config_key=config_key)
     else:
         print("\nNo assets had sufficient Kalshi data for PnL sweep.")
         print("Config NOT updated. Run the bot to collect more data.")

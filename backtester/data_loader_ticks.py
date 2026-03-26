@@ -227,8 +227,9 @@ def generate_tick_windows(
             boundary += timedelta(minutes=15)
             continue
 
-        # Determine open price (first tick at decision start) and close price
-        price_open = during_ticks[0].price
+        # Determine open price (first tick at window start, minute 0) and close price
+        # Uses warmup tick to match Kalshi settlement (minute 0 vs minute 15)
+        price_open = warmup_ticks[0].price
 
         # Close price: last tick at or before close_ref
         close_ticks = [t for t in during_ticks if t.ts <= close_ref]

@@ -172,6 +172,7 @@ class AssetState:
     current_price: Optional[Decimal] = None
 
     current_window_id: Optional[str] = None
+    window_open_price: Optional[float] = None  # Price at minute 0 of current window
     traded_windows: set = field(default_factory=set)
     pending_settlements: list = field(default_factory=list)
 
@@ -184,10 +185,13 @@ class AssetState:
     kalshi_price: KalshiPriceProcessor = field(default=None)
     ml_processor: Optional[Any] = None  # MLProcessor (optional, per-asset)
     ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) from sweep
+    early_ml_processor: Optional[Any] = None  # MLProcessor for dm 2-3 (optional)
+    early_ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) for dm 2-3
 
-    # Circuit breaker: stop trading after 3 consecutive losses (reset on param tune)
-    loss_count: int = 0
+    # Circuit breaker: stop trading after 3 consecutive losses (auto-reset after 1 hour)
+    consecutive_losses: int = 0
     circuit_open: bool = False
+    circuit_tripped_at: Optional[datetime] = None
 
     ws_source: Optional[BinanceWebSocketSource] = None
 
@@ -299,11 +303,14 @@ class KalshiMultiAssetStrategy:
 
         # Load ensemble params from config
         ensemble_config = self._load_ensemble_config()
+        early_ensemble_config = self._load_early_ensemble_config()
 
         # Build per-asset state
         self.states: dict[str, AssetState] = {}
         ml_loaded = []
+        early_ml_loaded = []
         ensemble_loaded = []
+        early_ensemble_loaded = []
         for asset in self.assets:
             symbol = BINANCE_SYMBOLS.get(asset)
             if not symbol:
@@ -331,6 +338,21 @@ class KalshiMultiAssetStrategy:
                 except FileNotFoundError:
                     logger.info("No ML model for %s, using fusion fallback", asset)
 
+                # Try loading early model (dm 2-3 specialist)
+                try:
+                    state.early_ml_processor = MLProcessor(
+                        asset=asset,
+                        model_dir=model_dir,
+                        confidence_threshold=ml_confidence_threshold,
+                        tickvel_proc=state.velocity,
+                        model_suffix="_early",
+                    )
+                    early_ml_loaded.append(asset)
+                    early_model_path = model_dir / f"{asset}_early_xgb.json"
+                    self._model_mtimes[f"{asset}_early"] = self._get_mtime(early_model_path)
+                except FileNotFoundError:
+                    logger.info("No early ML model for %s, standard model covers all dms", asset)
+
             # Load ensemble weights if configured and ML model available
             if asset in ensemble_config and state.ml_processor is not None:
                 ens = ensemble_config[asset]
@@ -340,13 +362,44 @@ class KalshiMultiAssetStrategy:
                     "Ensemble mode for %s: ml_weight=%.2f threshold=%.2f",
                     asset, ens["ml_weight"], ens["threshold"],
                 )
+                # Apply ensemble max_price_cents if present
+                if "max_price_cents" in ens:
+                    execution_adapter._max_price[asset] = ens["max_price_cents"]
+                    logger.info(
+                        "Ensemble max_price for %s: %dc",
+                        asset, ens["max_price_cents"],
+                    )
+
+            # Load early ensemble weights if configured and early model available
+            if asset in early_ensemble_config and state.early_ml_processor is not None:
+                ens = early_ensemble_config[asset]
+                state.early_ensemble_weights = (ens["ml_weight"], ens["threshold"])
+                early_ensemble_loaded.append(asset)
+                logger.info(
+                    "Early ensemble mode for %s (dm %d-%d): ml_weight=%.2f threshold=%.2f",
+                    asset, ens.get("min_dm", 2), ens.get("max_dm", 3),
+                    ens["ml_weight"], ens["threshold"],
+                )
+                # Apply early ensemble max_price_cents if more restrictive
+                if "max_price_cents" in ens:
+                    current = execution_adapter._max_price.get(asset, 95)
+                    if ens["max_price_cents"] < current:
+                        execution_adapter._max_price[asset] = ens["max_price_cents"]
+                        logger.info(
+                            "Early ensemble max_price for %s: %dc (more restrictive)",
+                            asset, ens["max_price_cents"],
+                        )
 
             self.states[asset] = state
 
         if ml_loaded:
             logger.info("ML models loaded for: %s", ml_loaded)
+        if early_ml_loaded:
+            logger.info("Early ML models loaded for: %s", early_ml_loaded)
         if ensemble_loaded:
             logger.info("Ensemble mode active for: %s", ensemble_loaded)
+        if early_ensemble_loaded:
+            logger.info("Early ensemble mode active for: %s", early_ensemble_loaded)
 
         logger.info(
             "KalshiMultiAssetStrategy initialized: assets=%s dry_run=%s blackout_windows=%d ml=%s",
@@ -401,6 +454,23 @@ class KalshiMultiAssetStrategy:
             logger.warning("Could not load ensemble config: %s", e)
         return result
 
+    def _load_early_ensemble_config(self) -> dict[str, dict]:
+        """Load per-asset early ensemble params from config/trading.json.
+
+        Returns dict like {"BTC": {"ml_weight": 0.5, "threshold": 0.60, "min_dm": 2, "max_dm": 3}, ...}.
+        """
+        result = {}
+        try:
+            with open(self.CONFIG_PATH, "r") as f:
+                config = json.load(f)
+            for asset, asset_cfg in config.get("assets", {}).items():
+                ens = asset_cfg.get("ensemble_early")
+                if ens and "ml_weight" in ens and "threshold" in ens:
+                    result[asset] = ens
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            logger.warning("Could not load early ensemble config: %s", e)
+        return result
+
     # -- hot-reload ---------------------------------------------------------------
 
     @staticmethod
@@ -421,13 +491,21 @@ class KalshiMultiAssetStrategy:
         if new_config_mtime != self._config_mtime and new_config_mtime > 0:
             config_changed = True
 
-        # Check models/{ASSET}_xgb.json for each asset
+        # Check models/{ASSET}_xgb.json and {ASSET}_early_xgb.json for each asset
         for asset in self.assets:
             model_path = self._model_dir / f"{asset}_xgb.json"
             new_mtime = self._get_mtime(model_path)
             old_mtime = self._model_mtimes.get(asset, 0.0)
             if new_mtime != old_mtime and new_mtime > 0:
                 models_changed.append(asset)
+
+            early_model_path = self._model_dir / f"{asset}_early_xgb.json"
+            early_key = f"{asset}_early"
+            new_early_mtime = self._get_mtime(early_model_path)
+            old_early_mtime = self._model_mtimes.get(early_key, 0.0)
+            if new_early_mtime != old_early_mtime and new_early_mtime > 0:
+                if early_key not in models_changed:
+                    models_changed.append(early_key)
 
         if not config_changed and not models_changed:
             return
@@ -443,10 +521,16 @@ class KalshiMultiAssetStrategy:
             self._config_mtime = new_config_mtime
 
         # Reload changed ML models
-        for asset in models_changed:
-            self._reload_model(asset)
-            model_path = self._model_dir / f"{asset}_xgb.json"
-            self._model_mtimes[asset] = self._get_mtime(model_path)
+        for key in models_changed:
+            if key.endswith("_early"):
+                asset = key.replace("_early", "")
+                self._reload_early_model(asset)
+                early_model_path = self._model_dir / f"{asset}_early_xgb.json"
+                self._model_mtimes[key] = self._get_mtime(early_model_path)
+            else:
+                self._reload_model(key)
+                model_path = self._model_dir / f"{key}_xgb.json"
+                self._model_mtimes[key] = self._get_mtime(model_path)
 
     def _reload_config(self) -> None:
         """Re-read config/trading.json and update ensemble weights + price bands."""
@@ -463,7 +547,7 @@ class KalshiMultiAssetStrategy:
         for asset, state in self.states.items():
             asset_cfg = {**defaults, **asset_configs.get(asset, {})}
 
-            # Update ensemble weights
+            # Update ensemble weights (standard model, dm 4+)
             ens = asset_cfg.get("ensemble")
             if ens and "ml_weight" in ens and "threshold" in ens and state.ml_processor is not None:
                 old = state.ensemble_weights
@@ -475,12 +559,37 @@ class KalshiMultiAssetStrategy:
                         asset, old, new[0], new[1],
                     )
 
+            # Update early ensemble weights (dm 2-3)
+            ens_early = asset_cfg.get("ensemble_early")
+            if ens_early and "ml_weight" in ens_early and "threshold" in ens_early and state.early_ml_processor is not None:
+                old = state.early_ensemble_weights
+                new = (ens_early["ml_weight"], ens_early["threshold"])
+                if old != new:
+                    state.early_ensemble_weights = new
+                    logger.info(
+                        "[hot-reload] %s early ensemble: %s -> ml_weight=%.2f threshold=%.2f",
+                        asset, old, new[0], new[1],
+                    )
+
             # Update execution adapter price bounds
+            # Ensemble max_price_cents overrides asset-level (more specific)
             max_p = asset_cfg.get("max_price_cents")
+            ens_max_p = (ens or {}).get("max_price_cents")
+            # Use ensemble max_price if available, else asset-level
+            max_p_candidates = [p for p in [ens_max_p, max_p] if p is not None]
+            effective_max_p = min(max_p_candidates) if max_p_candidates else None
+
             min_p = asset_cfg.get("min_price_cents")
             max_c = asset_cfg.get("max_contracts_per_trade")
-            if max_p is not None:
-                self.execution._max_price[asset] = max_p
+            if effective_max_p is not None:
+                old_max = self.execution._max_price.get(asset)
+                if old_max != effective_max_p:
+                    logger.info(
+                        "[hot-reload] %s max_price: %s -> %dc (source: %s)",
+                        asset, old_max, effective_max_p,
+                        "ensemble" if ens_max_p or ens_early_max_p else "asset",
+                    )
+                self.execution._max_price[asset] = effective_max_p
             if min_p is not None:
                 self.execution._min_price[asset] = min_p
             if max_c is not None:
@@ -524,6 +633,43 @@ class KalshiMultiAssetStrategy:
             logger.warning("[hot-reload] Model file disappeared for %s", asset)
         except Exception:
             logger.exception("[hot-reload] Failed to reload ML model for %s", asset)
+
+    def _reload_early_model(self, asset: str) -> None:
+        """Re-load a single asset's early XGBoost model from disk."""
+        if not _ML_AVAILABLE:
+            return
+
+        state = self.states.get(asset)
+        if state is None:
+            return
+
+        try:
+            new_processor = MLProcessor(
+                asset=asset,
+                model_dir=self._model_dir,
+                confidence_threshold=self._ml_confidence_threshold,
+                tickvel_proc=state.velocity,
+                model_suffix="_early",
+            )
+            state.early_ml_processor = new_processor
+            logger.info("[hot-reload] Reloaded early ML model for %s", asset)
+
+            # If early ensemble config exists but wasn't loaded before, load it
+            if state.early_ensemble_weights is None:
+                early_config = self._load_early_ensemble_config()
+                if asset in early_config:
+                    ens = early_config[asset]
+                    state.early_ensemble_weights = (ens["ml_weight"], ens["threshold"])
+                    logger.info(
+                        "[hot-reload] Activated early ensemble for %s: ml_weight=%.2f threshold=%.2f",
+                        asset, ens["ml_weight"], ens["threshold"],
+                    )
+        except FileNotFoundError:
+            logger.warning("[hot-reload] Early model file disappeared for %s", asset)
+            state.early_ml_processor = None
+            state.early_ensemble_weights = None
+        except Exception:
+            logger.exception("[hot-reload] Failed to reload early ML model for %s", asset)
 
     def _in_blackout(self, utc_time: Optional[dt_time] = None) -> bool:
         """Check if the given UTC time falls within any blackout window."""
@@ -576,10 +722,10 @@ class KalshiMultiAssetStrategy:
             asyncio.create_task(self._kalshi_polling_loop(), name="kalshi-poller"),
         )
 
-        # 6. Rolling parameter tuning (every 2 hours)
-        self._tasks.append(
-            asyncio.create_task(self._param_tuning_loop(), name="param-tune"),
-        )
+        # 6. Rolling parameter tuning -- DISABLED, using weekly retrain only
+        # self._tasks.append(
+        #     asyncio.create_task(self._param_tuning_loop(), name="param-tune"),
+        # )
 
         logger.info("All loops launched (%d tasks)", len(self._tasks))
 
@@ -697,8 +843,9 @@ class KalshiMultiAssetStrategy:
     async def _param_tuning_loop(self):
         """Run pnl_sweep.py every 2 hours to adapt ensemble parameters.
 
-        Uses the backtester + real Kalshi polling data (not signal_log) so
-        fusion_p is always recomputed with the latest code.
+        Single sweep across dm 2-8 using the standard model. This gives more
+        trades per combo than splitting into two narrow dm ranges, producing
+        more statistically meaningful results for the 12h rolling window.
         Initial delay is configurable via tune_delay_seconds (default 7200s).
         On failure, logs warning and continues (non-fatal).
         """
@@ -715,12 +862,12 @@ class KalshiMultiAssetStrategy:
 
         while self._running:
             try:
-                logger.info("[param-tune] Starting PnL sweep (Kalshi data)...")
-
+                # Single sweep across dm 2-8 (standard model, 12h rolling window)
+                logger.info("[param-tune] Starting PnL sweep (dm 2-8, last 12h)...")
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, str(tune_script),
                     "--asset", assets_arg,
-                    "--min-dm", "2",
+                    "--min-dm", "2", "--max-dm", "8",
                     "--hours", "12",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -729,21 +876,22 @@ class KalshiMultiAssetStrategy:
 
                 if proc.returncode == 0:
                     output = stdout.decode("utf-8", errors="replace").strip()
-                    logger.info("[param-tune] Completed successfully:\n%s", output)
-
-                    # Reset circuit breakers for all assets
-                    for a, st in self.states.items():
-                        if st.circuit_open:
-                            logger.info("[param-tune] Resetting circuit breaker for %s (was %d losses)", a, st.loss_count)
-                        st.loss_count = 0
-                        st.circuit_open = False
+                    logger.info("[param-tune] PnL sweep completed:\n%s", output)
                 else:
                     err = stderr.decode("utf-8", errors="replace").strip()
                     out = stdout.decode("utf-8", errors="replace").strip()
                     logger.warning(
-                        "[param-tune] Exited with code %d:\nstdout: %s\nstderr: %s",
+                        "[param-tune] PnL sweep exited with code %d:\nstdout: %s\nstderr: %s",
                         proc.returncode, out, err,
                     )
+
+                # Reset circuit breakers for all assets
+                for a, st in self.states.items():
+                    if st.circuit_open:
+                        logger.info("[param-tune] Resetting circuit breaker for %s (was %d consecutive losses)", a, st.consecutive_losses)
+                    st.consecutive_losses = 0
+                    st.circuit_open = False
+                    st.circuit_tripped_at = None
 
             except asyncio.CancelledError:
                 break
@@ -848,6 +996,15 @@ class KalshiMultiAssetStrategy:
                 if window_id != self._last_reload_window and elapsed < self.ENTRY_GATE_START_S + 10:
                     self._last_reload_window = window_id
                     self._check_and_reload()
+                    # Reset window open price for new window
+                    for state in self.states.values():
+                        state.window_open_price = None
+
+                # Capture window open price at minute 0 (for price_vs_open feature)
+                if elapsed < self.ENTRY_GATE_START_S:
+                    for asset, state in self.states.items():
+                        if state.window_open_price is None and state.current_price is not None:
+                            state.window_open_price = float(state.current_price)
 
                 if self.ENTRY_GATE_START_S <= elapsed <= self.ENTRY_GATE_END_S:
                     dm = int((elapsed - 300) / 60)  # decision_minute equivalent
@@ -892,10 +1049,18 @@ class KalshiMultiAssetStrategy:
                 )
                 return
 
-        # Circuit breaker: stop trading this asset after 3 losses since last param tune
+        # Circuit breaker: stop trading after 3 consecutive losses, auto-reset after 1 hour
         if state.circuit_open:
-            logger.warning("[%s] Circuit breaker open (losses=%d), skipping", asset, state.loss_count)
-            return
+            elapsed_since_trip = (datetime.now(tz=timezone.utc) - state.circuit_tripped_at).total_seconds()
+            if elapsed_since_trip >= 3600:
+                logger.info("[%s] Circuit breaker auto-reset after 1 hour (%d consecutive losses)", asset, state.consecutive_losses)
+                state.circuit_open = False
+                state.consecutive_losses = 0
+                state.circuit_tripped_at = None
+            else:
+                mins_left = (3600 - elapsed_since_trip) / 60
+                logger.warning("[%s] Circuit breaker open (%d consecutive losses), %.0f min until reset", asset, state.consecutive_losses, mins_left)
+                return
 
         # Blackout window check: skip trading during configured UTC hours
         if self._in_blackout():
@@ -931,17 +1096,22 @@ class KalshiMultiAssetStrategy:
         kalshi_no_ask = market_info.get("no_ask", 0) or 0
         spot_price = float(state.current_price) if state.current_price else 0.0
 
+        # Always use standard model for all dms (trained on dm 2+, higher accuracy)
+        active_ml = state.ml_processor
+        active_weights = state.ensemble_weights
+        model_label = "standard"
+
         # Ensemble path: blend ML + fusion probabilities
-        if state.ensemble_weights is not None and state.ml_processor is not None:
-            ml_w, ens_threshold = state.ensemble_weights
+        if active_weights is not None and active_ml is not None:
+            ml_w, ens_threshold = active_weights
             fusion_w = 1.0 - ml_w
 
             # Get ML raw probability
-            ml_p = state.ml_processor.predict_proba(
+            ml_p = active_ml.predict_proba(
                 state.current_price, list(state.price_history), metadata,
             )
             if ml_p is None:
-                logger.debug("[%s] Ensemble: ML returned None for window %s", asset, window_id)
+                logger.debug("[%s] Ensemble (%s): ML returned None for window %s", asset, model_label, window_id)
                 return
 
             # Get fusion probability
@@ -961,8 +1131,8 @@ class KalshiMultiAssetStrategy:
                 entry_price = kalshi_no_ask
             else:
                 logger.info(
-                    "[%s] Ensemble skip: p=%.3f (ml=%.3f fus=%.3f) below threshold %.2f",
-                    asset, ensemble_p, ml_p, fusion_p, ens_threshold,
+                    "[%s] Ensemble skip (%s): p=%.3f (ml=%.3f fus=%.3f) below threshold %.2f",
+                    asset, model_label, ensemble_p, ml_p, fusion_p, ens_threshold,
                 )
                 self._log_signal(
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,
@@ -1179,6 +1349,10 @@ class KalshiMultiAssetStrategy:
         if state.current_price is not None:
             meta["spot_price"] = float(state.current_price)
 
+        # Window open price (minute 0) for price_vs_open feature
+        if state.window_open_price is not None:
+            meta["window_open_price"] = state.window_open_price
+
         # Simple momentum: 5-period ROC
         if len(state.price_history) >= 5:
             recent = list(state.price_history)
@@ -1376,15 +1550,18 @@ class KalshiMultiAssetStrategy:
                             self._log_balance("settlement", trade.asset)
                             settled.append(trade)
 
-                            # Circuit breaker: track losses
+                            # Circuit breaker: track consecutive losses
                             won = trade.side == trade.settlement_outcome
-                            if not won:
-                                state.loss_count += 1
-                                if state.loss_count >= 3 and not state.circuit_open:
+                            if won:
+                                state.consecutive_losses = 0
+                            else:
+                                state.consecutive_losses += 1
+                                if state.consecutive_losses >= 3 and not state.circuit_open:
                                     state.circuit_open = True
+                                    state.circuit_tripped_at = datetime.now(tz=timezone.utc)
                                     logger.warning(
-                                        "[%s] Circuit breaker TRIPPED: %d losses since last param tune",
-                                        trade.asset, state.loss_count,
+                                        "[%s] Circuit breaker TRIPPED: %d consecutive losses",
+                                        trade.asset, state.consecutive_losses,
                                     )
 
                     for trade in settled:

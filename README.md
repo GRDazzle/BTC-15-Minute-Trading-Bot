@@ -481,7 +481,6 @@ Per-asset trading parameters. Updated automatically by `ensemble_sweep.py` and `
 |   |-- ensemble_sweep.py               Step 5: accuracy-based weight sweep
 |   |-- pnl_sweep.py                    Step 6: PnL-based weight sweep
 |   |-- weekly_retrain.py               Automated retrain pipeline
-|   |-- param_tune.py                   Rolling param tune from signal log
 |   +-- param_sweep.py                  Signal parameter sweep (720 combos)
 |-- data/
 |   |-- aggtrades/                      Binance tick CSVs (Data Vision + live WS + REST)

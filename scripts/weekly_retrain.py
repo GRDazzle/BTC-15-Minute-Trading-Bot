@@ -195,8 +195,8 @@ def main():
         log("ABORT: Cannot train without training data")
         return 1
 
-    # Step 3: Train XGBoost models
-    ok = run_step("Train XGBoost models", [
+    # Step 3a: Train XGBoost standard models (dm 2+, used by live bot + PnL sweep)
+    ok = run_step("Train XGBoost models (dm 2+)", [
         python, "scripts/train_xgb.py",
         "--asset", assets,
         "--min-dm", min_dm,
@@ -206,16 +206,26 @@ def main():
         log("ABORT: Cannot sweep without trained models")
         return 1
 
-    # Step 4: Ensemble sweep (writes config/trading.json)
-    ok = run_step("Ensemble sweep", [
+    # Step 3b: Train XGBoost early models (dm 2-3 specialist)
+    ok = run_step("Train XGBoost models (dm 2-3 early)", [
+        python, "scripts/train_xgb.py",
+        "--asset", assets,
+        "--min-dm", min_dm, "--max-dm", "3",
+        "--model-suffix", "_early",
+    ])
+    if not ok:
+        log("WARNING: Early model training failed, continuing with standard models")
+
+    # Step 4: Ensemble sweep (dm 2-8) -- produces candidate set for PnL sweep
+    ok = run_step("Ensemble sweep (dm 2-8)", [
         python, "scripts/ensemble_sweep.py",
         "--asset", assets,
         "--days", days,
-        "--min-dm", min_dm,
+        "--min-dm", min_dm, "--max-dm", "8",
     ])
     if not ok:
         failed.append("sweep")
-        log("WARNING: Sweep failed, models are updated but config unchanged")
+        log("WARNING: Ensemble sweep failed, models are updated but config unchanged")
 
     # Step 5: Purge old data (>14 days)
     purge_kalshi_polls(max_age_days=14)
@@ -229,26 +239,14 @@ def main():
     if not ok:
         log("WARNING: REST aggTrades fetch failed, continuing with existing data")
 
-    # Step 6: PnL sweep (if Kalshi data available)
-    ok = run_step("PnL sweep", [
+    # Step 6: PnL sweep (dm 2-8) -- uses ensemble candidates + max_price sweep
+    ok = run_step("PnL sweep (dm 2-8)", [
         python, "scripts/pnl_sweep.py",
         "--asset", assets,
-        "--min-dm", min_dm,
+        "--min-dm", min_dm, "--max-dm", "8",
     ])
     if not ok:
         log("WARNING: PnL sweep failed or insufficient Kalshi data")
-
-    # Step 7: Rolling param tune using last 12h of live signal data
-    # This overrides ensemble weights with the most recent live performance,
-    # so the bot uses up-to-date parameters immediately after retrain.
-    ok = run_step("Param tune (12h rolling)", [
-        python, "scripts/param_tune.py",
-        "--hours", "12",
-        "--min-dm", min_dm,
-    ])
-    if not ok:
-        log("WARNING: Param tune failed (no signal_log.csv yet?). "
-            "Using PnL sweep params instead.")
 
     total = time.time() - pipeline_start
     log("=" * 60)

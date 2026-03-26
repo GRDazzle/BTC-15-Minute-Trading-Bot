@@ -2,13 +2,14 @@
 Train per-asset XGBoost meta-model.
 
 Walk-forward split: train on first 70%, validate on next 17%, test on last 13%.
-Saves model to models/{ASSET}_xgb.json and feature importance chart.
+Saves model to models/{ASSET}{suffix}_xgb.json and feature importance chart.
 
 Usage:
   python scripts/train_xgb.py --asset BTC
   python scripts/train_xgb.py --asset BTC,ETH,SOL,XRP
   python scripts/train_xgb.py --asset BTC --tune
   python scripts/train_xgb.py --asset BTC --min-dm 2   # exclude noisy dm 0-1
+  python scripts/train_xgb.py --asset BTC --min-dm 2 --max-dm 3 --model-suffix _early
   python scripts/train_xgb.py --asset XRP --exclude-hours 1,9,10,17
 """
 import argparse
@@ -35,7 +36,7 @@ MODEL_DIR = PROJECT_ROOT / "models"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "ml"
 
 
-def load_data(asset: str, min_dm: int = 0, exclude_hours: list[int] | None = None) -> pd.DataFrame:
+def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None, exclude_hours: list[int] | None = None) -> pd.DataFrame:
     """Load training data CSV for an asset."""
     path = DATA_DIR / f"{asset.upper()}_features.csv"
     if not path.exists():
@@ -51,6 +52,12 @@ def load_data(asset: str, min_dm: int = 0, exclude_hours: list[int] | None = Non
         before = len(df)
         df = df[df["minute_in_window"] >= min_dm].reset_index(drop=True)
         print(f"Filtered dm < {min_dm}: {before} -> {len(df)} rows")
+
+    # Filter out late decision minutes (for dm-specific models)
+    if max_dm is not None:
+        before = len(df)
+        df = df[df["minute_in_window"] <= max_dm].reset_index(drop=True)
+        print(f"Filtered dm > {max_dm}: {before} -> {len(df)} rows")
 
     # Filter out low-accuracy hours
     if exclude_hours:
@@ -360,15 +367,19 @@ def train_asset(
     asset: str,
     tune: bool = False,
     min_dm: int = 0,
+    max_dm: int | None = None,
     dedup: str = "none",
     exclude_hours: list[int] | None = None,
+    model_suffix: str = "",
 ) -> None:
     """Full training pipeline for one asset."""
+    dm_range = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
+    suffix_label = f" (suffix='{model_suffix}')" if model_suffix else ""
     print(f"\n{'='*60}")
-    print(f"Training XGBoost for {asset}")
+    print(f"Training XGBoost for {asset} [{dm_range}]{suffix_label}")
     print(f"{'='*60}")
 
-    df = load_data(asset, min_dm=min_dm, exclude_hours=exclude_hours)
+    df = load_data(asset, min_dm=min_dm, max_dm=max_dm, exclude_hours=exclude_hours)
 
     # Optional window deduplication
     if dedup != "none":
@@ -382,7 +393,7 @@ def train_asset(
 
     # Save model
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = MODEL_DIR / f"{asset.upper()}_xgb.json"
+    model_path = MODEL_DIR / f"{asset.upper()}{model_suffix}_xgb.json"
     model.save_model(str(model_path))
     print(f"Model saved: {model_path}")
 
@@ -402,6 +413,14 @@ def main():
     parser.add_argument(
         "--min-dm", type=int, default=2,
         help="Exclude decision minutes below this (default: 2, excludes noisy dm 0-1)",
+    )
+    parser.add_argument(
+        "--max-dm", type=int, default=None,
+        help="Exclude decision minutes above this (e.g. 3 for dm 2-3 early model)",
+    )
+    parser.add_argument(
+        "--model-suffix", type=str, default="",
+        help="Suffix for model filename (e.g. '_early' -> BTC_early_xgb.json)",
     )
     parser.add_argument(
         "--dedup", choices=["none", "last", "middle", "random"], default="none",
@@ -425,8 +444,10 @@ def main():
             asset,
             tune=args.tune,
             min_dm=args.min_dm,
+            max_dm=args.max_dm,
             dedup=args.dedup,
             exclude_hours=exclude_hours,
+            model_suffix=args.model_suffix,
         )
 
 
