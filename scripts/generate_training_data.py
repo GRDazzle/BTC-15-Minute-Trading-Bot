@@ -102,6 +102,7 @@ def extract_window_features(
     tick_buffer: deque,
     btc_ticks: Optional[list[Tick]] = None,
     btc_ts_index: Optional[list[datetime]] = None,
+    persistent_raw_buffer: deque | None = None,
 ) -> list[dict]:
     """Replay one tick window, extracting features at every 10s checkpoint.
 
@@ -121,8 +122,11 @@ def extract_window_features(
             price_history.append(Decimal(str(bar["price"])))
             tick_buffer.append(bar)
 
-    # Enrich bars with volume data from raw ticks
-    raw_tick_buffer: deque = deque(maxlen=1200)
+    # Use persistent buffer if provided, otherwise local
+    if persistent_raw_buffer is not None:
+        raw_tick_buffer = persistent_raw_buffer
+    else:
+        raw_tick_buffer = deque(maxlen=500000)
     for tick in window.ticks_before:
         raw_tick_buffer.append({
             "ts": tick.ts,
@@ -221,8 +225,11 @@ def extract_window_features(
             btc_vel = _compute_btc_velocity_at(window_btc_ticks, window_btc_ts, current_check)
 
         # Extract features using raw_tick_buffer (has qty/is_buyer)
+        # Filter to last 20 minutes to avoid iterating 500K ticks
+        cutoff = current_check - timedelta(seconds=1200)
+        recent_raw = [t for t in raw_tick_buffer if t["ts"] >= cutoff]
         feats = extract_features(
-            tick_buffer=list(raw_tick_buffer),
+            tick_buffer=recent_raw,
             price_history=list(price_history),
             current_price=current_price,
             timestamp=current_check,
@@ -237,6 +244,17 @@ def extract_window_features(
         rows.append(feats)
 
         current_check = next_check
+
+    # Feed remaining during ticks so next window has them in persistent buffer
+    while raw_tick_idx < len(window.ticks_during):
+        tick = window.ticks_during[raw_tick_idx]
+        raw_tick_buffer.append({
+            "ts": tick.ts,
+            "price": tick.price,
+            "qty": tick.qty,
+            "is_buyer": tick.is_buyer,
+        })
+        raw_tick_idx += 1
 
     return rows
 
@@ -281,6 +299,8 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
 
     price_history: deque = deque(maxlen=200)
     tick_buffer: deque = deque(maxlen=300)
+    # Persistent raw tick buffer across windows for longer-lookback features (5-min, 15-min)
+    persistent_raw_buffer: deque = deque(maxlen=500000)
 
     all_rows: list[dict] = []
     log_interval = max(1, len(windows) // 20)
@@ -292,6 +312,7 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
         rows = extract_window_features(
             window, tickvel_proc, price_history, tick_buffer,
             btc_ticks=btc_ticks, btc_ts_index=btc_ts_index,
+            persistent_raw_buffer=persistent_raw_buffer,
         )
         all_rows.extend(rows)
 

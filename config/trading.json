@@ -13,15 +13,15 @@
       "min_price_cents": 65,
       "ensemble": {
         "ml_weight": 0.35,
-        "threshold": 0.58,
+        "threshold": 0.6,
         "min_dm": 2,
-        "accuracy": 74.2,
-        "net_correct": 187,
-        "traded_pct": 40.7,
-        "pnl_sweep_total_pnl": 912.06,
+        "accuracy": 79.8,
+        "net_correct": 381,
+        "traded_pct": 61.0,
+        "pnl_sweep_total_pnl": 627.6,
         "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 65
+        "max_price_cents": 80
       }
     },
     "ETH": {
@@ -30,16 +30,16 @@
       "max_price_cents": 90,
       "min_price_cents": 65,
       "ensemble": {
-        "ml_weight": 0.15,
-        "threshold": 0.55,
+        "ml_weight": 0.25,
+        "threshold": 0.58,
         "min_dm": 2,
-        "accuracy": 77.5,
-        "net_correct": 237,
-        "traded_pct": 46.5,
-        "pnl_sweep_total_pnl": 395.6,
+        "accuracy": 80.4,
+        "net_correct": 299,
+        "traded_pct": 48.0,
+        "pnl_sweep_total_pnl": 242.0,
         "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 75
+        "max_price_cents": 80
       }
     },
     "SOL": {
@@ -51,13 +51,13 @@
         "ml_weight": 0.2,
         "threshold": 0.58,
         "min_dm": 2,
-        "accuracy": 89.6,
-        "net_correct": 282,
-        "traded_pct": 42.1,
-        "pnl_sweep_total_pnl": 417.3,
+        "accuracy": 93.3,
+        "net_correct": 502,
+        "traded_pct": 63.4,
+        "pnl_sweep_total_pnl": 357.04,
         "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 85
+        "max_price_cents": 95
       }
     },
     "XRP": {
@@ -69,10 +69,10 @@
         "ml_weight": 0.2,
         "threshold": 0.58,
         "min_dm": 2,
-        "accuracy": 87.3,
-        "net_correct": 418,
-        "traded_pct": 65.4,
-        "pnl_sweep_total_pnl": 459.3,
+        "accuracy": 90.1,
+        "net_correct": 423,
+        "traded_pct": 56.5,
+        "pnl_sweep_total_pnl": 406.4,
         "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
         "max_price_cents": 90

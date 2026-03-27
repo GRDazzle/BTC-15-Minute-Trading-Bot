@@ -59,6 +59,13 @@ FEATURE_NAMES = [
     "delta_vol_vs_avg",
     # Cross-asset (1)
     "btc_velocity_60s",
+    # Longer lookback features (6)
+    "velocity_300s",      # 5-minute price velocity
+    "velocity_900s",      # 15-minute price velocity
+    "volatility_300s",    # 5-minute volatility
+    "buy_volume_ratio_300s",  # 5-minute buy ratio
+    "volume_trend",       # volume 60s / volume 300s (recent activity relative to recent history)
+    "momentum_trend",     # velocity_60s - velocity_300s (is short-term accelerating vs medium-term?)
 ]
 
 
@@ -497,6 +504,35 @@ def extract_features(
 
     # Cross-asset BTC velocity
     features["btc_velocity_60s"] = btc_velocity_60s if btc_velocity_60s is not None else 0.0
+
+    # ---- Longer lookback features ----
+    price_300s = _get_price_at_offset(tick_buffer, 300, timestamp)
+    price_900s = _get_price_at_offset(tick_buffer, 900, timestamp)
+
+    # 5-minute velocity
+    features["velocity_300s"] = (
+        (current_price - price_300s) / price_300s if price_300s and price_300s != 0 else 0.0
+    )
+
+    # 15-minute velocity
+    features["velocity_900s"] = (
+        (current_price - price_900s) / price_900s if price_900s and price_900s != 0 else 0.0
+    )
+
+    # 5-minute volatility
+    ticks_300 = _ticks_in_window(tick_buffer, 300, timestamp)
+    features["volatility_300s"] = _compute_return_volatility(ticks_300)
+
+    # 5-minute buy volume ratio
+    vol_300 = sum(t.get("qty", 0) for t in ticks_300)
+    buy_300 = sum(t.get("qty", 0) for t in ticks_300 if t.get("is_buyer", False))
+    features["buy_volume_ratio_300s"] = buy_300 / vol_300 if vol_300 > 0 else 0.5
+
+    # Volume trend: recent vs medium-term
+    features["volume_trend"] = vol_60 / vol_300 * 5 if vol_300 > 0 else 1.0  # normalized to ~1.0
+
+    # Momentum trend: is short-term accelerating vs medium-term?
+    features["momentum_trend"] = features["velocity_60s"] - features["velocity_300s"]
 
     return features
 
