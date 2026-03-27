@@ -35,6 +35,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine, 
 try:
     from core.strategy_brain.signal_processors.ml_processor import MLProcessor
     from core.strategy_brain.signal_processors.lstm_processor import LSTMProcessor
+    from data_sources.coinbase.websocket import CoinbaseWebSocket
     _ML_AVAILABLE = True
 except ImportError:
     _ML_AVAILABLE = False
@@ -708,11 +709,11 @@ class KalshiMultiAssetStrategy:
         # Log startup balances
         self._log_balance("startup")
 
-        # 1. Binance WS streams (one per asset)
+        # 1. Coinbase WS streams for dense tick data (one per asset)
         for asset, state in self.states.items():
             task = asyncio.create_task(
-                self._binance_stream(asset, state),
-                name=f"binance-ws-{asset}",
+                self._coinbase_stream(asset, state),
+                name=f"coinbase-ws-{asset}",
             )
             self._tasks.append(task)
 
@@ -975,6 +976,46 @@ class KalshiMultiAssetStrategy:
                 logger.exception("[ws-%s] Stream error, reconnecting in 5s", asset)
                 await asyncio.sleep(5)
 
+    # -- Coinbase streaming ----------------------------------------------------
+
+    async def _coinbase_stream(self, asset: str, state: AssetState):
+        """Stream Coinbase trade matches for dense tick data.
+
+        Replaces Binance WS for live data — Coinbase is not geo-blocked
+        and provides 100-1000x more tick density than Binance.US.
+        Feeds price_history, tick_buffer, and raw_tick_buffer.
+        """
+        from data_sources.coinbase.websocket import CoinbaseWebSocket
+        cb_ws = CoinbaseWebSocket(asset)
+
+        def on_trade(trade: dict[str, Any]):
+            price = Decimal(str(trade["price"]))
+            ts = trade["timestamp"]
+
+            # Update price state (replaces Binance ticker)
+            state.current_price = price
+            state.price_history.append(price)
+            state.tick_buffer.append({"ts": ts, "price": float(price)})
+
+            # Update raw tick buffer (replaces Binance aggTrade)
+            state.raw_tick_buffer.append({
+                "ts": ts,
+                "price": float(trade["price"]),
+                "qty": float(trade["quantity"]),
+                "is_buyer": trade["side"] == "buy",
+            })
+
+        while self._running:
+            try:
+                logger.info("[ws-%s] Connecting to Coinbase stream...", asset)
+                await cb_ws.stream_trades(on_trade)
+            except asyncio.CancelledError:
+                cb_ws.stop()
+                break
+            except Exception:
+                logger.exception("[ws-%s] Coinbase stream error, reconnecting in 5s", asset)
+                await asyncio.sleep(5)
+
     # -- window management -----------------------------------------------------
 
     @staticmethod
@@ -1178,6 +1219,12 @@ class KalshiMultiAssetStrategy:
                 return
 
             score = confidence * 100
+            lstm_str = f" lstm={lstm_p:.3f}" if lstm_p is not None else ""
+            logger.info(
+                "[%s] Ensemble %s (%s): p=%.3f (xgb=%.3f%s fus=%.3f) price=%dc",
+                asset, direction, model_label, ensemble_p, ml_p, lstm_str, fusion_p, entry_price,
+            )
+
             trade = self.execution.execute_trade(
                 asset=asset,
                 direction=direction,

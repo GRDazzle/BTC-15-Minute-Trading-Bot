@@ -128,9 +128,9 @@ def extract_lstm_sequence(
         })
         last_price = bar_price
 
-    # Check minimum data density
+    # Check minimum data density (minimal — sparse Binance.US may have very few ticks)
     bars_with_ticks = sum(1 for b in bars if b["had_tick"])
-    if bars_with_ticks < seq_len // 4:
+    if bars_with_ticks < 1:
         return None
 
     # Pre-compute price array for rolling calculations

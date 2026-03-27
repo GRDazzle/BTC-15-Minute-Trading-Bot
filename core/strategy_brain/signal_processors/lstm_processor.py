@@ -49,6 +49,10 @@ class LSTMProcessor(BaseSignalProcessor):
             self.scaler_std = np.array(self.metadata["scaler_std"], dtype=np.float32)
             self.scaler_std[self.scaler_std == 0] = 1.0
 
+    def process(self, current_price, historical_prices, metadata):
+        """Not used directly — strategy calls predict_proba instead."""
+        return None
+
     def predict_proba(self, current_price, historical_prices, metadata) -> Optional[float]:
         """Return raw P(BULLISH) without threshold gating."""
         tick_buffer = metadata.get("raw_tick_buffer") or metadata.get("tick_buffer")
@@ -71,6 +75,10 @@ class LSTMProcessor(BaseSignalProcessor):
         window_open_price = metadata.get("window_open_price")
         sequence = extract_lstm_sequence(buf, ts, decision_minute=dm, window_open_price=window_open_price)
         if sequence is None:
+            from loguru import logger
+            logger.warning(
+                "LSTM {}: seq=None, buf_len={}, ts={}", self.asset, len(buf), ts
+            )
             return None
 
         # Apply scaler normalization

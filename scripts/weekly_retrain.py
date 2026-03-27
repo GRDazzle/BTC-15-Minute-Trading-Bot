@@ -195,43 +195,40 @@ def main():
         log("ABORT: Cannot train without training data")
         return 1
 
-    # Step 3a: Train XGBoost standard models (dm 2+, used by live bot + PnL sweep)
+    # Step 3: Train XGBoost models (dm 2+)
     ok = run_step("Train XGBoost models (dm 2+)", [
         python, "scripts/train_xgb.py",
         "--asset", assets,
         "--min-dm", min_dm,
     ])
     if not ok:
-        failed.append("train")
-        log("ABORT: Cannot sweep without trained models")
+        failed.append("train_xgb")
+        log("ABORT: Cannot sweep without trained XGBoost models")
         return 1
 
-    # Step 3b: Train XGBoost early models (dm 2-3 specialist)
-    ok = run_step("Train XGBoost models (dm 2-3 early)", [
-        python, "scripts/train_xgb.py",
-        "--asset", assets,
-        "--min-dm", min_dm, "--max-dm", "3",
-        "--model-suffix", "_early",
-    ])
-    if not ok:
-        log("WARNING: Early model training failed, continuing with standard models")
-
-    # Step 4: Ensemble sweep (dm 2-8) -- produces candidate set for PnL sweep
-    ok = run_step("Ensemble sweep (dm 2-8)", [
-        python, "scripts/ensemble_sweep.py",
+    # Step 4: Generate LSTM training data
+    ok = run_step("Generate LSTM training data", [
+        python, "scripts/generate_lstm_training_data.py",
         "--asset", assets,
         "--days", days,
-        "--min-dm", min_dm, "--max-dm", "8",
     ])
     if not ok:
-        failed.append("sweep")
-        log("WARNING: Ensemble sweep failed, models are updated but config unchanged")
+        log("WARNING: LSTM data generation failed, LSTM models will not be updated")
 
-    # Step 5: Purge old data (>14 days)
+    # Step 5: Train LSTM models
+    ok = run_step("Train LSTM models", [
+        python, "scripts/train_lstm.py",
+        "--asset", assets,
+        "--min-dm", min_dm,
+    ])
+    if not ok:
+        log("WARNING: LSTM training failed, LSTM models will not be updated")
+
+    # Step 6: Purge old data (>14 days)
     purge_kalshi_polls(max_age_days=14)
     purge_old_aggtrades(max_age_days=14)
 
-    # Step 5.5: Fetch recent aggTrades via REST (fills gap if bot was offline)
+    # Step 6.5: Fetch recent aggTrades via REST (fills gap if bot was offline)
     ok = run_step("Fetch recent aggTrades (REST)", [
         python, "scripts/fetch_recent_aggtrades.py",
         "--assets", assets, "--hours", "48",
@@ -239,7 +236,7 @@ def main():
     if not ok:
         log("WARNING: REST aggTrades fetch failed, continuing with existing data")
 
-    # Step 6: PnL sweep (dm 2-8) -- uses ensemble candidates + max_price sweep
+    # Step 7: PnL sweep (dm 2-8) -- sweeps XGB weights + max_price with dynamic weighting
     ok = run_step("PnL sweep (dm 2-8)", [
         python, "scripts/pnl_sweep.py",
         "--asset", assets,
