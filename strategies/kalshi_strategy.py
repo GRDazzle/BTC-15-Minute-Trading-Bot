@@ -178,6 +178,16 @@ class AssetState:
     traded_windows: set = field(default_factory=set)
     pending_settlements: list = field(default_factory=list)
 
+    # Live Kalshi prices (updated by WebSocket or REST poller)
+    kalshi_market_ticker: Optional[str] = None
+    kalshi_event_ticker: Optional[str] = None
+    kalshi_yes_ask: int = 0
+    kalshi_no_ask: int = 0
+    kalshi_yes_bid: int = 0
+    kalshi_no_bid: int = 0
+    kalshi_close_time: Optional[str] = None
+    kalshi_last_update: Optional[datetime] = None
+
     # Per-asset processor instances (no cross-contamination)
     spike: SpikeDetectionProcessor = field(default=None)
     velocity: TickVelocityProcessor = field(default=None)
@@ -732,7 +742,12 @@ class KalshiMultiAssetStrategy:
             asyncio.create_task(self._reconciliation_loop(), name="reconcile-loop"),
         )
 
-        # 5. Kalshi data collection poller
+        # 5. Kalshi WebSocket for real-time prices
+        self._tasks.append(
+            asyncio.create_task(self._kalshi_ws_stream(), name="kalshi-ws"),
+        )
+
+        # 6. Kalshi data collection poller (writes JSONL for backtesting)
         self._tasks.append(
             asyncio.create_task(self._kalshi_polling_loop(), name="kalshi-poller"),
         )
@@ -1016,6 +1031,111 @@ class KalshiMultiAssetStrategy:
                 logger.exception("[ws-%s] Coinbase stream error, reconnecting in 5s", asset)
                 await asyncio.sleep(5)
 
+    # -- Kalshi WebSocket streaming --------------------------------------------
+
+    @staticmethod
+    def _dollars_to_cents(val: str) -> int:
+        """Convert dollar string (e.g. '0.68') to cents (68)."""
+        try:
+            return int(round(float(val) * 100))
+        except (ValueError, TypeError):
+            return 0
+
+    async def _kalshi_ws_stream(self):
+        """Stream Kalshi ticker prices via WebSocket.
+
+        Subscribes to current market tickers and updates AssetState
+        with live yes_ask/no_ask prices. Re-subscribes every 15 minutes
+        when market tickers change.
+        """
+        from sdk.kalshi.websocket import KalshiWebSocket
+
+        kalshi_ws = KalshiWebSocket(self.client.cfg)
+
+        def on_ticker(msg: dict):
+            """Update AssetState with live Kalshi prices."""
+            market_ticker = msg.get("market_ticker", "")
+            yes_ask_str = msg.get("yes_ask_dollars", "")
+            no_ask_str = msg.get("no_ask_dollars", "")
+            yes_bid_str = msg.get("yes_bid_dollars", "")
+            no_bid_str = msg.get("no_bid_dollars", "")
+
+            # Find which asset this ticker belongs to
+            for asset, state in self.states.items():
+                if state.kalshi_market_ticker == market_ticker:
+                    if yes_ask_str:
+                        state.kalshi_yes_ask = KalshiMultiAssetStrategy._dollars_to_cents(yes_ask_str)
+                    if no_ask_str:
+                        state.kalshi_no_ask = KalshiMultiAssetStrategy._dollars_to_cents(no_ask_str)
+                    if yes_bid_str:
+                        state.kalshi_yes_bid = KalshiMultiAssetStrategy._dollars_to_cents(yes_bid_str)
+                    if no_bid_str:
+                        state.kalshi_no_bid = KalshiMultiAssetStrategy._dollars_to_cents(no_bid_str)
+                    state.kalshi_last_update = datetime.now(timezone.utc)
+                    break
+
+        def on_error(msg: dict):
+            logger.warning("[kalshi-ws] Error: %s", msg)
+
+        kalshi_ws.on_ticker = on_ticker
+        kalshi_ws.on_error = on_error
+
+        # Start connection in background
+        ws_task = asyncio.create_task(kalshi_ws.connect_and_stream())
+
+        # Wait for connection to establish
+        await asyncio.sleep(3)
+
+        last_subscribed_tickers: list[str] = []
+
+        while self._running:
+            try:
+                # Resolve current market tickers for all assets
+                new_tickers = []
+                for asset, state in self.states.items():
+                    try:
+                        market_info = fetch_current_market(self.client, state.series)
+                        if market_info:
+                            mt = market_info.get("market_ticker", "")
+                            et = market_info.get("event_ticker", "")
+                            if mt:
+                                state.kalshi_market_ticker = mt
+                                state.kalshi_event_ticker = et
+                                state.kalshi_close_time = market_info.get("close_time")
+                                new_tickers.append(mt)
+                                # Seed initial prices from REST
+                                state.kalshi_yes_ask = market_info.get("yes_ask", 0) or 0
+                                state.kalshi_no_ask = market_info.get("no_ask", 0) or 0
+                                state.kalshi_yes_bid = market_info.get("yes_bid", 0) or 0
+                                state.kalshi_no_bid = market_info.get("no_bid", 0) or 0
+                    except Exception:
+                        logger.debug("[kalshi-ws] Failed to resolve market for %s", asset)
+
+                # Subscribe to new tickers (or update existing subscription)
+                if new_tickers and new_tickers != last_subscribed_tickers:
+                    if last_subscribed_tickers:
+                        # Unsubscribe old, subscribe new
+                        await kalshi_ws.unsubscribe_all()
+                        await asyncio.sleep(0.5)
+                    await kalshi_ws.subscribe_ticker(new_tickers)
+                    logger.info("[kalshi-ws] Subscribed to %d tickers: %s",
+                                len(new_tickers), ", ".join(new_tickers))
+                    last_subscribed_tickers = new_tickers
+
+                # Sleep until next window boundary (re-subscribe with new tickers)
+                next_boundary = self._next_window_boundary()
+                sleep_s = max(5, (next_boundary - datetime.now(timezone.utc)).total_seconds() + 2)
+                await asyncio.sleep(min(sleep_s, 60))  # Check at least every 60s
+
+            except asyncio.CancelledError:
+                kalshi_ws.stop()
+                break
+            except Exception:
+                logger.exception("[kalshi-ws] Error in subscription loop")
+                await asyncio.sleep(10)
+
+        ws_task.cancel()
+
     # -- window management -----------------------------------------------------
 
     @staticmethod
@@ -1051,9 +1171,13 @@ class KalshiMultiAssetStrategy:
                 if window_id != self._last_reload_window and elapsed < self.ENTRY_GATE_START_S + 10:
                     self._last_reload_window = window_id
                     self._check_and_reload()
-                    # Reset window open price for new window
+                    # Reset window open price and Kalshi prices for new window
                     for state in self.states.values():
                         state.window_open_price = None
+                        state.kalshi_yes_ask = 0
+                        state.kalshi_no_ask = 0
+                        state.kalshi_yes_bid = 0
+                        state.kalshi_no_bid = 0
 
                 # Capture window open price at minute 0 (for price_vs_open feature)
                 if elapsed < self.ENTRY_GATE_START_S:
@@ -1134,21 +1258,37 @@ class KalshiMultiAssetStrategy:
         if state.current_price is None:
             return
 
-        # Fetch Kalshi market
-        series = state.series
-        market_info = fetch_current_market(self.client, series)
-        if market_info is None:
-            logger.warning("[%s] No open Kalshi market for %s", asset, series)
-            return
+        # Use cached Kalshi prices (updated by WebSocket or poller)
+        kalshi_yes_ask = state.kalshi_yes_ask
+        kalshi_no_ask = state.kalshi_no_ask
+        if kalshi_yes_ask == 0 and kalshi_no_ask == 0:
+            # Fallback to REST if WebSocket hasn't provided prices yet
+            series = state.series
+            market_info = fetch_current_market(self.client, series)
+            if market_info is None:
+                logger.warning("[%s] No open Kalshi market for %s", asset, series)
+                return
+            kalshi_yes_ask = market_info.get("yes_ask", 0) or 0
+            kalshi_no_ask = market_info.get("no_ask", 0) or 0
+            state.kalshi_yes_ask = kalshi_yes_ask
+            state.kalshi_no_ask = kalshi_no_ask
+            state.kalshi_market_ticker = market_info.get("market_ticker")
+            state.kalshi_event_ticker = market_info.get("event_ticker")
+
+        # Build market_info from cached state for execution adapter
+        market_info = {
+            "market_ticker": state.kalshi_market_ticker,
+            "event_ticker": state.kalshi_event_ticker,
+            "close_time": state.kalshi_close_time,
+            "yes_ask": kalshi_yes_ask,
+            "no_ask": kalshi_no_ask,
+            "yes_bid": state.kalshi_yes_bid,
+            "no_bid": state.kalshi_no_bid,
+        }
 
         metadata = self._build_metadata(state)
-        if market_info is not None:
-            metadata["kalshi_market"] = market_info
+        metadata["kalshi_market"] = market_info
         metadata["decision_minute"] = dm
-
-        # Kalshi prices for signal logging
-        kalshi_yes_ask = market_info.get("yes_ask", 0) or 0
-        kalshi_no_ask = market_info.get("no_ask", 0) or 0
         spot_price = float(state.current_price) if state.current_price else 0.0
 
         # Always use standard model for all dms (trained on dm 2+, higher accuracy)
