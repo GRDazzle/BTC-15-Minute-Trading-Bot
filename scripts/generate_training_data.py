@@ -12,14 +12,12 @@ Usage:
   python scripts/generate_training_data.py --asset XRP --days 30 --min-move 0.0001
 """
 import argparse
-import bisect
 import csv
 import sys
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -27,81 +25,21 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from loguru import logger
 
 from backtester.data_loader_ticks import (
-    Tick,
     TickWindow,
     load_aggtrades_multi,
     generate_tick_windows,
     resample_ticks,
 )
-from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
 from ml.features import FEATURE_NAMES, extract_features
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 
 
-def build_processors():
-    """Instantiate signal processors with sweep-validated parameters."""
-    tickvel = TickVelocityProcessor(
-        velocity_threshold_60s=0.001,
-        velocity_threshold_30s=0.0007,
-        min_ticks=5,
-        min_confidence=0.55,
-    )
-    return tickvel
-
-
-def _build_btc_timestamp_index(btc_ticks: list[Tick]) -> list[datetime]:
-    """Pre-build sorted timestamp list for bisect lookups."""
-    return [t.ts for t in btc_ticks]
-
-
-def _bisect_closest_price(btc_ticks: list[Tick], ts_index: list[datetime], target: datetime, max_diff_s: float = 30) -> Optional[float]:
-    """Find BTC tick price closest to target timestamp using bisect. O(log n)."""
-    idx = bisect.bisect_left(ts_index, target)
-    best_price = None
-    best_diff = float("inf")
-    # Check idx-1 and idx (the two candidates around the insertion point)
-    for i in (idx - 1, idx):
-        if 0 <= i < len(btc_ticks):
-            diff = abs((ts_index[i] - target).total_seconds())
-            if diff < best_diff:
-                best_diff = diff
-                best_price = btc_ticks[i].price
-    if best_diff > max_diff_s:
-        return None
-    return best_price
-
-
-def _compute_btc_velocity_at(btc_ticks: list[Tick], ts_index: list[datetime], timestamp: datetime) -> float:
-    """Compute BTC 60s velocity at a given timestamp. O(log n) via bisect."""
-    if not btc_ticks:
-        return 0.0
-    price_now = _bisect_closest_price(btc_ticks, ts_index, timestamp)
-    price_60s = _bisect_closest_price(btc_ticks, ts_index, timestamp - timedelta(seconds=60))
-    if price_now is None or price_60s is None or price_60s == 0:
-        return 0.0
-    return (price_now - price_60s) / price_60s
-
-
-def _get_btc_ticks_for_window(
-    btc_ticks: list[Tick], ts_index: list[datetime], window_start: datetime, window_end: datetime
-) -> tuple[list[Tick], list[datetime]]:
-    """Extract BTC ticks covering the window period (with 2min buffer). O(log n) slice."""
-    buf_start = window_start - timedelta(minutes=2)
-    buf_end = window_end + timedelta(minutes=1)
-    lo = bisect.bisect_left(ts_index, buf_start)
-    hi = bisect.bisect_right(ts_index, buf_end)
-    return btc_ticks[lo:hi], ts_index[lo:hi]
-
-
 def extract_window_features(
     window: TickWindow,
-    tickvel_proc: TickVelocityProcessor,
     price_history: deque,
     tick_buffer: deque,
-    btc_ticks: Optional[list[Tick]] = None,
-    btc_ts_index: Optional[list[datetime]] = None,
     persistent_raw_buffer: deque | None = None,
 ) -> list[dict]:
     """Replay one tick window, extracting features at every 10s checkpoint.
@@ -149,14 +87,6 @@ def extract_window_features(
     # Add raw ticks from decision zone to raw_tick_buffer as we go
     raw_tick_idx = 0
 
-    # Get BTC ticks covering this window (for cross-asset feature)
-    window_btc_ticks = None
-    window_btc_ts = None
-    if btc_ticks is not None and btc_ts_index is not None:
-        window_btc_ticks, window_btc_ts = _get_btc_ticks_for_window(
-            btc_ticks, btc_ts_index, window.window_start, window.window_end
-        )
-
     label = 1 if window.actual_direction == "BULLISH" else 0
     rows = []
 
@@ -196,36 +126,7 @@ def extract_window_features(
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
 
-        # Compute momentum for metadata
-        if len(price_history) >= 6:
-            prev = float(price_history[-6])
-            momentum = (current_price - prev) / prev if prev != 0 else 0.0
-        else:
-            momentum = 0.0
-
-        metadata = {
-            "tick_buffer": list(tick_buffer),
-            "spot_price": current_price,
-            "momentum": momentum,
-            "sentiment_score": 50,
-        }
-
-        # Run tickvel processor
-        tickvel_signal = None
-        try:
-            tickvel_signal = tickvel_proc.process(
-                Decimal(str(current_price)), list(price_history), metadata
-            )
-        except Exception:
-            pass
-
-        # Compute cross-asset BTC velocity
-        btc_vel = None
-        if window_btc_ticks is not None and window_btc_ts is not None:
-            btc_vel = _compute_btc_velocity_at(window_btc_ticks, window_btc_ts, current_check)
-
-        # Extract features using raw_tick_buffer (has qty/is_buyer)
-        # Filter to last 20 minutes to avoid iterating 500K ticks
+        # Extract features — filter buffer to last 20 min for efficiency
         cutoff = current_check - timedelta(seconds=1200)
         recent_raw = [t for t in raw_tick_buffer if t["ts"] >= cutoff]
         feats = extract_features(
@@ -233,10 +134,8 @@ def extract_window_features(
             price_history=list(price_history),
             current_price=current_price,
             timestamp=current_check,
-            tickvel_signal=tickvel_signal,
             decision_minute=dm,
             window_open_price=window.price_open,
-            btc_velocity_60s=btc_vel,
         )
         feats["label"] = label
         feats["window_start"] = window.window_start.isoformat()
@@ -281,25 +180,10 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
         filtered = before - len(windows)
         logger.info("Filtered {} windows with move < {:.4%} ({} -> {})", filtered, min_move, before, len(windows))
 
-    # Load BTC ticks for cross-asset feature (non-BTC assets only)
-    btc_ticks = None
-    btc_ts_index = None
-    if asset.upper() != "BTC":
-        btc_ticks_raw = load_aggtrades_multi(DATA_DIR, "BTC", days=days)
-        if btc_ticks_raw:
-            btc_ticks = btc_ticks_raw
-            btc_ts_index = _build_btc_timestamp_index(btc_ticks)
-            logger.info("Loaded {} BTC ticks for cross-asset features", len(btc_ticks))
-        else:
-            logger.warning("No BTC aggTrades data found -- btc_velocity_60s will be 0")
-
     logger.info("Generating training data for {} ({} windows)", asset, len(windows))
-
-    tickvel_proc = build_processors()
 
     price_history: deque = deque(maxlen=200)
     tick_buffer: deque = deque(maxlen=300)
-    # Persistent raw tick buffer across windows for longer-lookback features (5-min, 15-min)
     persistent_raw_buffer: deque = deque(maxlen=500000)
 
     all_rows: list[dict] = []
@@ -310,8 +194,7 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
             logger.info("Processing window {}/{}", i + 1, len(windows))
 
         rows = extract_window_features(
-            window, tickvel_proc, price_history, tick_buffer,
-            btc_ticks=btc_ticks, btc_ts_index=btc_ts_index,
+            window, price_history, tick_buffer,
             persistent_raw_buffer=persistent_raw_buffer,
         )
         all_rows.extend(rows)
