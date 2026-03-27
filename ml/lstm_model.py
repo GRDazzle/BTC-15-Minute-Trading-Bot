@@ -1,8 +1,15 @@
 """
-LSTM model definition for price prediction (v3).
+LSTM model definition for price direction prediction (v4).
 
-Architecture: Bidirectional LSTM with attention pooling.
-v3: Supports both classification (P(BULLISH)) and regression (price return).
+Architecture: Conv1D -> BatchNorm -> LSTM -> Attention -> Dense
+Inspired by LSTM_AI_Stock_Predictor: Conv1D captures local patterns,
+LSTM handles sequence dependencies, attention pools the output.
+
+v4 changes:
+- Added Conv1D layer before LSTM (local pattern detection)
+- BatchNorm after Conv1D (training stability)
+- StandardScaler normalization saved with model (feature scaling)
+- Warmup-aware early stopping
 """
 import torch
 import torch.nn as nn
@@ -11,7 +18,7 @@ from ml.lstm_features import LSTM_NUM_FEATURES, LSTM_SEQ_LEN
 
 
 class PriceLSTM(nn.Module):
-    """Bidirectional LSTM for price prediction (classification or regression)."""
+    """Conv1D + Bidirectional LSTM for binary price direction prediction."""
 
     def __init__(
         self,
@@ -20,7 +27,7 @@ class PriceLSTM(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.3,
         num_heads: int = 4,
-        mode: str = "regression",  # "classification" or "regression"
+        mode: str = "classification",
     ):
         super().__init__()
         self.input_size = input_size
@@ -28,10 +35,13 @@ class PriceLSTM(nn.Module):
         self.num_layers = num_layers
         self.mode = mode
 
-        # Input projection
-        self.input_norm = nn.LayerNorm(input_size)
-        self.input_proj = nn.Linear(input_size, hidden_size)
+        # Conv1D for local temporal pattern detection
+        # Input: (batch, seq_len, features) -> transpose to (batch, features, seq_len)
+        self.conv1d = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
+        self.batch_norm = nn.BatchNorm1d(hidden_size)
+        self.conv_dropout = nn.Dropout(dropout)
 
+        # LSTM on top of conv features
         self.lstm = nn.LSTM(
             hidden_size,
             hidden_size,
@@ -43,10 +53,8 @@ class PriceLSTM(nn.Module):
 
         lstm_output_size = hidden_size * 2  # bidirectional
 
-        # Simple attention pooling
-        self.attn_score = nn.Sequential(
-            nn.Linear(lstm_output_size, 1),
-        )
+        # Attention pooling
+        self.attn_score = nn.Linear(lstm_output_size, 1)
 
         # Output head
         self.head = nn.Sequential(
@@ -61,24 +69,26 @@ class PriceLSTM(nn.Module):
         """Forward pass.
 
         Args:
-            x: (batch, seq_len, features) tensor.
+            x: (batch, seq_len, features) tensor — already normalized by scaler.
 
         Returns:
-            (batch,) tensor.
-            - regression: predicted price return (unbounded)
-            - classification: P(BULLISH) in [0, 1]
+            (batch,) tensor of P(BULLISH) probabilities or predicted returns.
         """
-        # Normalize and project input
-        x = self.input_norm(x)
-        x = self.input_proj(x)
+        # Conv1D expects (batch, channels, seq_len)
+        x = x.transpose(1, 2)  # (batch, features, seq_len)
+        x = self.conv1d(x)     # (batch, hidden, seq_len)
+        x = self.batch_norm(x)
+        x = torch.relu(x)
+        x = self.conv_dropout(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, hidden)
 
         # LSTM
-        lstm_out, _ = self.lstm(x)
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden*2)
 
         # Attention pooling
-        scores = self.attn_score(lstm_out)
+        scores = self.attn_score(lstm_out)  # (batch, seq_len, 1)
         weights = torch.softmax(scores, dim=1)
-        context = (lstm_out * weights).sum(dim=1)
+        context = (lstm_out * weights).sum(dim=1)  # (batch, hidden*2)
 
         out = self.head(context).squeeze(-1)
 
@@ -89,7 +99,7 @@ class PriceLSTM(nn.Module):
 
 
 def save_model(model: PriceLSTM, path: str, metadata: dict | None = None) -> None:
-    """Save model state dict and metadata."""
+    """Save model state dict, config, and metadata."""
     payload = {
         "state_dict": model.state_dict(),
         "config": {

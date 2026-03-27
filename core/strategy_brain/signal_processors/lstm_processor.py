@@ -1,13 +1,14 @@
 """
-LSTM signal processor for live inference.
+LSTM signal processor for live inference (v4).
 
-Parallel to MLProcessor (XGBoost). Loads a .pt model and returns
-P(BULLISH) from a 120-second price sequence.
+Loads Conv1D+LSTM model with StandardScaler normalization.
+Returns P(BULLISH) from a 180-second price sequence.
 """
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 from core.strategy_brain.signal_processors.base_processor import (
@@ -20,7 +21,7 @@ from ml.lstm_model import load_model
 
 
 class LSTMProcessor(BaseSignalProcessor):
-    """LSTM-based price direction signal processor."""
+    """LSTM-based price direction signal processor with normalization."""
 
     def __init__(
         self,
@@ -40,34 +41,16 @@ class LSTMProcessor(BaseSignalProcessor):
         self.model, self.metadata = load_model(str(model_path))
         self.model.eval()
 
-    def process(self, current_price, historical_prices, metadata) -> Optional[TradingSignal]:
-        """Generate signal if LSTM probability exceeds threshold."""
-        p = self.predict_proba(current_price, historical_prices, metadata)
-        if p is None:
-            return None
-
-        if p >= self.confidence_threshold:
-            return TradingSignal(
-                direction=SignalDirection.BULLISH,
-                confidence=p,
-                source="LSTM",
-                score=p * 100,
-            )
-        elif p <= 1.0 - self.confidence_threshold:
-            return TradingSignal(
-                direction=SignalDirection.BEARISH,
-                confidence=1.0 - p,
-                source="LSTM",
-                score=(1.0 - p) * 100,
-            )
-        return None
+        # Load scaler from model metadata
+        self.scaler_mean = None
+        self.scaler_std = None
+        if "scaler_mean" in self.metadata and "scaler_std" in self.metadata:
+            self.scaler_mean = np.array(self.metadata["scaler_mean"], dtype=np.float32)
+            self.scaler_std = np.array(self.metadata["scaler_std"], dtype=np.float32)
+            self.scaler_std[self.scaler_std == 0] = 1.0
 
     def predict_proba(self, current_price, historical_prices, metadata) -> Optional[float]:
-        """Return raw P(BULLISH) without threshold gating.
-
-        Uses raw_tick_buffer from metadata for volume features,
-        falls back to tick_buffer for price-only sequences.
-        """
+        """Return raw P(BULLISH) without threshold gating."""
         tick_buffer = metadata.get("raw_tick_buffer") or metadata.get("tick_buffer")
         if not tick_buffer:
             return None
@@ -89,6 +72,11 @@ class LSTMProcessor(BaseSignalProcessor):
         sequence = extract_lstm_sequence(buf, ts, decision_minute=dm, window_open_price=window_open_price)
         if sequence is None:
             return None
+
+        # Apply scaler normalization
+        if self.scaler_mean is not None:
+            sequence = (sequence - self.scaler_mean) / self.scaler_std
+            sequence = np.nan_to_num(sequence, nan=0.0, posinf=1e6, neginf=-1e6)
 
         # Inference
         with torch.no_grad():

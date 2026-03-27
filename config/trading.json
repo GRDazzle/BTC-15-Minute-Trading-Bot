@@ -12,13 +12,13 @@
       "max_price_cents": 90,
       "min_price_cents": 65,
       "ensemble": {
-        "ml_weight": 0.30,
-        "threshold": 0.60,
+        "ml_weight": 0.20,
+        "threshold": 0.70,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 1465.4,
-        "pnl_sweep_source": "dynamic_sweep"
+        "max_price_cents": 90,
+        "pnl_sweep_total_pnl": 541.2,
+        "pnl_sweep_source": "ensemble_combo_sweep"
       }
     },
     "ETH": {
@@ -27,13 +27,13 @@
       "max_price_cents": 90,
       "min_price_cents": 65,
       "ensemble": {
-        "ml_weight": 0.30,
-        "threshold": 0.62,
+        "ml_weight": 0.10,
+        "threshold": 0.70,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 460.1,
-        "pnl_sweep_source": "dynamic_sweep"
+        "max_price_cents": 85,
+        "pnl_sweep_total_pnl": 273.5,
+        "pnl_sweep_source": "ensemble_combo_sweep"
       }
     },
     "SOL": {
@@ -42,13 +42,13 @@
       "max_price_cents": 90,
       "min_price_cents": 65,
       "ensemble": {
-        "ml_weight": 0.20,
-        "threshold": 0.65,
+        "ml_weight": 0.10,
+        "threshold": 0.70,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 90,
-        "pnl_sweep_total_pnl": 491.3,
-        "pnl_sweep_source": "dynamic_sweep"
+        "max_price_cents": 85,
+        "pnl_sweep_total_pnl": 322.7,
+        "pnl_sweep_source": "ensemble_combo_sweep"
       }
     },
     "XRP": {
@@ -57,13 +57,13 @@
       "max_price_cents": 90,
       "min_price_cents": 65,
       "ensemble": {
-        "ml_weight": 0.30,
-        "threshold": 0.65,
+        "ml_weight": 0.10,
+        "threshold": 0.70,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 557.7,
-        "pnl_sweep_source": "dynamic_sweep"
+        "max_price_cents": 90,
+        "pnl_sweep_total_pnl": 326.0,
+        "pnl_sweep_source": "ensemble_combo_sweep"
       }
     }
   }

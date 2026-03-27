@@ -34,6 +34,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine, 
 
 try:
     from core.strategy_brain.signal_processors.ml_processor import MLProcessor
+    from core.strategy_brain.signal_processors.lstm_processor import LSTMProcessor
     _ML_AVAILABLE = True
 except ImportError:
     _ML_AVAILABLE = False
@@ -184,6 +185,7 @@ class AssetState:
     divergence: PriceDivergenceProcessor = field(default=None)
     kalshi_price: KalshiPriceProcessor = field(default=None)
     ml_processor: Optional[Any] = None  # MLProcessor (optional, per-asset)
+    lstm_processor: Optional[Any] = None  # LSTMProcessor (optional, per-asset)
     ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) from sweep
     early_ml_processor: Optional[Any] = None  # MLProcessor for dm 2-3 (optional)
     early_ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) for dm 2-3
@@ -352,6 +354,18 @@ class KalshiMultiAssetStrategy:
                     self._model_mtimes[f"{asset}_early"] = self._get_mtime(early_model_path)
                 except FileNotFoundError:
                     logger.info("No early ML model for %s, standard model covers all dms", asset)
+
+                # Try loading LSTM model
+                try:
+                    state.lstm_processor = LSTMProcessor(
+                        asset=asset,
+                        model_dir=model_dir,
+                    )
+                    logger.info("LSTM model loaded for %s", asset)
+                except FileNotFoundError:
+                    logger.info("No LSTM model for %s", asset)
+                except Exception as e:
+                    logger.warning("Failed to load LSTM for %s: %s", asset, e)
 
             # Load ensemble weights if configured and ML model available
             if asset in ensemble_config and state.ml_processor is not None:
@@ -1104,7 +1118,6 @@ class KalshiMultiAssetStrategy:
         # Ensemble path: blend ML + fusion probabilities
         if active_weights is not None and active_ml is not None:
             ml_w, ens_threshold = active_weights
-            fusion_w = 1.0 - ml_w
 
             # Get ML raw probability
             ml_p = active_ml.predict_proba(
@@ -1117,16 +1130,30 @@ class KalshiMultiAssetStrategy:
             # Get fusion probability
             fusion_p = self._get_fusion_probability(state, metadata)
 
-            # Dynamic weight: ml_w scales exponentially with ML confidence
-            # confidence = 0 when ml_p=0.5 (uncertain), 1 when ml_p=0 or 1 (certain)
-            raw_conf = abs(ml_p - 0.5) * 2.0
-            dynamic_k = 4.5
-            # ml_w from config acts as min_w, cap at max_w=0.90
-            dynamic_ml_w = ml_w + (0.90 - ml_w) * (raw_conf ** dynamic_k)
-            dynamic_fusion_w = 1.0 - dynamic_ml_w
+            # Get LSTM probability (if available)
+            lstm_p = None
+            if state.lstm_processor is not None:
+                lstm_p = state.lstm_processor.predict_proba(
+                    state.current_price, list(state.price_history), metadata,
+                )
 
-            # Blend
-            ensemble_p = dynamic_ml_w * ml_p + dynamic_fusion_w * fusion_p
+            # Dynamic weight: scales exponentially with each model's confidence
+            dynamic_k = 4.5
+            xgb_conf = abs(ml_p - 0.5) * 2.0
+            # ml_w from config acts as xgb_min_w
+            xgb_max_w = 0.60
+            dyn_xgb_w = ml_w + (xgb_max_w - ml_w) * (xgb_conf ** dynamic_k)
+
+            if lstm_p is not None:
+                lstm_conf = abs(lstm_p - 0.5) * 2.0
+                lstm_min_w = 0.10
+                lstm_max_w = 0.40
+                dyn_lstm_w = lstm_min_w + (lstm_max_w - lstm_min_w) * (lstm_conf ** dynamic_k)
+                dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w - dyn_lstm_w)
+                ensemble_p = dyn_xgb_w * ml_p + dyn_lstm_w * lstm_p + dyn_fusion_w * fusion_p
+            else:
+                dyn_fusion_w = 1.0 - dyn_xgb_w
+                ensemble_p = dyn_xgb_w * ml_p + dyn_fusion_w * fusion_p
 
             # Decision
             if ensemble_p >= ens_threshold:
@@ -1138,9 +1165,10 @@ class KalshiMultiAssetStrategy:
                 confidence = 1.0 - ensemble_p
                 entry_price = kalshi_no_ask
             else:
+                lstm_str = f" lstm={lstm_p:.3f}" if lstm_p is not None else ""
                 logger.info(
-                    "[%s] Ensemble skip (%s): p=%.3f (ml=%.3f fus=%.3f dw=%.2f) below threshold %.2f",
-                    asset, model_label, ensemble_p, ml_p, fusion_p, dynamic_ml_w, ens_threshold,
+                    "[%s] Ensemble skip (%s): p=%.3f (xgb=%.3f%s fus=%.3f) below threshold %.2f",
+                    asset, model_label, ensemble_p, ml_p, lstm_str, fusion_p, ens_threshold,
                 )
                 self._log_signal(
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,
