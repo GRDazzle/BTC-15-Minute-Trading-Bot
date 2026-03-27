@@ -1117,8 +1117,16 @@ class KalshiMultiAssetStrategy:
             # Get fusion probability
             fusion_p = self._get_fusion_probability(state, metadata)
 
+            # Dynamic weight: ml_w scales exponentially with ML confidence
+            # confidence = 0 when ml_p=0.5 (uncertain), 1 when ml_p=0 or 1 (certain)
+            raw_conf = abs(ml_p - 0.5) * 2.0
+            dynamic_k = 4.5
+            # ml_w from config acts as min_w, cap at max_w=0.90
+            dynamic_ml_w = ml_w + (0.90 - ml_w) * (raw_conf ** dynamic_k)
+            dynamic_fusion_w = 1.0 - dynamic_ml_w
+
             # Blend
-            ensemble_p = ml_w * ml_p + fusion_w * fusion_p
+            ensemble_p = dynamic_ml_w * ml_p + dynamic_fusion_w * fusion_p
 
             # Decision
             if ensemble_p >= ens_threshold:
@@ -1131,8 +1139,8 @@ class KalshiMultiAssetStrategy:
                 entry_price = kalshi_no_ask
             else:
                 logger.info(
-                    "[%s] Ensemble skip (%s): p=%.3f (ml=%.3f fus=%.3f) below threshold %.2f",
-                    asset, model_label, ensemble_p, ml_p, fusion_p, ens_threshold,
+                    "[%s] Ensemble skip (%s): p=%.3f (ml=%.3f fus=%.3f dw=%.2f) below threshold %.2f",
+                    asset, model_label, ensemble_p, ml_p, fusion_p, dynamic_ml_w, ens_threshold,
                 )
                 self._log_signal(
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,

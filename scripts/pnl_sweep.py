@@ -194,7 +194,12 @@ def sweep_combo_pnl(
             if max_dm is not None and cp["dm"] > max_dm:
                 continue
 
-            ensemble_p = ml_weight * cp["ml_p"] + fusion_weight * cp["fusion_p"]
+            # Dynamic weight: exponential scaling by ML confidence
+            ml_p_val = cp["ml_p"]
+            raw_conf = abs(ml_p_val - 0.5) * 2.0
+            dynamic_k = 4.5
+            dyn_ml_w = ml_weight + (0.90 - ml_weight) * (raw_conf ** dynamic_k)
+            ensemble_p = dyn_ml_w * ml_p_val + (1.0 - dyn_ml_w) * cp["fusion_p"]
 
             if ensemble_p >= threshold:
                 p = cp["kalshi"]["yes_ask"]
