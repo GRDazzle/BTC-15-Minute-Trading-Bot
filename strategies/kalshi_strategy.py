@@ -266,6 +266,7 @@ class KalshiMultiAssetStrategy:
     # dm 9 = window_start + 14min (elapsed 840s), mtc=1
     ENTRY_GATE_START_S = 420   # dm=2: 7 min into window (mtc=8)
     ENTRY_GATE_END_S = 840     # dm=9: 14 min into window (mtc=1)
+    BLOCKED_HOURS = {15}       # UTC hours to skip (15:00 UTC = 8am PT, US market open)
 
     CONFIG_PATH = Path("config/trading.json")
 
@@ -1186,12 +1187,17 @@ class KalshiMultiAssetStrategy:
                             state.window_open_price = float(state.current_price)
 
                 if self.ENTRY_GATE_START_S <= elapsed <= self.ENTRY_GATE_END_S:
-                    dm = int((elapsed - 300) / 60)  # decision_minute equivalent
-                    mtc = 10 - dm                    # mins_to_close equivalent
-                    for asset, state in self.states.items():
-                        await self._process_asset_window(
-                            asset, state, window_id, dm=dm, mtc=mtc,
-                        )
+                    # Skip blocked hours (historically unprofitable)
+                    current_hour = datetime.now(timezone.utc).hour
+                    if current_hour in self.BLOCKED_HOURS:
+                        pass  # silently skip
+                    else:
+                        dm = int((elapsed - 300) / 60)
+                        mtc = 10 - dm
+                        for asset, state in self.states.items():
+                            await self._process_asset_window(
+                                asset, state, window_id, dm=dm, mtc=mtc,
+                            )
                 elif elapsed < self.ENTRY_GATE_START_S:
                     secs_to_gate = self.ENTRY_GATE_START_S - elapsed
                     if secs_to_gate > 30:

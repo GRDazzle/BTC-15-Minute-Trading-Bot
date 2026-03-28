@@ -103,14 +103,20 @@ class KalshiExecutionAdapter:
         # Per-asset initial balances for contract scaling
         self._initial_balances: dict[str, float] = initial_balances or {}
 
+    # Hard cap to avoid disrupting Kalshi market liquidity
+    MAX_CONTRACTS_CAP = 500
+
     def _get_max_contracts(self, asset: str) -> int:
-        """Get max contracts for an asset, scaled up by 50% per balance doubling."""
+        """Get max contracts for an asset, sqrt-scaled by balance ratio.
+
+        Grows slowly: 2x balance = 1.41x contracts. Also scales down on losses.
+        Capped at MAX_CONTRACTS_CAP to avoid disrupting market liquidity.
+        """
         base = self._max_contracts.get(asset, self._max_contracts.get("_default", self.DEFAULT_MAX_CONTRACTS))
         initial = self._initial_balances.get(asset, 0.0)
         if initial <= 0:
             return base
 
-        # Look up current sub-account balance
         series = series_for_asset(asset)
         try:
             acct = self.account_manager.get_account(series)
@@ -118,21 +124,9 @@ class KalshiExecutionAdapter:
             return base
 
         current = acct.balance_dollars
-        if current <= initial:
-            return base
-
-        # Number of complete doublings: floor(log2(current / initial))
-        doublings = int(math.log2(current / initial))
-        if doublings < 1:
-            return base
-
-        # Scale up by 50% per doubling (compounding: 1.5^doublings)
-        scaled = int(base * (1.5 ** doublings))
-        if scaled != base:
-            logger.info(
-                "[kalshi-exec] %s max_contracts scaled: %d -> %d (%d doublings, $%.2f / $%.2f)",
-                asset, base, scaled, doublings, current, initial,
-            )
+        ratio = current / initial
+        scaled = int(base * math.sqrt(ratio))
+        scaled = max(1, min(scaled, self.MAX_CONTRACTS_CAP))
         return scaled
 
     def _get_max_price(self, asset: str) -> int:
