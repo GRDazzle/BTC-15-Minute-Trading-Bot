@@ -348,6 +348,39 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     for mode_name, r in results_by_mode.items():
         print(f"  {mode_name:20s}: PnL=${r['total_pnl']:+8.2f}  WR={r['win_rate']:5.1f}%  trades={r['traded_count']}")
 
+    # Write best 3-way params to config
+    best_3way = results_by_mode.get("XGB+LSTM+Fusion")
+    if best_3way:
+        _write_config(asset, best_3way)
+
+
+def _write_config(asset: str, best: dict):
+    """Update config/trading.json with best 3-way ensemble params."""
+    config_path = PROJECT_ROOT / "config" / "trading.json"
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    asset_cfg = cfg.get("assets", {}).get(asset, {})
+    ens = asset_cfg.get("ensemble", {})
+
+    # ml_weight in config acts as xgb_min_w for dynamic weighting
+    ens["ml_weight"] = best["min_w_a"]
+    ens["threshold"] = best["threshold"]
+    ens["max_price_cents"] = best["max_price"]
+    ens["pnl_sweep_total_pnl"] = round(best["total_pnl"], 2)
+    ens["pnl_sweep_source"] = "ensemble_combo_sweep"
+    ens["win_rate"] = round(best["win_rate"], 1)
+    ens["traded_count"] = best["traded_count"]
+
+    asset_cfg["ensemble"] = ens
+    cfg.setdefault("assets", {})[asset] = asset_cfg
+
+    with open(config_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+    print(f"  Config updated: {asset} ml_w={best['min_w_a']:.2f} thresh={best['threshold']} maxP={best['max_price']}c")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Ensemble combo sweep")

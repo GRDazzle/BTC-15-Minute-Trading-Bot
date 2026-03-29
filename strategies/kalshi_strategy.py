@@ -823,13 +823,13 @@ class KalshiMultiAssetStrategy:
                     if new_event:
                         current_events[asset] = new_event
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("[poller] Error in polling loop")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
     async def _fetch_and_write_outcome(
         self,
@@ -1021,6 +1021,20 @@ class KalshiMultiAssetStrategy:
                 "is_buyer": trade["side"] == "buy",
             })
 
+            # Persist to daily CSV for backtesting/tuning
+            ts_ms = int(ts.timestamp() * 1000)
+            compat_trade = {
+                "agg_trade_id": 0,
+                "price": float(trade["price"]),
+                "quantity": float(trade["quantity"]),
+                "first_id": 0,
+                "last_id": 0,
+                "timestamp_ms": ts_ms,
+                "is_buyer_maker": trade["side"] != "buy",
+                "best_price_match": True,
+            }
+            self._trade_writer.write(asset, state.binance_symbol, compat_trade)
+
         while self._running:
             try:
                 logger.info("[ws-%s] Connecting to Coinbase stream...", asset)
@@ -1057,21 +1071,21 @@ class KalshiMultiAssetStrategy:
             """Update AssetState with live Kalshi prices."""
             market_ticker = msg.get("market_ticker", "")
             yes_ask_str = msg.get("yes_ask_dollars", "")
-            no_ask_str = msg.get("no_ask_dollars", "")
             yes_bid_str = msg.get("yes_bid_dollars", "")
-            no_bid_str = msg.get("no_bid_dollars", "")
 
             # Find which asset this ticker belongs to
             for asset, state in self.states.items():
                 if state.kalshi_market_ticker == market_ticker:
                     if yes_ask_str:
-                        state.kalshi_yes_ask = KalshiMultiAssetStrategy._dollars_to_cents(yes_ask_str)
-                    if no_ask_str:
-                        state.kalshi_no_ask = KalshiMultiAssetStrategy._dollars_to_cents(no_ask_str)
+                        yes_ask = KalshiMultiAssetStrategy._dollars_to_cents(yes_ask_str)
+                        state.kalshi_yes_ask = yes_ask
+                        # no_bid = 100 - yes_ask (Kalshi binary market)
+                        state.kalshi_no_bid = 100 - yes_ask
                     if yes_bid_str:
-                        state.kalshi_yes_bid = KalshiMultiAssetStrategy._dollars_to_cents(yes_bid_str)
-                    if no_bid_str:
-                        state.kalshi_no_bid = KalshiMultiAssetStrategy._dollars_to_cents(no_bid_str)
+                        yes_bid = KalshiMultiAssetStrategy._dollars_to_cents(yes_bid_str)
+                        state.kalshi_yes_bid = yes_bid
+                        # no_ask = 100 - yes_bid
+                        state.kalshi_no_ask = 100 - yes_bid
                     state.kalshi_last_update = datetime.now(timezone.utc)
                     break
 

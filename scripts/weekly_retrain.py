@@ -224,11 +224,7 @@ def main():
     if not ok:
         log("WARNING: LSTM training failed, LSTM models will not be updated")
 
-    # Step 6: Purge old data (>14 days)
-    purge_kalshi_polls(max_age_days=14)
-    purge_old_aggtrades(max_age_days=14)
-
-    # Step 6.5: Fetch recent aggTrades via REST (fills gap if bot was offline)
+    # Step 6: Fetch recent aggTrades via REST (fills gap if bot was offline)
     ok = run_step("Fetch recent aggTrades (REST)", [
         python, "scripts/fetch_recent_aggtrades.py",
         "--assets", assets, "--hours", "48",
@@ -236,14 +232,18 @@ def main():
     if not ok:
         log("WARNING: REST aggTrades fetch failed, continuing with existing data")
 
-    # Step 7: PnL sweep (dm 2-8) -- sweeps XGB weights + max_price with dynamic weighting
-    ok = run_step("PnL sweep (dm 2-8)", [
-        python, "scripts/pnl_sweep.py",
+    # Step 7: Purge old data (>14 days) — after fetch so new data isn't purged
+    purge_kalshi_polls(max_age_days=14)
+    purge_old_aggtrades(max_age_days=14)
+
+    # Step 8: 3-way ensemble combo sweep (XGB + LSTM + Fusion with dynamic weighting)
+    ok = run_step("Ensemble combo sweep (3-way)", [
+        python, "scripts/ensemble_combo_sweep.py",
         "--asset", assets,
         "--min-dm", min_dm, "--max-dm", "8",
     ])
     if not ok:
-        log("WARNING: PnL sweep failed or insufficient Kalshi data")
+        log("WARNING: Ensemble combo sweep failed")
 
     total = time.time() - pipeline_start
     log("=" * 60)
