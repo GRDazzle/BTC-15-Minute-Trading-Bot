@@ -2,21 +2,21 @@
   "defaults": {
     "initial_balance": 25.0,
     "max_contracts_per_trade": 10,
-    "max_price_cents": 90,
-    "min_price_cents": 65
+    "max_price_cents": 85,
+    "min_price_cents": 55
   },
   "assets": {
     "BTC": {
       "initial_balance": 50.0,
       "max_contracts_per_trade": 20,
-      "max_price_cents": 90,
-      "min_price_cents": 65,
+      "max_price_cents": 85,
+      "min_price_cents": 55,
       "ensemble": {
         "ml_weight": 0.20,
         "threshold": 0.70,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 90,
+        "max_price_cents": 85,
         "pnl_sweep_total_pnl": 541.2,
         "pnl_sweep_source": "ensemble_combo_sweep"
       }
@@ -24,8 +24,8 @@
     "ETH": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 90,
-      "min_price_cents": 65,
+      "max_price_cents": 85,
+      "min_price_cents": 55,
       "ensemble": {
         "ml_weight": 0.10,
         "threshold": 0.70,
@@ -39,8 +39,8 @@
     "SOL": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 90,
-      "min_price_cents": 65,
+      "max_price_cents": 85,
+      "min_price_cents": 55,
       "ensemble": {
         "ml_weight": 0.10,
         "threshold": 0.70,
@@ -54,14 +54,14 @@
     "XRP": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 90,
-      "min_price_cents": 65,
+      "max_price_cents": 85,
+      "min_price_cents": 55,
       "ensemble": {
         "ml_weight": 0.10,
         "threshold": 0.70,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 90,
+        "max_price_cents": 85,
         "pnl_sweep_total_pnl": 326.0,
         "pnl_sweep_source": "ensemble_combo_sweep"
       }
