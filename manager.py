@@ -264,22 +264,56 @@ def build_dashboard(
             f"[{p_style}]${p:+.2f}[/]",
         )
 
+    # --- Bot Log (last 15 lines from most recent trading log) ---
+    log_lines = []
+    log_dir = PROJECT_ROOT / "logs"
+    log_files = sorted(log_dir.glob("trading*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if log_files:
+        try:
+            with open(log_files[0], "r", errors="ignore") as f:
+                f.seek(0, 2)
+                fsize = f.tell()
+                f.seek(max(0, fsize - 8192))
+                all_lines = f.read().splitlines()
+            # Just show the last 15 INFO lines, no filtering
+            for line in all_lines:
+                if "| INFO" in line:
+                    # Strip timestamp prefix to save space
+                    short = line.split(" | ", 2)[-1][:100]
+                    log_lines.append(short)
+            log_lines = log_lines[-15:]
+        except Exception:
+            pass
+
+    if not log_lines:
+        log_lines = ["  Waiting for bot logs..."]
+
+    log_text = "\n".join(log_lines)
+
     # --- Assemble Layout ---
     layout = Layout()
     layout.split_column(
         Layout(Panel(header, style="bold blue"), size=3),
         Layout(name="main"),
-        Layout(Panel(Text.from_markup(retrain_text), title="Model Retrain", border_style="magenta"), size=7),
     )
     layout["main"].split_row(
-        Layout(name="left"),
-        Layout(name="right"),
+        Layout(name="left", ratio=2),
+        Layout(name="right", ratio=3),
     )
+    # Left: retrain status + entry price band
     layout["left"].split_column(
-        Layout(Panel(bal_table, border_style="green"), ratio=3),
+        Layout(Panel(Text.from_markup(retrain_text), title="Model Retrain", border_style="magenta"), ratio=2),
         Layout(Panel(band_table, border_style="cyan"), ratio=2),
     )
-    layout["right"].update(Panel(recent_table, border_style="yellow"))
+    # Right: balance on top, recent trades + log on bottom
+    layout["right"].split_column(
+        Layout(Panel(bal_table, border_style="green"), ratio=2),
+        Layout(name="right_bottom", ratio=3),
+    )
+    layout["right_bottom"].split_row(
+        Layout(Panel(recent_table, border_style="yellow"), ratio=1),
+        Layout(Panel(Text(log_text), title="Bot Log", border_style="blue"), ratio=1),
+    )
 
     return layout
 

@@ -1,33 +1,66 @@
 # Kalshi 15-Minute Multi-Asset Trading Bot
 
-Binary options trading bot for Kalshi's 15-minute crypto price prediction markets (BTC, ETH, SOL, XRP). Uses Binance tick data for signal generation, an XGBoost ML model blended with rule-based fusion signals, and half-Kelly position sizing.
+Binary options trading bot for Kalshi's 15-minute crypto price prediction markets (BTC, ETH, SOL, XRP). Uses a 3-way dynamic ensemble (XGBoost + LSTM + Fusion) with exponential confidence scaling for trade decisions.
+
+## Architecture
+
+### 3-Way Dynamic Ensemble
+```
+ensemble_p = xgb_w * xgb_p + lstm_w * lstm_p + fusion_w * fusion_p
+```
+- **XGBoost**: 22 features, 88% test accuracy. Looks back 15 minutes via persistent tick buffer.
+  Top features: price_vs_open (41%), velocity_900s (19%), velocity_300s (4%).
+- **LSTM (v4)**: Conv1D + BatchNorm + BiLSTM + Attention, 87% test accuracy.
+  Looks back 3 minutes (180 x 1-second bars). Captures micro price patterns.
+  StandardScaler normalization fitted on training data, saved with model.
+- **Fusion**: Rule-based signal processors (TickVelocity, DeribitPCR).
+  Acts as confidence dampener (~0.50), prevents overconfident trades.
+- **Dynamic weighting**: `w = min_w + (max_w - min_w) * confidence^4.5`
+  Uncertain signals get low weight, confident signals get amplified.
+
+### Data Sources
+- **Training data**: Binance.com Data Vision CSVs (30 days, ~1M ticks/day)
+- **Live tick data**: Coinbase Exchange WebSocket (`wss://ws-feed.exchange.coinbase.com`)
+  ~100+ ticks/min — matches training data density. Coinbase trades saved to aggTrade CSVs.
+- **Live Kalshi prices**: Kalshi WebSocket (real-time ticker) with REST poller fallback (2s)
+- **Kalshi polling data**: JSONL files for backtesting (2-second snapshots)
+
+### Model Lookback Windows
+- **XGBoost**: 15-minute lookback via persistent tick buffer (500K maxlen).
+  Features: velocity_30s/60s/300s/900s, volatility, volume, buy_ratio.
+  Uses bisect-based O(log n) lookups for price and tick window queries.
+- **LSTM**: 3-minute lookback (180 x 1s bars). Per-window buffer (5K maxlen).
+  Conv1D captures local patterns, BiLSTM captures sequence dependencies.
+  Bisect-based tick filtering for window extraction.
+- Both predict: will price at minute 15 be higher or lower than price at minute 0?
 
 ## Pipeline Overview
 
 ```
 1. Download Data        download_binance_aggtrades.py  (Data Vision, 30 days)
-         |
-         v
-2. Generate Features    generate_training_data.py      (31 features)
-         |
-         v
-3. Train Model          train_xgb.py                   (per-asset XGBoost)
-         |
-         v
-4. Backtest             backtest_ticks.py
-         |
-         v
-5. Ensemble Sweep       ensemble_sweep.py  -->  config/trading.json  (accuracy-based)
-         |
-         v
-6. PnL Sweep            pnl_sweep.py  -->  config/trading.json  (dollar PnL-based)
-         |
-         v
-7. Run Bot              main.py (dry-run or live)
-         |
-         +--> Live data collection (Binance WS + Kalshi polls)
-         +--> Rolling PnL tune every 2h (auto, uses live data)
-         +--> Hot-reload config at each window boundary
+2. Generate XGB Data    generate_training_data.py      (22 features, bisect-optimized)
+3. Train XGBoost        train_xgb.py                   (per-asset, dm 2+)
+4. Generate LSTM Data   generate_lstm_training_data.py  (180s sequences, 15 features)
+5. Train LSTM           train_lstm.py                   (Conv1D+BiLSTM, GPU accelerated)
+6. Fetch Recent Data    fetch_recent_aggtrades.py       (REST gap fill)
+7. Purge Old Data       weekly_retrain.py               (>14 days)
+8. Ensemble Sweep       ensemble_combo_sweep.py         (3-way dynamic, writes config)
+```
+
+## Running
+
+```bash
+# Terminal UI manager (recommended)
+python manager.py                          # Dry run, retrain Sunday 6am UTC
+python manager.py --real                   # Real trading
+python manager.py --retrain-day saturday   # Custom retrain day
+
+# Manual retrain with progress display
+python retrain.py                          # Full retrain
+python retrain.py --skip-download          # Skip data download
+
+# Direct bot (without manager)
+python main.py --assets BTC,ETH,SOL,XRP
 ```
 
 ---

@@ -9,7 +9,9 @@ v2 changes:
 - 15 features per timestep (was 7)
 - Added: price_vs_open (#1 XGBoost feature), rolling momentum (5s/10s/30s),
   rolling volatility (10s/30s), VWAP deviation, tick intensity, cumulative buy ratio
+v2.1: Bisect-based tick filtering for O(log n) window extraction.
 """
+import bisect
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -73,25 +75,34 @@ def extract_lstm_sequence(
     # Define the time window
     start_time = timestamp - timedelta(seconds=seq_len)
 
-    # Filter ticks within the window
-    relevant_ticks = []
+    # Build sorted index and use bisect for O(log n) window extraction
+    if not tick_buffer:
+        return None
+
+    # Ensure UTC and build timestamp list for bisect
+    ts_list = []
     for tick in tick_buffer:
         ts = tick["ts"]
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        if start_time <= ts <= timestamp:
-            relevant_ticks.append({
-                "ts": ts,
-                "price": float(tick["price"]),
-                "qty": float(tick.get("qty", 0)),
-                "is_buyer": bool(tick.get("is_buyer", False)),
-            })
+        ts_list.append(ts)
+
+    lo = bisect.bisect_left(ts_list, start_time)
+    hi = bisect.bisect_right(ts_list, timestamp)
+
+    relevant_ticks = []
+    for i in range(lo, hi):
+        tick = tick_buffer[i]
+        ts = ts_list[i]
+        relevant_ticks.append({
+            "ts": ts,
+            "price": float(tick["price"]),
+            "qty": float(tick.get("qty", 0)),
+            "is_buyer": bool(tick.get("is_buyer", False)),
+        })
 
     if not relevant_ticks:
         return None
-
-    # Sort by timestamp
-    relevant_ticks.sort(key=lambda t: t["ts"])
 
     # Resample into 1-second bars
     bars = []

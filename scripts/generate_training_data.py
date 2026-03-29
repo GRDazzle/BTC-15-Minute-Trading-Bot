@@ -30,7 +30,7 @@ from backtester.data_loader_ticks import (
     generate_tick_windows,
     resample_ticks,
 )
-from ml.features import FEATURE_NAMES, extract_features
+from ml.features import FEATURE_NAMES, extract_features, build_tick_index
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
@@ -126,16 +126,17 @@ def extract_window_features(
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
 
-        # Extract features — filter buffer to last 20 min for efficiency
-        cutoff = current_check - timedelta(seconds=1200)
-        recent_raw = [t for t in raw_tick_buffer if t["ts"] >= cutoff]
+        # Build bisect index for O(log n) lookups
+        ts_idx, sorted_raw = build_tick_index(list(raw_tick_buffer))
         feats = extract_features(
-            tick_buffer=recent_raw,
+            tick_buffer=None,  # not used when index provided
             price_history=list(price_history),
             current_price=current_price,
             timestamp=current_check,
             decision_minute=dm,
             window_open_price=window.price_open,
+            ts_index=ts_idx,
+            sorted_ticks=sorted_raw,
         )
         feats["label"] = label
         feats["window_start"] = window.window_start.isoformat()
