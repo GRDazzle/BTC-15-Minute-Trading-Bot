@@ -35,7 +35,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine
 from ml.lstm_model import load_model as load_lstm
 from ml.lstm_features import extract_lstm_sequence, LSTM_SEQ_LEN
 
-DATA_DIR = PROJECT_ROOT / "data" / "aggtrades"
+DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 KALSHI_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
 FG_CSV = PROJECT_ROOT / "data" / "historical" / "fear_greed.csv"
 MODEL_DIR = PROJECT_ROOT / "models"
@@ -265,7 +265,7 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     config = {
         "initial_balance": 50.0 if asset == "BTC" else 25.0,
         "max_contracts_per_trade": 20 if asset == "BTC" else 10,
-        "min_price_cents": 20,
+        "min_price_cents": 55,
     }
 
     print(f"\n{'='*70}")
@@ -273,7 +273,7 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     print(f"{'='*70}")
 
     THRESHOLDS = [0.55, 0.58, 0.60, 0.62, 0.65, 0.70]
-    MAX_PRICES = [70, 75, 80, 85]  # Hard cap at 85c (>85c is unprofitable)
+    MAX_PRICES = [70, 75, 80]  # Hard cap at 80c
     MIN_WS = [0.10, 0.20, 0.30]
     MAX_WS = [0.40, 0.50, 0.60, 0.70, 0.80]
 
@@ -366,7 +366,7 @@ def _write_config(asset: str, best: dict):
     # ml_weight in config acts as xgb_min_w for dynamic weighting
     ens["ml_weight"] = best["min_w_a"]
     ens["threshold"] = best["threshold"]
-    ens["max_price_cents"] = min(best["max_price"], 85)  # Never exceed 85c
+    ens["max_price_cents"] = min(best["max_price"], 80)  # Never exceed 80c
     ens["pnl_sweep_total_pnl"] = round(best["total_pnl"], 2)
     ens["pnl_sweep_source"] = "ensemble_combo_sweep"
     ens["win_rate"] = round(best["win_rate"], 1)

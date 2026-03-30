@@ -243,8 +243,8 @@ def main():
         log("WARNING: REST aggTrades fetch failed, continuing with existing data")
 
     # Step 7: Purge old data (>14 days) — after fetch so new data isn't purged
-    purge_kalshi_polls(max_age_days=14)
-    purge_old_aggtrades(max_age_days=14)
+    purge_kalshi_polls(max_age_days=45)
+    purge_old_aggtrades(max_age_days=45)
 
     # Step 8: 3-way ensemble combo sweep (XGB + LSTM + Fusion with dynamic weighting)
     ok = run_step("Ensemble combo sweep (3-way)", [

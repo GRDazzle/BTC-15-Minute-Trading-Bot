@@ -2,76 +2,80 @@
   "defaults": {
     "initial_balance": 25.0,
     "max_contracts_per_trade": 10,
-    "max_price_cents": 85,
-    "min_price_cents": 20
+    "max_price_cents": 80,
+    "min_price_cents": 55
   },
   "assets": {
     "BTC": {
       "initial_balance": 50.0,
       "max_contracts_per_trade": 20,
-      "max_price_cents": 85,
-      "min_price_cents": 20,
+      "max_price_cents": 80,
+      "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.3,
+        "ml_weight": 0.5,
         "threshold": 0.65,
         "min_dm": 2,
+        "accuracy": 77.8,
+        "net_correct": 326,
+        "traded_pct": 46.7,
+        "pnl_sweep_total_pnl": 1003.76,
+        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 70,
-        "pnl_sweep_total_pnl": 834.0,
-        "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 67.7,
-        "traded_count": 489
+        "max_price_cents": 75
       }
     },
     "ETH": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 85,
-      "min_price_cents": 20,
+      "max_price_cents": 80,
+      "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.2,
-        "threshold": 0.62,
+        "ml_weight": 0.3,
+        "threshold": 0.6,
         "min_dm": 2,
+        "accuracy": 81.3,
+        "net_correct": 464,
+        "traded_pct": 59.0,
+        "pnl_sweep_total_pnl": 636.4,
+        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 70,
-        "pnl_sweep_total_pnl": 430.3,
-        "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 69.0,
-        "traded_count": 439
+        "max_price_cents": 80
       }
     },
     "SOL": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 85,
-      "min_price_cents": 20,
+      "max_price_cents": 80,
+      "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.3,
+        "ml_weight": 0.4,
         "threshold": 0.65,
         "min_dm": 2,
+        "accuracy": 80.1,
+        "net_correct": 435,
+        "traded_pct": 57.5,
+        "pnl_sweep_total_pnl": 547.41,
+        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 469.5,
-        "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 76.4,
-        "traded_count": 399
+        "max_price_cents": 80
       }
     },
     "XRP": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 85,
-      "min_price_cents": 20,
+      "max_price_cents": 80,
+      "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.2,
-        "threshold": 0.65,
+        "ml_weight": 0.5,
+        "threshold": 0.7,
         "min_dm": 2,
+        "accuracy": 81.9,
+        "net_correct": 422,
+        "traded_pct": 52.7,
+        "pnl_sweep_total_pnl": 569.87,
+        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 402.8,
-        "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 76.1,
-        "traded_count": 531
+        "max_price_cents": 80
       }
     }
   }

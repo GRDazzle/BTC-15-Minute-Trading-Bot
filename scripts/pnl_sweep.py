@@ -44,7 +44,7 @@ from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionP
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
 from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine
 
-DATA_DIR = PROJECT_ROOT / "data" / "aggtrades"
+DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 KALSHI_DATA_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
 FG_CSV = PROJECT_ROOT / "data" / "historical" / "fear_greed.csv"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "pnl_sweep"

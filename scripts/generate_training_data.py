@@ -32,7 +32,7 @@ from backtester.data_loader_ticks import (
 )
 from ml.features import FEATURE_NAMES, extract_features, build_tick_index
 
-DATA_DIR = PROJECT_ROOT / "data" / "aggtrades"
+DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 
 
@@ -95,6 +95,18 @@ def extract_window_features(
     current_check = decision_start + check_interval
     bar_idx = 0
 
+    # Build sorted index ONCE from persistent buffer (O(n log n))
+    # Then incrementally insert new ticks (O(log n) per tick)
+    import bisect
+    from ml.features import _ensure_utc
+    ts_idx = []
+    sorted_raw = []
+    for t in raw_tick_buffer:
+        ts = _ensure_utc(t["ts"])
+        idx = bisect.bisect_left(ts_idx, ts)
+        ts_idx.insert(idx, ts)
+        sorted_raw.insert(idx, t)
+
     while current_check < window.window_end:
         next_check = current_check + check_interval
 
@@ -105,15 +117,21 @@ def extract_window_features(
             tick_buffer.append(bar)
             bar_idx += 1
 
-        # Feed raw ticks up to current_check for volume features
+        # Feed raw ticks up to current_check — add to both buffer AND sorted index
         while raw_tick_idx < len(window.ticks_during) and window.ticks_during[raw_tick_idx].ts < current_check:
             tick = window.ticks_during[raw_tick_idx]
-            raw_tick_buffer.append({
+            tick_dict = {
                 "ts": tick.ts,
                 "price": tick.price,
                 "qty": tick.qty,
                 "is_buyer": tick.is_buyer,
-            })
+            }
+            raw_tick_buffer.append(tick_dict)
+            # Incremental insert into sorted index (O(log n))
+            ts = _ensure_utc(tick.ts)
+            idx = bisect.bisect_left(ts_idx, ts)
+            ts_idx.insert(idx, ts)
+            sorted_raw.insert(idx, tick_dict)
             raw_tick_idx += 1
 
         if len(price_history) < 20:
@@ -126,10 +144,9 @@ def extract_window_features(
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
 
-        # Build bisect index for O(log n) lookups
-        ts_idx, sorted_raw = build_tick_index(list(raw_tick_buffer))
+        # Use pre-built sorted index for O(log n) lookups
         feats = extract_features(
-            tick_buffer=None,  # not used when index provided
+            tick_buffer=None,
             price_history=list(price_history),
             current_price=current_price,
             timestamp=current_check,

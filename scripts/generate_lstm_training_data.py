@@ -28,7 +28,7 @@ from backtester.data_loader_ticks import (
 )
 from ml.lstm_features import LSTM_SEQ_LEN, LSTM_NUM_FEATURES, extract_lstm_sequence
 
-DATA_DIR = PROJECT_ROOT / "data" / "aggtrades"
+DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 
 
@@ -61,30 +61,33 @@ def extract_window_sequences(
     check_interval = timedelta(seconds=10)
     current_check = decision_start + check_interval
 
-    # Index into during ticks
+    # Build sorted tick list once from warmup, append incrementally (ticks arrive in order)
+    sorted_ticks = list(raw_tick_buffer)
+
     tick_idx = 0
 
     while current_check < window.window_end:
         next_check = current_check + check_interval
 
-        # Feed ticks up to current_check
+        # Feed ticks up to current_check — append to sorted list (already chronological)
         while tick_idx < len(window.ticks_during) and window.ticks_during[tick_idx].ts < current_check:
             tick = window.ticks_during[tick_idx]
-            raw_tick_buffer.append({
+            tick_dict = {
                 "ts": tick.ts,
                 "price": tick.price,
                 "qty": tick.qty,
                 "is_buyer": tick.is_buyer,
-            })
+            }
+            sorted_ticks.append(tick_dict)
             tick_idx += 1
 
         # Compute decision minute
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
 
-        # Extract LSTM sequence
+        # Extract LSTM sequence — pass list directly (no copy needed)
         seq = extract_lstm_sequence(
-            list(raw_tick_buffer),
+            sorted_ticks,
             current_check,
             decision_minute=dm,
             seq_len=seq_len,
