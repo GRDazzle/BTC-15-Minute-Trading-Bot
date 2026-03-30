@@ -12,16 +12,15 @@
       "max_price_cents": 80,
       "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.5,
+        "ml_weight": 0.20,
         "threshold": 0.65,
         "min_dm": 2,
-        "accuracy": 77.8,
-        "net_correct": 326,
-        "traded_pct": 46.7,
-        "pnl_sweep_total_pnl": 1003.76,
-        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 75
+        "max_price_cents": 80,
+        "pnl_sweep_total_pnl": 968.2,
+        "pnl_sweep_source": "ensemble_combo_sweep",
+        "win_rate": 80.3,
+        "traded_count": 689
       }
     },
     "ETH": {
@@ -30,16 +29,15 @@
       "max_price_cents": 80,
       "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.3,
-        "threshold": 0.6,
+        "ml_weight": 0.10,
+        "threshold": 0.65,
         "min_dm": 2,
-        "accuracy": 81.3,
-        "net_correct": 464,
-        "traded_pct": 59.0,
-        "pnl_sweep_total_pnl": 636.4,
-        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 80
+        "max_price_cents": 80,
+        "pnl_sweep_total_pnl": 593.2,
+        "pnl_sweep_source": "ensemble_combo_sweep",
+        "win_rate": 83.3,
+        "traded_count": 618
       }
     },
     "SOL": {
@@ -48,16 +46,15 @@
       "max_price_cents": 80,
       "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.4,
-        "threshold": 0.65,
+        "ml_weight": 0.10,
+        "threshold": 0.70,
         "min_dm": 2,
-        "accuracy": 80.1,
-        "net_correct": 435,
-        "traded_pct": 57.5,
-        "pnl_sweep_total_pnl": 547.41,
-        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 80
+        "max_price_cents": 80,
+        "pnl_sweep_total_pnl": 644.2,
+        "pnl_sweep_source": "ensemble_combo_sweep",
+        "win_rate": 83.9,
+        "traded_count": 607
       }
     },
     "XRP": {
@@ -66,16 +63,15 @@
       "max_price_cents": 80,
       "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.5,
-        "threshold": 0.7,
+        "ml_weight": 0.10,
+        "threshold": 0.70,
         "min_dm": 2,
-        "accuracy": 81.9,
-        "net_correct": 422,
-        "traded_pct": 52.7,
-        "pnl_sweep_total_pnl": 569.87,
-        "pnl_sweep_source": "pnl_sweep",
         "max_dm": 8,
-        "max_price_cents": 80
+        "max_price_cents": 80,
+        "pnl_sweep_total_pnl": 602.1,
+        "pnl_sweep_source": "ensemble_combo_sweep",
+        "win_rate": 85.4,
+        "traded_count": 520
       }
     }
   }
