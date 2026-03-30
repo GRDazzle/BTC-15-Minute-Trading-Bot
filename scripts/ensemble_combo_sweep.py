@@ -265,7 +265,7 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     config = {
         "initial_balance": 50.0 if asset == "BTC" else 25.0,
         "max_contracts_per_trade": 20 if asset == "BTC" else 10,
-        "min_price_cents": 65,
+        "min_price_cents": 20,
     }
 
     print(f"\n{'='*70}")

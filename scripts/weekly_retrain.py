@@ -33,33 +33,38 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
-def run_step(name: str, cmd: list[str]) -> bool:
-    """Run a subprocess step. Returns True on success."""
-    log(f"--- {name} ---")
-    log(f"  cmd: {' '.join(cmd)}")
-    start = time.time()
+def run_step(name: str, cmd: list[str], max_retries: int = 2) -> bool:
+    """Run a subprocess step with retry. Returns True on success."""
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            log(f"  Retry {attempt}/{max_retries}...")
+            time.sleep(10)  # Brief pause before retry
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-    )
+        log(f"--- {name} ---")
+        log(f"  cmd: {' '.join(cmd)}")
+        start = time.time()
 
-    elapsed = time.time() - start
-    if result.returncode == 0:
-        log(f"  OK ({elapsed:.0f}s)")
-        # Print last 5 lines of stdout for context
-        lines = result.stdout.strip().splitlines()
-        for line in lines[-5:]:
-            log(f"  > {line}")
-        return True
-    else:
-        log(f"  FAILED (exit {result.returncode}, {elapsed:.0f}s)")
-        # Print stderr for debugging
-        for line in result.stderr.strip().splitlines()[-10:]:
-            log(f"  ! {line}")
-        return False
+        result = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+        )
+
+        elapsed = time.time() - start
+        if result.returncode == 0:
+            log(f"  OK ({elapsed:.0f}s)")
+            lines = result.stdout.strip().splitlines()
+            for line in lines[-5:]:
+                log(f"  > {line}")
+            return True
+        else:
+            log(f"  FAILED (exit {result.returncode}, {elapsed:.0f}s)")
+            for line in result.stderr.strip().splitlines()[-10:]:
+                log(f"  ! {line}")
+
+    log(f"  GAVE UP after {max_retries} attempts")
+    return False
 
 
 KALSHI_POLLS_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
@@ -215,14 +220,19 @@ def main():
     if not ok:
         log("WARNING: LSTM data generation failed, LSTM models will not be updated")
 
-    # Step 5: Train LSTM models
-    ok = run_step("Train LSTM models", [
-        python, "scripts/train_lstm.py",
-        "--asset", assets,
-        "--min-dm", min_dm,
-    ])
-    if not ok:
-        log("WARNING: LSTM training failed, LSTM models will not be updated")
+    # Step 5: Train LSTM models (one at a time to avoid memory crashes)
+    asset_list = [a.strip() for a in assets.split(",")]
+    lstm_failed = False
+    for asset in asset_list:
+        ok = run_step(f"Train LSTM model ({asset})", [
+            python, "scripts/train_lstm.py",
+            "--asset", asset,
+            "--min-dm", min_dm,
+        ])
+        if not ok:
+            lstm_failed = True
+    if lstm_failed:
+        log("WARNING: Some LSTM models failed to train")
 
     # Step 6: Fetch recent aggTrades via REST (fills gap if bot was offline)
     ok = run_step("Fetch recent aggTrades (REST)", [
