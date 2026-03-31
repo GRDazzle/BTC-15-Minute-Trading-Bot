@@ -108,7 +108,7 @@ def extract_window_sequences(
     return rows
 
 
-def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> None:
+def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_filter: str = "all") -> None:
     """Generate LSTM training data for one asset."""
     ticks = load_aggtrades_multi(DATA_DIR, asset, days=days)
     if not ticks:
@@ -129,6 +129,16 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
         ]
         filtered = before - len(windows)
         logger.info("Filtered {} windows with move < {:.4%} ({} -> {})", filtered, min_move, before, len(windows))
+
+    # Filter by day of week
+    if day_filter == "weekday":
+        before = len(windows)
+        windows = [w for w in windows if w.window_start.weekday() < 5]
+        logger.info("Day filter weekday: {} -> {} windows", before, len(windows))
+    elif day_filter == "weekend":
+        before = len(windows)
+        windows = [w for w in windows if w.window_start.weekday() >= 5]
+        logger.info("Day filter weekend: {} -> {} windows", before, len(windows))
 
     logger.info("Generating LSTM training data for {} ({} windows)", asset, len(windows))
 
@@ -163,7 +173,8 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
 
     # Save as .npz
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"{asset.upper()}_lstm_sequences.npz"
+    day_suffix = f"_{day_filter}" if day_filter != "all" else ""
+    out_path = OUTPUT_DIR / f"{asset.upper()}_lstm_sequences{day_suffix}.npz"
     np.savez_compressed(
         out_path,
         X=X,
@@ -199,11 +210,15 @@ def main():
     parser.add_argument("--asset", required=True, help="Asset(s), comma-separated")
     parser.add_argument("--days", type=int, default=None, help="Limit to last N days")
     parser.add_argument("--min-move", type=float, default=0.0001, help="Min price move pct")
+    parser.add_argument(
+        "--day-filter", choices=["all", "weekday", "weekend"], default="all",
+        help="Filter windows by day of week (default: all)",
+    )
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     for asset in assets:
-        generate_for_asset(asset, args.days, min_move=args.min_move)
+        generate_for_asset(asset, args.days, min_move=args.min_move, day_filter=args.day_filter)
 
 
 if __name__ == "__main__":

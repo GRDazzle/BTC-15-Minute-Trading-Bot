@@ -36,9 +36,9 @@ MODEL_DIR = PROJECT_ROOT / "models"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "ml"
 
 
-def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None, exclude_hours: list[int] | None = None) -> pd.DataFrame:
+def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None, exclude_hours: list[int] | None = None, data_suffix: str = "") -> pd.DataFrame:
     """Load training data CSV for an asset."""
-    path = DATA_DIR / f"{asset.upper()}_features.csv"
+    path = DATA_DIR / f"{asset.upper()}_features{data_suffix}.csv"
     if not path.exists():
         raise FileNotFoundError(
             f"Training data not found: {path}\n"
@@ -371,6 +371,7 @@ def train_asset(
     dedup: str = "none",
     exclude_hours: list[int] | None = None,
     model_suffix: str = "",
+    data_suffix: str = "",
 ) -> None:
     """Full training pipeline for one asset."""
     dm_range = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
@@ -379,7 +380,7 @@ def train_asset(
     print(f"Training XGBoost for {asset} [{dm_range}]{suffix_label}")
     print(f"{'='*60}")
 
-    df = load_data(asset, min_dm=min_dm, max_dm=max_dm, exclude_hours=exclude_hours)
+    df = load_data(asset, min_dm=min_dm, max_dm=max_dm, exclude_hours=exclude_hours, data_suffix=data_suffix)
 
     # Optional window deduplication
     if dedup != "none":
@@ -431,6 +432,10 @@ def main():
         help="Comma-separated UTC hours to exclude (e.g. '1,9,10,17'). "
              "Removes rows from hours with low historical accuracy.",
     )
+    parser.add_argument(
+        "--data-suffix", type=str, default="",
+        help="Suffix for training data file (e.g. '_weekday' -> BTC_features_weekday.csv)",
+    )
     args = parser.parse_args()
 
     # Parse exclude hours
@@ -448,6 +453,7 @@ def main():
             dedup=args.dedup,
             exclude_hours=exclude_hours,
             model_suffix=args.model_suffix,
+            data_suffix=args.data_suffix,
         )
 
 

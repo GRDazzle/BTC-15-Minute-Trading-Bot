@@ -160,7 +160,7 @@ def sweep_combo(
     }
 
 
-def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
+def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8, model_suffix: str = "", day_filter: str = "all"):
     """Run all 3 ensemble combinations for one asset."""
     # Load Kalshi data
     kalshi_windows = load_kalshi_windows(KALSHI_DIR, asset)
@@ -179,9 +179,19 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     windows = generate_tick_windows(ticks, min_warmup_ticks=1, min_during_ticks=1)
     windows = [w for w in windows if w.window_end in kalshi_close_times]
 
+    # Filter by day of week
+    if day_filter == "weekday":
+        before = len(windows)
+        windows = [w for w in windows if w.window_start.weekday() < 5]
+        print(f"  Day filter weekday: {before} -> {len(windows)} windows")
+    elif day_filter == "weekend":
+        before = len(windows)
+        windows = [w for w in windows if w.window_start.weekday() >= 5]
+        print(f"  Day filter weekend: {before} -> {len(windows)} windows")
+
     # Run XGB + Fusion backtest
     fg = load_fear_greed(FG_CSV) if FG_CSV.exists() else {}
-    ml = MLProcessor(asset=asset, model_dir=MODEL_DIR, confidence_threshold=0.60)
+    ml = MLProcessor(asset=asset, model_dir=MODEL_DIR, confidence_threshold=0.60, model_suffix=model_suffix)
     procs = [
         SpikeDetectionProcessor(spike_threshold=0.003, velocity_threshold=0.0015,
                                 lookback_periods=20, min_confidence=0.55),
@@ -192,7 +202,7 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     window_data = sim.run_ticks_collect_probabilities(windows, fg)
 
     # Load LSTM model
-    lstm_path = MODEL_DIR / f"{asset}_lstm.pt"
+    lstm_path = MODEL_DIR / f"{asset}{model_suffix}_lstm.pt"
     if not lstm_path.exists():
         print(f"  No LSTM model for {asset}")
         return
@@ -348,20 +358,28 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8):
     for mode_name, r in results_by_mode.items():
         print(f"  {mode_name:20s}: PnL=${r['total_pnl']:+8.2f}  WR={r['win_rate']:5.1f}%  trades={r['traded_count']}")
 
+    # Derive config key from model_suffix
+    if model_suffix == "_weekday":
+        config_key = "ensemble_weekday"
+    elif model_suffix == "_weekend":
+        config_key = "ensemble_weekend"
+    else:
+        config_key = "ensemble"
+
     # Write best 3-way params to config
     best_3way = results_by_mode.get("XGB+LSTM+Fusion")
     if best_3way:
-        _write_config(asset, best_3way)
+        _write_config(asset, best_3way, config_key=config_key)
 
 
-def _write_config(asset: str, best: dict):
+def _write_config(asset: str, best: dict, config_key: str = "ensemble"):
     """Update config/trading.json with best 3-way ensemble params."""
     config_path = PROJECT_ROOT / "config" / "trading.json"
     with open(config_path, "r") as f:
         cfg = json.load(f)
 
     asset_cfg = cfg.get("assets", {}).get(asset, {})
-    ens = asset_cfg.get("ensemble", {})
+    ens = asset_cfg.get(config_key, {})
 
     # ml_weight in config acts as xgb_min_w for dynamic weighting
     ens["ml_weight"] = best["min_w_a"]
@@ -372,7 +390,7 @@ def _write_config(asset: str, best: dict):
     ens["win_rate"] = round(best["win_rate"], 1)
     ens["traded_count"] = best["traded_count"]
 
-    asset_cfg["ensemble"] = ens
+    asset_cfg[config_key] = ens
     cfg.setdefault("assets", {})[asset] = asset_cfg
 
     with open(config_path, "w") as f:
@@ -387,11 +405,16 @@ def main():
     parser.add_argument("--asset", required=True)
     parser.add_argument("--min-dm", type=int, default=2)
     parser.add_argument("--max-dm", type=int, default=8)
+    parser.add_argument("--model-suffix", type=str, default="",
+                        help="Model filename suffix (e.g. '_weekday')")
+    parser.add_argument("--day-filter", choices=["all", "weekday", "weekend"], default="all",
+                        help="Filter windows by day of week")
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     for asset in assets:
-        run_asset(asset, min_dm=args.min_dm, max_dm=args.max_dm)
+        run_asset(asset, min_dm=args.min_dm, max_dm=args.max_dm,
+                  model_suffix=args.model_suffix, day_filter=args.day_filter)
 
 
 if __name__ == "__main__":

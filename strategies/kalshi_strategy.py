@@ -200,6 +200,12 @@ class AssetState:
     ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) from sweep
     early_ml_processor: Optional[Any] = None  # MLProcessor for dm 2-3 (optional)
     early_ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) for dm 2-3
+    weekday_ml_processor: Optional[Any] = None  # MLProcessor for weekdays
+    weekday_lstm_processor: Optional[Any] = None  # LSTMProcessor for weekdays
+    weekday_ensemble_weights: Optional[tuple] = None
+    weekend_ml_processor: Optional[Any] = None  # MLProcessor for weekends
+    weekend_lstm_processor: Optional[Any] = None  # LSTMProcessor for weekends
+    weekend_ensemble_weights: Optional[tuple] = None
 
     # Circuit breaker: stop trading after 3 consecutive losses (auto-reset after 1 hour)
     consecutive_losses: int = 0
@@ -318,6 +324,8 @@ class KalshiMultiAssetStrategy:
         # Load ensemble params from config
         ensemble_config = self._load_ensemble_config()
         early_ensemble_config = self._load_early_ensemble_config()
+        weekday_ensemble_config = self._load_day_ensemble_config("ensemble_weekday")
+        weekend_ensemble_config = self._load_day_ensemble_config("ensemble_weekend")
 
         # Build per-asset state
         self.states: dict[str, AssetState] = {}
@@ -416,6 +424,42 @@ class KalshiMultiAssetStrategy:
                             asset, ens["max_price_cents"],
                         )
 
+            # Try loading weekday/weekend model variants (fallback to standard)
+            if _ML_AVAILABLE:
+                for variant in ("weekday", "weekend"):
+                    suffix = f"_{variant}"
+                    try:
+                        ml_proc = MLProcessor(
+                            asset=asset, model_dir=model_dir,
+                            confidence_threshold=ml_confidence_threshold,
+                            tickvel_proc=state.velocity, model_suffix=suffix,
+                        )
+                        setattr(state, f"{variant}_ml_processor", ml_proc)
+                        model_path = model_dir / f"{asset}{suffix}_xgb.json"
+                        self._model_mtimes[f"{asset}{suffix}"] = self._get_mtime(model_path)
+                        logger.info("%s ML model loaded for %s", variant.capitalize(), asset)
+                    except FileNotFoundError:
+                        pass
+
+                    try:
+                        lstm_proc = LSTMProcessor(
+                            asset=asset, model_dir=model_dir, model_suffix=suffix,
+                        )
+                        setattr(state, f"{variant}_lstm_processor", lstm_proc)
+                        logger.info("%s LSTM model loaded for %s", variant.capitalize(), asset)
+                    except (FileNotFoundError, Exception):
+                        pass
+
+                    # Load variant ensemble weights
+                    var_config = weekday_ensemble_config if variant == "weekday" else weekend_ensemble_config
+                    if asset in var_config and getattr(state, f"{variant}_ml_processor") is not None:
+                        ens = var_config[asset]
+                        setattr(state, f"{variant}_ensemble_weights", (ens["ml_weight"], ens["threshold"]))
+                        logger.info(
+                            "%s ensemble for %s: ml_weight=%.2f threshold=%.2f",
+                            variant.capitalize(), asset, ens["ml_weight"], ens["threshold"],
+                        )
+
             self.states[asset] = state
 
         if ml_loaded:
@@ -497,6 +541,20 @@ class KalshiMultiAssetStrategy:
             logger.warning("Could not load early ensemble config: %s", e)
         return result
 
+    def _load_day_ensemble_config(self, config_key: str) -> dict[str, dict]:
+        """Load per-asset weekday/weekend ensemble params from config/trading.json."""
+        result = {}
+        try:
+            with open(self.CONFIG_PATH, "r") as f:
+                config = json.load(f)
+            for asset, asset_cfg in config.get("assets", {}).items():
+                ens = asset_cfg.get(config_key)
+                if ens and "ml_weight" in ens and "threshold" in ens:
+                    result[asset] = ens
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            logger.warning("Could not load %s config: %s", config_key, e)
+        return result
+
     # -- hot-reload ---------------------------------------------------------------
 
     @staticmethod
@@ -533,6 +591,16 @@ class KalshiMultiAssetStrategy:
                 if early_key not in models_changed:
                     models_changed.append(early_key)
 
+            # Check weekday/weekend model files
+            for variant in ("weekday", "weekend"):
+                var_key = f"{asset}_{variant}"
+                var_path = self._model_dir / f"{asset}_{variant}_xgb.json"
+                new_var_mtime = self._get_mtime(var_path)
+                old_var_mtime = self._model_mtimes.get(var_key, 0.0)
+                if new_var_mtime != old_var_mtime and new_var_mtime > 0:
+                    if var_key not in models_changed:
+                        models_changed.append(var_key)
+
         if not config_changed and not models_changed:
             return
 
@@ -553,6 +621,12 @@ class KalshiMultiAssetStrategy:
                 self._reload_early_model(asset)
                 early_model_path = self._model_dir / f"{asset}_early_xgb.json"
                 self._model_mtimes[key] = self._get_mtime(early_model_path)
+            elif key.endswith("_weekday") or key.endswith("_weekend"):
+                variant = "weekday" if key.endswith("_weekday") else "weekend"
+                asset = key.replace(f"_{variant}", "")
+                self._reload_variant_model(asset, variant)
+                var_path = self._model_dir / f"{asset}_{variant}_xgb.json"
+                self._model_mtimes[key] = self._get_mtime(var_path)
             else:
                 self._reload_model(key)
                 model_path = self._model_dir / f"{key}_xgb.json"
@@ -597,6 +671,21 @@ class KalshiMultiAssetStrategy:
                         asset, old, new[0], new[1],
                     )
 
+            # Update weekday/weekend ensemble weights
+            for variant in ("weekday", "weekend"):
+                var_ens = asset_cfg.get(f"ensemble_{variant}")
+                ml_attr = f"{variant}_ml_processor"
+                weights_attr = f"{variant}_ensemble_weights"
+                if var_ens and "ml_weight" in var_ens and "threshold" in var_ens and getattr(state, ml_attr) is not None:
+                    old = getattr(state, weights_attr)
+                    new = (var_ens["ml_weight"], var_ens["threshold"])
+                    if old != new:
+                        setattr(state, weights_attr, new)
+                        logger.info(
+                            "[hot-reload] %s %s ensemble: %s -> ml_weight=%.2f threshold=%.2f",
+                            asset, variant, old, new[0], new[1],
+                        )
+
             # Update execution adapter price bounds
             # Ensemble max_price_cents overrides asset-level (more specific)
             max_p = asset_cfg.get("max_price_cents")
@@ -613,7 +702,7 @@ class KalshiMultiAssetStrategy:
                     logger.info(
                         "[hot-reload] %s max_price: %s -> %dc (source: %s)",
                         asset, old_max, effective_max_p,
-                        "ensemble" if ens_max_p or ens_early_max_p else "asset",
+                        "ensemble" if ens_max_p else "asset",
                     )
                 self.execution._max_price[asset] = effective_max_p
             if min_p is not None:
@@ -696,6 +785,47 @@ class KalshiMultiAssetStrategy:
             state.early_ensemble_weights = None
         except Exception:
             logger.exception("[hot-reload] Failed to reload early ML model for %s", asset)
+
+    def _reload_variant_model(self, asset: str, variant: str) -> None:
+        """Re-load a weekday/weekend XGBoost model from disk."""
+        if not _ML_AVAILABLE:
+            return
+
+        state = self.states.get(asset)
+        if state is None:
+            return
+
+        suffix = f"_{variant}"
+        ml_attr = f"{variant}_ml_processor"
+        weights_attr = f"{variant}_ensemble_weights"
+        config_key = f"ensemble_{variant}"
+
+        try:
+            new_processor = MLProcessor(
+                asset=asset,
+                model_dir=self._model_dir,
+                confidence_threshold=self._ml_confidence_threshold,
+                tickvel_proc=state.velocity,
+                model_suffix=suffix,
+            )
+            setattr(state, ml_attr, new_processor)
+            logger.info("[hot-reload] Reloaded %s ML model for %s", variant, asset)
+
+            if getattr(state, weights_attr) is None:
+                var_config = self._load_day_ensemble_config(config_key)
+                if asset in var_config:
+                    ens = var_config[asset]
+                    setattr(state, weights_attr, (ens["ml_weight"], ens["threshold"]))
+                    logger.info(
+                        "[hot-reload] Activated %s ensemble for %s: ml_weight=%.2f threshold=%.2f",
+                        variant, asset, ens["ml_weight"], ens["threshold"],
+                    )
+        except FileNotFoundError:
+            logger.warning("[hot-reload] %s model file disappeared for %s", variant.capitalize(), asset)
+            setattr(state, ml_attr, None)
+            setattr(state, weights_attr, None)
+        except Exception:
+            logger.exception("[hot-reload] Failed to reload %s ML model for %s", variant, asset)
 
     def _in_blackout(self, utc_time: Optional[dt_time] = None) -> bool:
         """Check if the given UTC time falls within any blackout window."""
@@ -1311,10 +1441,23 @@ class KalshiMultiAssetStrategy:
         metadata["decision_minute"] = dm
         spot_price = float(state.current_price) if state.current_price else 0.0
 
-        # Always use standard model for all dms (trained on dm 2+, higher accuracy)
-        active_ml = state.ml_processor
-        active_weights = state.ensemble_weights
-        model_label = "standard"
+        # Select model variant based on day of week (fallback to standard)
+        dow = datetime.now(timezone.utc).weekday()
+        if dow >= 5 and state.weekend_ml_processor is not None and state.weekend_ensemble_weights is not None:
+            active_ml = state.weekend_ml_processor
+            active_weights = state.weekend_ensemble_weights
+            active_lstm = state.weekend_lstm_processor
+            model_label = "weekend"
+        elif dow < 5 and state.weekday_ml_processor is not None and state.weekday_ensemble_weights is not None:
+            active_ml = state.weekday_ml_processor
+            active_weights = state.weekday_ensemble_weights
+            active_lstm = state.weekday_lstm_processor
+            model_label = "weekday"
+        else:
+            active_ml = state.ml_processor
+            active_weights = state.ensemble_weights
+            active_lstm = state.lstm_processor
+            model_label = "standard"
 
         # Ensemble path: blend ML + fusion probabilities
         if active_weights is not None and active_ml is not None:
@@ -1333,8 +1476,8 @@ class KalshiMultiAssetStrategy:
 
             # Get LSTM probability (if available)
             lstm_p = None
-            if state.lstm_processor is not None:
-                lstm_p = state.lstm_processor.predict_proba(
+            if active_lstm is not None:
+                lstm_p = active_lstm.predict_proba(
                     state.current_price, list(state.price_history), metadata,
                 )
 

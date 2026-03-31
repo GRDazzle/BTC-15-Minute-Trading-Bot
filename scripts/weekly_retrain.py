@@ -255,6 +255,53 @@ def main():
     if not ok:
         log("WARNING: Ensemble combo sweep failed")
 
+    # Step 9: Weekday/weekend model variants
+    for day_filter in ["weekday", "weekend"]:
+        suffix = f"_{day_filter}"
+
+        ok = run_step(f"Generate XGB training data ({day_filter})", [
+            python, "scripts/generate_training_data.py",
+            "--asset", assets, "--days", days,
+            "--day-filter", day_filter,
+        ])
+        if not ok:
+            log(f"WARNING: {day_filter} XGB data gen failed, skipping {day_filter} models")
+            continue
+
+        ok = run_step(f"Train XGB models ({day_filter})", [
+            python, "scripts/train_xgb.py",
+            "--asset", assets, "--min-dm", min_dm,
+            "--data-suffix", suffix, "--model-suffix", suffix,
+        ])
+        if not ok:
+            log(f"WARNING: {day_filter} XGB training failed")
+
+        ok = run_step(f"Generate LSTM data ({day_filter})", [
+            python, "scripts/generate_lstm_training_data.py",
+            "--asset", assets, "--days", days,
+            "--day-filter", day_filter,
+        ])
+        if not ok:
+            log(f"WARNING: {day_filter} LSTM data gen failed")
+
+        for asset in asset_list:
+            ok = run_step(f"Train LSTM ({asset} {day_filter})", [
+                python, "scripts/train_lstm.py",
+                "--asset", asset, "--min-dm", min_dm,
+                "--data-suffix", suffix, "--model-suffix", suffix,
+            ])
+            if not ok:
+                log(f"WARNING: {day_filter} LSTM training failed for {asset}")
+
+        ok = run_step(f"Ensemble sweep ({day_filter})", [
+            python, "scripts/ensemble_combo_sweep.py",
+            "--asset", assets,
+            "--min-dm", min_dm, "--max-dm", "8",
+            "--model-suffix", suffix, "--day-filter", day_filter,
+        ])
+        if not ok:
+            log(f"WARNING: {day_filter} ensemble sweep failed")
+
     total = time.time() - pipeline_start
     log("=" * 60)
     if failed:

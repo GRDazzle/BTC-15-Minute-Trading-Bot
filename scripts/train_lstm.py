@@ -36,6 +36,7 @@ def train_asset(
     min_dm: int = 2,
     max_dm: int | None = None,
     model_suffix: str = "",
+    data_suffix: str = "",
     epochs: int = 150,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -46,7 +47,7 @@ def train_asset(
     dropout: float = 0.3,
 ) -> None:
     """Train LSTM for one asset."""
-    data_path = DATA_DIR / f"{asset.upper()}_lstm_sequences.npz"
+    data_path = DATA_DIR / f"{asset.upper()}_lstm_sequences{data_suffix}.npz"
     if not data_path.exists():
         print(f"No LSTM training data for {asset}. Run generate_lstm_training_data.py first.")
         return
@@ -322,6 +323,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--hidden-size", type=int, default=64, help="Hidden size")
     parser.add_argument("--num-layers", type=int, default=2, help="LSTM layers")
+    parser.add_argument("--data-suffix", type=str, default="",
+                        help="Suffix for training data file (e.g. '_weekday')")
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
@@ -331,6 +334,7 @@ def main():
             min_dm=args.min_dm,
             max_dm=args.max_dm,
             model_suffix=args.model_suffix,
+            data_suffix=args.data_suffix,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,

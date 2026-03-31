@@ -267,7 +267,7 @@ def build_dashboard(
     # --- Bot Log (last 15 lines from most recent trading log) ---
     log_lines = []
     log_dir = PROJECT_ROOT / "logs"
-    log_files = sorted(log_dir.glob("trading*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    log_files = sorted(log_dir.glob("trading*.log"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
     if log_files:
         try:
             with open(log_files[0], "r", errors="ignore") as f:

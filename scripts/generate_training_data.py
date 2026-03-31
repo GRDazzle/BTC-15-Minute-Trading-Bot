@@ -176,7 +176,7 @@ def extract_window_features(
     return rows
 
 
-def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> None:
+def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_filter: str = "all") -> None:
     """Generate training data CSV for one asset."""
     ticks = load_aggtrades_multi(DATA_DIR, asset, days=days)
     if not ticks:
@@ -197,6 +197,16 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
         ]
         filtered = before - len(windows)
         logger.info("Filtered {} windows with move < {:.4%} ({} -> {})", filtered, min_move, before, len(windows))
+
+    # Filter by day of week
+    if day_filter == "weekday":
+        before = len(windows)
+        windows = [w for w in windows if w.window_start.weekday() < 5]
+        logger.info("Day filter weekday: {} -> {} windows", before, len(windows))
+    elif day_filter == "weekend":
+        before = len(windows)
+        windows = [w for w in windows if w.window_start.weekday() >= 5]
+        logger.info("Day filter weekend: {} -> {} windows", before, len(windows))
 
     logger.info("Generating training data for {} ({} windows)", asset, len(windows))
 
@@ -223,7 +233,8 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0) -> N
 
     # Write CSV
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"{asset.upper()}_features.csv"
+    day_suffix = f"_{day_filter}" if day_filter != "all" else ""
+    out_path = OUTPUT_DIR / f"{asset.upper()}_features{day_suffix}.csv"
 
     columns = FEATURE_NAMES + ["label", "window_start", "hour_utc"]
     with open(out_path, "w", newline="") as f:
@@ -268,11 +279,15 @@ def main():
         help="Min price move pct to include window (default: 0.0001 = 0.01%%). "
              "Windows with smaller moves have ambiguous labels and add noise.",
     )
+    parser.add_argument(
+        "--day-filter", choices=["all", "weekday", "weekend"], default="all",
+        help="Filter windows by day of week (default: all)",
+    )
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     for asset in assets:
-        generate_for_asset(asset, args.days, min_move=args.min_move)
+        generate_for_asset(asset, args.days, min_move=args.min_move, day_filter=args.day_filter)
 
 
 if __name__ == "__main__":
