@@ -78,7 +78,7 @@ class KalshiDataWriter:
             f.write(line + "\n")
 
 
-AGGTRADES_DIR = Path("data/aggtrades")
+AGGTRADES_DIR = Path("data/aggtrades_coinbase")
 
 
 class BinanceTradeWriter:
@@ -267,7 +267,7 @@ class KalshiMultiAssetStrategy:
         "entry_price", "action", "contracts", "spot_price",
     ]
 
-    # Entry gate: dm 2-9 (ensemble accuracy 85%+ from dm 2 onward)
+    # Entry gate: dm 2-9 (ensemble accuracy 82%+ from dm 2 onward in backtest)
     # dm 2 = window_start + 7min (elapsed 420s), mtc=8
     # dm 9 = window_start + 14min (elapsed 840s), mtc=1
     ENTRY_GATE_START_S = 420   # dm=2: 7 min into window (mtc=8)
@@ -1316,6 +1316,9 @@ class KalshiMultiAssetStrategy:
                 if window_id != self._last_reload_window and elapsed < self.ENTRY_GATE_START_S + 10:
                     self._last_reload_window = window_id
                     self._check_and_reload()
+                    # Log window transition
+                    prices = {a: f"${float(s.current_price):.2f}" for a, s in self.states.items() if s.current_price}
+                    logger.info("[window] %s | prices: %s", window_id, prices)
                     # Reset window open price and Kalshi prices for new window
                     for state in self.states.values():
                         state.window_open_price = None
@@ -1331,17 +1334,19 @@ class KalshiMultiAssetStrategy:
                             state.window_open_price = float(state.current_price)
 
                 if self.ENTRY_GATE_START_S <= elapsed <= self.ENTRY_GATE_END_S:
-                    # Skip blocked hours (historically unprofitable)
                     current_hour = datetime.now(timezone.utc).hour
-                    if current_hour in self.BLOCKED_HOURS:
-                        pass  # silently skip
-                    else:
-                        dm = int((elapsed - 300) / 60)
-                        mtc = 10 - dm
-                        for asset, state in self.states.items():
-                            await self._process_asset_window(
-                                asset, state, window_id, dm=dm, mtc=mtc,
-                            )
+                    blocked = current_hour in self.BLOCKED_HOURS
+                    if blocked:
+                        if not hasattr(self, '_last_blocked_log') or self._last_blocked_log != window_id:
+                            self._last_blocked_log = window_id
+                            logger.info("[window] Hour %d UTC blocked, signals only (no trades)", current_hour)
+                    dm = int((elapsed - 300) / 60)
+                    mtc = 10 - dm
+                    for asset, state in self.states.items():
+                        await self._process_asset_window(
+                            asset, state, window_id, dm=dm, mtc=mtc,
+                            blocked=blocked,
+                        )
                 elif elapsed < self.ENTRY_GATE_START_S:
                     secs_to_gate = self.ENTRY_GATE_START_S - elapsed
                     if secs_to_gate > 30:
@@ -1360,7 +1365,7 @@ class KalshiMultiAssetStrategy:
 
     async def _process_asset_window(
         self, asset: str, state: AssetState, window_id: str,
-        dm: int = 0, mtc: int = 10,
+        dm: int = 0, mtc: int = 10, blocked: bool = False,
     ):
         """Process a single asset for the current window.
 
@@ -1524,9 +1529,18 @@ class KalshiMultiAssetStrategy:
             score = confidence * 100
             lstm_str = f" lstm={lstm_p:.3f}" if lstm_p is not None else ""
             logger.info(
-                "[%s] Ensemble %s (%s): p=%.3f (xgb=%.3f%s fus=%.3f) price=%dc",
+                "[%s] Ensemble %s (%s): p=%.3f (xgb=%.3f%s fus=%.3f) price=%dc%s",
                 asset, direction, model_label, ensemble_p, ml_p, lstm_str, fusion_p, entry_price,
+                " [BLOCKED]" if blocked else "",
             )
+
+            if blocked:
+                self._log_signal(
+                    asset, window_id, dm, ml_p, fusion_p, ensemble_p,
+                    ens_threshold, direction, kalshi_yes_ask, kalshi_no_ask,
+                    entry_price, "skip_blocked", 0, spot_price,
+                )
+                return
 
             trade = self.execution.execute_trade(
                 asset=asset,

@@ -251,7 +251,7 @@ class DeribitPCRProcessor(BaseSignalProcessor):
 
             logger.info(
                 f"DeribitPCR: HIGH PCR={pcr:.3f} "
-                f"(excessive puts = fear) → contrarian BULLISH"
+                f"(excessive puts = fear) -> contrarian BULLISH"
             )
 
         elif pcr <= self.bearish_pcr_threshold:
@@ -269,7 +269,7 @@ class DeribitPCRProcessor(BaseSignalProcessor):
 
             logger.info(
                 f"DeribitPCR: LOW PCR={pcr:.3f} "
-                f"(excessive calls = greed) → contrarian BEARISH"
+                f"(excessive calls = greed) -> contrarian BEARISH"
             )
 
         else:

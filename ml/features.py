@@ -45,6 +45,11 @@ FEATURE_NAMES = [
     "volatility_300s",
     "buy_volume_ratio_300s",
     "momentum_trend",
+    # Market condition (4)
+    "volume_180s",
+    "choppiness_60s",
+    "range_pct_180s",
+    "vol_acceleration",
 ]
 
 
@@ -279,5 +284,41 @@ def extract_features(
     features["buy_volume_ratio_300s"] = buy_300 / vol_300 if vol_300 > 0 else 0.5
 
     features["momentum_trend"] = features["velocity_60s"] - features["velocity_300s"]
+
+    # ---- Market condition features ----
+    ticks_180 = _ticks_in_window(tick_buffer, 180, timestamp, ts_index, sorted_ticks)
+
+    # Volume over 3 minutes (bridges 60s and 300s gap)
+    features["volume_180s"] = sum(t.get("qty", 0) for t in ticks_180)
+
+    # Choppiness: direction flips per tick in last 60s
+    # High = trending (consistent direction), Low = choppy/noisy
+    if len(ticks_60) >= 3:
+        prices_60 = [t["price"] for t in ticks_60]
+        flips = 0
+        for i in range(2, len(prices_60)):
+            prev_dir = prices_60[i - 1] - prices_60[i - 2]
+            curr_dir = prices_60[i] - prices_60[i - 1]
+            if prev_dir * curr_dir < 0:
+                flips += 1
+        features["choppiness_60s"] = flips / (len(prices_60) - 2)
+    else:
+        features["choppiness_60s"] = 0.0
+
+    # Price range as % of mean over 3 minutes
+    if ticks_180:
+        prices_180 = [t["price"] for t in ticks_180]
+        mean_180 = sum(prices_180) / len(prices_180)
+        features["range_pct_180s"] = (
+            (max(prices_180) - min(prices_180)) / mean_180 if mean_180 != 0 else 0.0
+        )
+    else:
+        features["range_pct_180s"] = 0.0
+
+    # Volatility acceleration: recent vol / longer-term vol
+    # >1 = volatility increasing, <1 = calming down
+    vol_30 = features["volatility_30s"]
+    vol_300 = features["volatility_300s"]
+    features["vol_acceleration"] = vol_30 / vol_300 if vol_300 > 0 else 1.0
 
     return features

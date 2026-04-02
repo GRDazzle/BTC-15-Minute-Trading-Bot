@@ -42,6 +42,10 @@ LSTM_FEATURE_NAMES = [
     # Time (2)
     "hour_sin",
     "hour_cos",
+    # Market condition (3)
+    "choppiness_30s",
+    "volume_60s",
+    "vol_acceleration",
 ]
 LSTM_NUM_FEATURES = len(LSTM_FEATURE_NAMES)
 
@@ -236,5 +240,26 @@ def extract_lstm_sequence(
 
         # --- hour_cos ---
         sequence[i, 14] = hour_cos
+
+        # --- choppiness_30s (direction flips per tick in last 30 bars) ---
+        if i >= 30:
+            window_prices = prices[i - 29:i + 1]
+            flips = 0
+            for j in range(2, len(window_prices)):
+                prev_d = window_prices[j - 1] - window_prices[j - 2]
+                curr_d = window_prices[j] - window_prices[j - 1]
+                if prev_d * curr_d < 0:
+                    flips += 1
+            sequence[i, 15] = flips / (len(window_prices) - 2)
+
+        # --- volume_60s (rolling 60-bar log volume) ---
+        lo_v = max(0, i - 59)
+        sequence[i, 16] = math.log1p(float(volumes[lo_v:i + 1].sum()))
+
+        # --- vol_acceleration (10s vol / 30s vol ratio) ---
+        if i >= 30:
+            vol_10 = float(np.std(returns_1s[max(0, i - 9):i + 1]))
+            vol_30 = float(np.std(returns_1s[i - 29:i + 1]))
+            sequence[i, 17] = vol_10 / vol_30 if vol_30 > 0 else 1.0
 
     return sequence

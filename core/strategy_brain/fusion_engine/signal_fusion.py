@@ -163,7 +163,7 @@ class SignalFusionEngine:
             self._signal_history.pop(0)
         
         logger.info(
-            f"Fused {len(recent_signals)} signals → {direction} "
+            f"Fused {len(recent_signals)} signals -> {direction} "
             f"(score={consensus_score:.1f}, conf={avg_conf:.1%})"
         )
         

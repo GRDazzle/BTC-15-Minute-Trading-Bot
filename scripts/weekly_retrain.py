@@ -9,12 +9,16 @@ Usage:
     python scripts/weekly_retrain.py
     python scripts/weekly_retrain.py --assets BTC,ETH --days 14
     python scripts/weekly_retrain.py --skip-download
+    python scripts/weekly_retrain.py --day-type weekday   # Sunday: retrain weekday models only
+    python scripts/weekly_retrain.py --day-type weekend   # Monday: retrain weekend models only
 """
 import argparse
 import os
 import subprocess
 import sys
 import time
+import urllib.request
+import json as _json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -139,6 +143,27 @@ def purge_kalshi_polls(max_age_days: int = 14) -> None:
         log(f"No Kalshi polling files older than {max_age_days} days to purge")
 
 
+def send_telegram(message: str) -> None:
+    """Send a Telegram notification via the bot API."""
+    env_path = Path.home() / ".claude" / "channels" / "telegram" / ".env"
+    if not env_path.exists():
+        return
+    token = None
+    chat_id = "8292385179"
+    for line in env_path.read_text().splitlines():
+        if line.startswith("TELEGRAM_BOT_TOKEN="):
+            token = line.split("=", 1)[1].strip()
+    if not token:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = _json.dumps({"chat_id": chat_id, "text": message}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        log(f"Telegram notification failed: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Weekly ML retrain pipeline")
     parser.add_argument(
@@ -164,6 +189,12 @@ def main():
         action="store_true",
         help="Skip data download (use existing data)",
     )
+    parser.add_argument(
+        "--day-type",
+        choices=["all", "weekday", "weekend"],
+        default="all",
+        help="Which models to retrain (default: all)",
+    )
     args = parser.parse_args()
 
     python = sys.executable
@@ -171,8 +202,10 @@ def main():
     days = str(args.days)
     min_dm = str(args.min_dm)
 
+    day_type = args.day_type
+
     log("=" * 60)
-    log(f"Weekly retrain: assets={assets} days={days} min_dm={min_dm}")
+    log(f"Weekly retrain: assets={assets} days={days} min_dm={min_dm} day_type={day_type}")
     log("=" * 60)
 
     pipeline_start = time.time()
@@ -188,6 +221,69 @@ def main():
         if not ok:
             failed.append("download")
             log("WARNING: Download failed, continuing with existing data")
+
+    # Steps 2-8: Standard models (only when day_type is "all")
+    if day_type == "all":
+        pass  # fall through to standard pipeline below
+    else:
+        # Skip standard pipeline, jump to weekday/weekend
+        log(f"Skipping standard pipeline (day_type={day_type})")
+        # Still need to generate data for the specific day type
+        suffix = f"_{day_type}"
+
+        ok = run_step(f"Generate XGB training data ({day_type})", [
+            python, "scripts/generate_training_data.py",
+            "--asset", assets, "--days", days,
+            "--day-filter", day_type,
+        ])
+        if not ok:
+            log(f"ABORT: {day_type} XGB data gen failed")
+            return 1
+
+        ok = run_step(f"Train XGB models ({day_type})", [
+            python, "scripts/train_xgb.py",
+            "--asset", assets, "--min-dm", min_dm,
+            "--data-suffix", suffix, "--model-suffix", suffix,
+        ])
+        if not ok:
+            failed.append(f"train_xgb_{day_type}")
+
+        ok = run_step(f"Generate LSTM data ({day_type})", [
+            python, "scripts/generate_lstm_training_data.py",
+            "--asset", assets, "--days", days,
+            "--day-filter", day_type,
+        ])
+        if not ok:
+            log(f"WARNING: {day_type} LSTM data gen failed")
+
+        for asset in asset_list:
+            ok = run_step(f"Train LSTM ({asset} {day_type})", [
+                python, "scripts/train_lstm.py",
+                "--asset", asset, "--min-dm", min_dm,
+                "--data-suffix", suffix, "--model-suffix", suffix,
+            ])
+            if not ok:
+                log(f"WARNING: {day_type} LSTM training failed for {asset}")
+
+        ok = run_step(f"Ensemble sweep ({day_type})", [
+            python, "scripts/ensemble_combo_sweep.py",
+            "--asset", assets,
+            "--min-dm", min_dm, "--max-dm", "8",
+            "--model-suffix", suffix, "--day-filter", day_type,
+        ])
+        if not ok:
+            log(f"WARNING: {day_type} ensemble sweep failed")
+
+        total = time.time() - pipeline_start
+        log("=" * 60)
+        if failed:
+            log(f"Done with warnings ({total:.0f}s). Failed steps: {failed}")
+            send_telegram(f"Retrain ({day_type}) done with warnings ({total:.0f}s). Failed: {failed}")
+        else:
+            log(f"Done ({total:.0f}s). All steps succeeded.")
+            send_telegram(f"Retrain ({day_type}) complete ({total:.0f}s). All steps succeeded. Bot will hot-reload.")
+        log("=" * 60)
+        return 1 if failed else 0
 
     # Step 2: Generate training features
     ok = run_step("Generate training data", [
@@ -306,8 +402,10 @@ def main():
     log("=" * 60)
     if failed:
         log(f"Done with warnings ({total:.0f}s). Failed steps: {failed}")
+        send_telegram(f"Retrain (all) done with warnings ({total:.0f}s). Failed: {failed}")
     else:
         log(f"Done ({total:.0f}s). All steps succeeded.")
+        send_telegram(f"Retrain (all) complete ({total:.0f}s). All steps succeeded. Bot will hot-reload.")
     log("Live bot will pick up new params at next window boundary.")
     log("=" * 60)
 

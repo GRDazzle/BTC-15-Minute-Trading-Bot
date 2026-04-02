@@ -124,6 +124,7 @@ def build_dashboard(
     mode,
     assets,
     start_time,
+    log_lines=None,
 ):
     """Build the rich dashboard layout."""
     now = datetime.now(timezone.utc)
@@ -225,7 +226,11 @@ def build_dashboard(
     else:
         last_line = "Never"
 
-    next_dt = next_retrain_time(retrain_day, retrain_hour)
+    # Next retrain: Sunday 8 UTC (weekday) or Monday 8 UTC (weekend)
+    next_sun = next_retrain_time(6, 8)  # Sunday 8 UTC
+    next_mon = next_retrain_time(0, 8)  # Monday 8 UTC
+    next_dt = min(next_sun, next_mon)
+    next_type = "weekday" if next_dt == next_sun else "weekend"
     remaining = (next_dt - now).total_seconds()
     next_str = next_dt.strftime("%Y-%m-%d %H:%M UTC")
     remaining_str = format_duration(remaining)
@@ -233,12 +238,11 @@ def build_dashboard(
     retrain_status = "RUNNING" if retrain_running else "idle"
     retrain_color = "yellow" if retrain_running else "green"
 
-    day_name = [k for k, v in DAY_MAP.items() if v == retrain_day][0].capitalize()
-
     retrain_text = (
-        f"  Schedule: Every {day_name} at {retrain_hour:02d}:00 UTC\n"
-        f"  Last retrain: {last_line}\n"
-        f"  Next retrain: {next_str} ({remaining_str})\n"
+        f"  Sun 08:00 UTC (1AM PT) -> weekday models\n"
+        f"  Mon 08:00 UTC (1AM PT) -> weekend models\n"
+        f"  Last: {last_line}\n"
+        f"  Next: {next_type} {next_str} ({remaining_str})\n"
         f"  Status: [{retrain_color}]{retrain_status}[/]"
     )
 
@@ -264,31 +268,31 @@ def build_dashboard(
             f"[{p_style}]${p:+.2f}[/]",
         )
 
-    # --- Bot Log (last 15 lines from most recent trading log) ---
-    log_lines = []
-    log_dir = PROJECT_ROOT / "logs"
-    log_files = sorted(log_dir.glob("trading*.log"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-    if log_files:
-        try:
-            with open(log_files[0], "r", errors="ignore") as f:
-                f.seek(0, 2)
-                fsize = f.tell()
-                f.seek(max(0, fsize - 8192))
-                all_lines = f.read().splitlines()
-            # Just show the last 15 INFO lines, no filtering
-            for line in all_lines:
-                if "| INFO" in line:
-                    # Strip timestamp prefix to save space
-                    short = line.split(" | ", 2)[-1][:100]
-                    log_lines.append(short)
-            log_lines = log_lines[-15:]
-        except Exception:
-            pass
+    # --- PnL by Decision Minute ---
+    dm_table = Table(title="PnL by Entry DM", expand=True)
+    dm_table.add_column("DM", width=4)
+    dm_table.add_column("W/L", justify="right", width=8)
+    dm_table.add_column("WR", justify="right", width=6)
+    dm_table.add_column("PnL", justify="right", width=10)
 
-    if not log_lines:
-        log_lines = ["  Waiting for bot logs..."]
+    for dm in range(2, 10):
+        dm_trades = [t for t in trades if int(t.get("dm", 0)) == dm]
+        if not dm_trades:
+            continue
+        w = sum(1 for t in dm_trades if float(t.get("pnl", "0").replace("+", "")) > 0)
+        p = sum(float(t.get("pnl", "0").replace("+", "")) for t in dm_trades)
+        wr = w / len(dm_trades) * 100
+        p_style = "green" if p >= 0 else "red"
+        dm_table.add_row(
+            f"dm {dm}",
+            f"{w}W/{len(dm_trades)-w}L",
+            f"{wr:.0f}%",
+            f"[{p_style}]${p:+.2f}[/]",
+        )
 
-    log_text = "\n".join(log_lines)
+    # --- Bot Log (use cached lines passed from manager) ---
+    display_lines = log_lines if log_lines else ["  Waiting for bot logs..."]
+    log_text = "\n".join(display_lines[-30:])
 
     # --- Assemble Layout ---
     layout = Layout()
@@ -300,10 +304,11 @@ def build_dashboard(
         Layout(name="left", ratio=2),
         Layout(name="right", ratio=3),
     )
-    # Left: retrain status + entry price band
+    # Left: retrain status + entry price band + DM breakdown
     layout["left"].split_column(
         Layout(Panel(Text.from_markup(retrain_text), title="Model Retrain", border_style="magenta"), ratio=2),
         Layout(Panel(band_table, border_style="cyan"), ratio=2),
+        Layout(Panel(dm_table, border_style="cyan"), ratio=2),
     )
     # Right: balance on top, recent trades + log on bottom
     layout["right"].split_column(
@@ -330,6 +335,8 @@ class BotManager:
         self.start_time = datetime.now(timezone.utc)
         self.retrain_day = DAY_MAP.get(args.retrain_day.lower(), 6)
         self.retrain_hour = args.retrain_hour
+        self._cached_log_lines: list[str] = []
+        self._log_file_pos: int = 0
 
     def start_bot(self):
         """Launch the trading bot as a subprocess."""
@@ -345,19 +352,30 @@ class BotManager:
             cwd=str(PROJECT_ROOT),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
 
     def stop_bot(self):
-        """Stop the trading bot."""
+        """Stop the trading bot and all child processes."""
         if self.bot_process and self.bot_process.poll() is None:
-            self.bot_process.terminate()
+            pid = self.bot_process.pid
             try:
-                self.bot_process.wait(timeout=10)
+                # On Windows, terminate() doesn't kill child processes.
+                # Use taskkill /T to kill the entire process tree.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=15,
+                )
+            except Exception:
+                # Fallback: force kill the process directly
+                self.bot_process.kill()
+            try:
+                self.bot_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.bot_process.kill()
 
-    def run_retrain(self):
-        """Run weekly retrain in a background thread."""
+    def run_retrain(self, day_type: str = "all"):
+        """Run retrain in a background thread."""
         if self.retrain_running:
             return
 
@@ -369,7 +387,8 @@ class BotManager:
                 result = subprocess.run(
                     [sys.executable, "scripts/weekly_retrain.py",
                      "--assets", self.args.assets,
-                     "--days", "30"],
+                     "--days", "30",
+                     "--day-type", day_type],
                     cwd=str(PROJECT_ROOT),
                     capture_output=True,
                     text=True,
@@ -382,7 +401,7 @@ class BotManager:
                 status = f"error: {e}"
 
             state["last_retrain"] = datetime.now(timezone.utc).isoformat()
-            state["last_retrain_status"] = status
+            state["last_retrain_status"] = f"{day_type}: {status}"
             save_retrain_state(state)
             self.retrain_running = False
 
@@ -390,11 +409,20 @@ class BotManager:
         thread.start()
 
     def check_retrain_schedule(self):
-        """Check if it's time to retrain."""
+        """Check if it's time to retrain.
+
+        Schedule:
+          Sunday 8 UTC (1 AM PT) -> retrain weekday models
+          Monday 8 UTC (1 AM PT) -> retrain weekend models
+        """
         now = datetime.now(timezone.utc)
-        if now.weekday() != self.retrain_day:
+
+        # Sunday=6 -> weekday retrain, Monday=0 -> weekend retrain
+        schedule = {6: "weekday", 0: "weekend"}
+        day_type = schedule.get(now.weekday())
+        if day_type is None:
             return
-        if now.hour != self.retrain_hour:
+        if now.hour != 8:  # 8 UTC = 1 AM PT
             return
 
         state = load_retrain_state()
@@ -404,7 +432,45 @@ class BotManager:
             if (now - last_dt).total_seconds() < 82800:  # 23 hours
                 return  # Already ran today
 
-        self.run_retrain()
+        self.run_retrain(day_type=day_type)
+
+    def _read_new_log_lines(self):
+        """Read new log lines incrementally from the most recent trading log."""
+        log_dir = PROJECT_ROOT / "logs"
+        # Only check the main trading.log (not the rotated copies)
+        main_log = log_dir / "trading.log"
+        if not main_log.exists():
+            return
+
+        current_file = str(main_log)
+
+        # Reset position if file was rotated (shrunk)
+        try:
+            file_size = os.path.getsize(current_file)
+        except OSError:
+            return
+        if file_size < self._log_file_pos:
+            self._log_file_pos = 0
+
+        try:
+            with open(current_file, "r", errors="ignore") as f:
+                f.seek(self._log_file_pos)
+                new_data = f.read()
+                self._log_file_pos = f.tell()
+        except (FileNotFoundError, OSError):
+            return
+
+        if not new_data:
+            return
+
+        for line in new_data.splitlines():
+            if "| INFO" in line:
+                short = line.split(" | ", 2)[-1][:120]
+                self._cached_log_lines.append(short)
+
+        # Keep last 200 lines to avoid unbounded growth
+        if len(self._cached_log_lines) > 200:
+            self._cached_log_lines = self._cached_log_lines[-200:]
 
     def run(self):
         """Main loop — display dashboard and manage processes."""
@@ -431,6 +497,9 @@ class BotManager:
                         account_state = load_account_state()
                         retrain_state = load_retrain_state()
 
+                        # Read new log lines (incremental, cached)
+                        self._read_new_log_lines()
+
                         # Build and display dashboard
                         dashboard = build_dashboard(
                             self.bot_process,
@@ -443,6 +512,7 @@ class BotManager:
                             "real" if self.args.real else "dry_run",
                             self.args.assets,
                             self.start_time,
+                            log_lines=self._cached_log_lines,
                         )
                         live.update(dashboard)
 

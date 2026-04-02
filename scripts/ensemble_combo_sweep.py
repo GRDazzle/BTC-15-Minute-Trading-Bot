@@ -66,6 +66,9 @@ def sweep_combo(
     traded_count = 0
     win_count = 0
     total_pnl = 0.0
+    running_balance = balance
+    peak_balance = balance
+    max_drawdown = 0.0
 
     for win in enriched_windows:
         outcome = win["outcome"]
@@ -145,11 +148,18 @@ def sweep_combo(
         revenue = contracts * 1.0 if won else 0.0
         pnl = revenue - cost - fees
         total_pnl += pnl
+        running_balance += pnl
+        if running_balance > peak_balance:
+            peak_balance = running_balance
+        dd = peak_balance - running_balance
+        if dd > max_drawdown:
+            max_drawdown = dd
         traded_count += 1
         if won:
             win_count += 1
 
     wr = win_count / traded_count * 100 if traded_count > 0 else 0
+    dd_pct = max_drawdown / peak_balance * 100 if peak_balance > 0 else 0
     return {
         "mode": mode,
         "min_w_a": min_w_a, "max_w_a": max_w_a,
@@ -157,6 +167,7 @@ def sweep_combo(
         "threshold": threshold, "max_price": max_price,
         "total_pnl": total_pnl, "win_rate": wr,
         "traded_count": traded_count, "win_count": win_count,
+        "max_drawdown": max_drawdown, "max_drawdown_pct": dd_pct,
     }
 
 
@@ -343,6 +354,7 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8, model_suffix:
         results_by_mode[mode_name] = best
         print(f"\n  {mode_name}: PnL=${best['total_pnl']:+.2f} WR={best['win_rate']:.1f}% "
               f"trades={best['traded_count']} thresh={best['threshold']} maxP={best['max_price']}c "
+              f"maxDD=${best['max_drawdown']:.2f} ({best['max_drawdown_pct']:.1f}%) "
               f"({elapsed:.1f}s)")
         if sweep_fn == "3way":
             print(f"    xgb: min={best['min_w_a']:.2f} max={best['max_w_a']:.2f}  "
@@ -356,7 +368,7 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8, model_suffix:
     # Summary
     print(f"\n  --- {asset} Summary ---")
     for mode_name, r in results_by_mode.items():
-        print(f"  {mode_name:20s}: PnL=${r['total_pnl']:+8.2f}  WR={r['win_rate']:5.1f}%  trades={r['traded_count']}")
+        print(f"  {mode_name:20s}: PnL=${r['total_pnl']:+8.2f}  WR={r['win_rate']:5.1f}%  trades={r['traded_count']}  maxDD=${r['max_drawdown']:.2f} ({r['max_drawdown_pct']:.1f}%)")
 
     # Derive config key from model_suffix
     if model_suffix == "_weekday":
