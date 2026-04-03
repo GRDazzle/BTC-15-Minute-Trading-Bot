@@ -46,6 +46,10 @@ LSTM_FEATURE_NAMES = [
     "choppiness_30s",
     "volume_60s",
     "vol_acceleration",
+    # Crash detection (3)
+    "flips_per_tick_180s",
+    "momentum_strength_180s",
+    "volume_180s",
 ]
 LSTM_NUM_FEATURES = len(LSTM_FEATURE_NAMES)
 
@@ -261,5 +265,28 @@ def extract_lstm_sequence(
             vol_10 = float(np.std(returns_1s[max(0, i - 9):i + 1]))
             vol_30 = float(np.std(returns_1s[i - 29:i + 1]))
             sequence[i, 17] = vol_10 / vol_30 if vol_30 > 0 else 1.0
+
+        # --- flips_per_tick_180s (direction flips over full sequence window) ---
+        window_len = min(i + 1, 180)
+        if window_len >= 3:
+            wp = prices[max(0, i - 179):i + 1]
+            fl = 0
+            for j in range(2, len(wp)):
+                pd = wp[j - 1] - wp[j - 2]
+                cd = wp[j] - wp[j - 1]
+                if pd * cd < 0:
+                    fl += 1
+            sequence[i, 18] = fl / (len(wp) - 2)
+
+        # --- momentum_strength_180s (|net move| / range over full window) ---
+        if window_len >= 2:
+            wp = prices[max(0, i - 179):i + 1]
+            net = float(wp[-1] - wp[0])
+            rng = float(wp.max() - wp.min())
+            sequence[i, 19] = abs(net) / rng if rng > 0 else 0.0
+
+        # --- volume_180s (rolling 180-bar log volume) ---
+        lo_v180 = max(0, i - 179)
+        sequence[i, 20] = math.log1p(float(volumes[lo_v180:i + 1].sum()))
 
     return sequence

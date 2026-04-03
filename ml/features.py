@@ -50,7 +50,75 @@ FEATURE_NAMES = [
     "choppiness_60s",
     "range_pct_180s",
     "vol_acceleration",
+    # Crash detection (5)
+    "flips_per_tick_180s",
+    "momentum_strength_180s",
+    "price_vs_sma5",
+    "price_vs_sma15",
+    "price_vs_sma30",
 ]
+
+
+def compute_daily_smas(
+    daily_closes: list[tuple[str, float]],
+    target_date: str,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Compute SMA 5, 15, 30 from daily closing prices.
+
+    Args:
+        daily_closes: List of (date_str, close_price) sorted by date ascending.
+        target_date: Date string (YYYY-MM-DD) to compute SMAs for.
+
+    Returns:
+        (sma5, sma15, sma30) — None if insufficient data for that period.
+    """
+    # Get prices up to (but not including) target_date
+    prices = [p for d, p in daily_closes if d < target_date]
+
+    sma5 = sum(prices[-5:]) / 5 if len(prices) >= 5 else None
+    sma15 = sum(prices[-15:]) / 15 if len(prices) >= 15 else None
+    sma30 = sum(prices[-30:]) / 30 if len(prices) >= 30 else None
+
+    return sma5, sma15, sma30
+
+
+def load_daily_closes(data_dir, asset: str) -> list[tuple[str, float]]:
+    """Load daily closing prices from aggTrade CSVs.
+
+    Returns list of (date_str, close_price) sorted by date.
+    """
+    import csv as _csv
+    from pathlib import Path
+
+    asset_dir = Path(data_dir) / asset.upper()
+    if not asset_dir.exists():
+        return []
+
+    daily = {}
+    for f in sorted(asset_dir.glob("*-aggTrades-*.csv")):
+        date_str = f.stem.split("aggTrades-")[1]
+        # Read last line to get closing price
+        last_price = None
+        try:
+            with open(f, "r") as fh:
+                fh.seek(0, 2)
+                fsize = fh.tell()
+                fh.seek(max(0, fsize - 1024))
+                lines = fh.read().splitlines()
+                for line in reversed(lines):
+                    parts = line.split(",")
+                    if len(parts) >= 2:
+                        try:
+                            last_price = float(parts[1])
+                            break
+                        except ValueError:
+                            continue
+        except Exception:
+            continue
+        if last_price is not None:
+            daily[date_str] = last_price
+
+    return sorted(daily.items())
 
 
 def _ensure_utc(ts: datetime) -> datetime:
@@ -177,11 +245,15 @@ def extract_features(
     btc_velocity_60s: Optional[float] = None,
     ts_index: list[datetime] = None,
     sorted_ticks: list[dict] = None,
+    sma5: Optional[float] = None,
+    sma15: Optional[float] = None,
+    sma30: Optional[float] = None,
 ) -> dict[str, float]:
-    """Extract 22 features for one decision point.
+    """Extract 31 features for one decision point.
 
     For fast batch processing, pass ts_index and sorted_ticks from
     build_tick_index(). For live inference with small buffers, omit them.
+    SMA values should be precomputed from daily closing prices.
     """
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -320,5 +392,47 @@ def extract_features(
     vol_30 = features["volatility_30s"]
     vol_300 = features["volatility_300s"]
     features["vol_acceleration"] = vol_30 / vol_300 if vol_300 > 0 else 1.0
+
+    # ---- Crash detection features ----
+
+    # Direction flips per tick over 3 minutes (longer-term choppiness)
+    if len(ticks_180) >= 3:
+        prices_180_list = [t["price"] for t in ticks_180]
+        flips_180 = 0
+        for i in range(2, len(prices_180_list)):
+            prev_dir = prices_180_list[i - 1] - prices_180_list[i - 2]
+            curr_dir = prices_180_list[i] - prices_180_list[i - 1]
+            if prev_dir * curr_dir < 0:
+                flips_180 += 1
+        features["flips_per_tick_180s"] = flips_180 / (len(prices_180_list) - 2)
+    else:
+        features["flips_per_tick_180s"] = 0.0
+
+    # Momentum strength: |net move| / range over 3 minutes
+    # High = strong trend, Low = choppy (moved a lot but ended near start)
+    if ticks_180 and len(ticks_180) >= 2:
+        p_180 = [t["price"] for t in ticks_180]
+        net_move = p_180[-1] - p_180[0]
+        price_range = max(p_180) - min(p_180)
+        features["momentum_strength_180s"] = abs(net_move) / price_range if price_range > 0 else 0.0
+    else:
+        features["momentum_strength_180s"] = 0.0
+
+    # SMA features: current price relative to moving averages
+    # Negative = price below SMA = bearish trend
+    if sma5 is not None and sma5 != 0:
+        features["price_vs_sma5"] = (current_price - sma5) / sma5
+    else:
+        features["price_vs_sma5"] = 0.0
+
+    if sma15 is not None and sma15 != 0:
+        features["price_vs_sma15"] = (current_price - sma15) / sma15
+    else:
+        features["price_vs_sma15"] = 0.0
+
+    if sma30 is not None and sma30 != 0:
+        features["price_vs_sma30"] = (current_price - sma30) / sma30
+    else:
+        features["price_vs_sma30"] = 0.0
 
     return features

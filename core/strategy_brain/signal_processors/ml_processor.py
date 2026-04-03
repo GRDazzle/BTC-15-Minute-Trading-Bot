@@ -124,6 +124,9 @@ class MLProcessor(BaseSignalProcessor):
             decision_minute=dm,
             window_open_price=metadata.get("window_open_price"),
             btc_velocity_60s=metadata.get("btc_velocity_60s"),
+            sma5=metadata.get("sma5"),
+            sma15=metadata.get("sma15"),
+            sma30=metadata.get("sma30"),
         )
 
         # Build feature vector in correct order
@@ -231,6 +234,9 @@ class MLProcessor(BaseSignalProcessor):
             decision_minute=dm,
             window_open_price=metadata.get("window_open_price"),
             btc_velocity_60s=metadata.get("btc_velocity_60s"),
+            sma5=metadata.get("sma5"),
+            sma15=metadata.get("sma15"),
+            sma30=metadata.get("sma30"),
         )
 
         X = [[feats.get(name, 0.0) for name in FEATURE_NAMES]]

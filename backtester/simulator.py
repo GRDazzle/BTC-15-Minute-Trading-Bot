@@ -54,6 +54,15 @@ class BacktestSimulator:
         self.min_dm = min_dm  # Skip signals before this decision minute
         # ensemble_weights = (ml_weight, ensemble_threshold) or None
         self.ensemble_weights = ensemble_weights
+        # SMA lookup: date_str -> (sma5, sma15, sma30)
+        self._sma_lookup: dict[str, tuple] = {}
+        self._sma5: Optional[float] = None
+        self._sma15: Optional[float] = None
+        self._sma30: Optional[float] = None
+
+    def set_sma_lookup(self, lookup: dict[str, tuple]) -> None:
+        """Set SMA lookup table: {date_str: (sma5, sma15, sma30)}."""
+        self._sma_lookup = lookup
 
     def run(
         self,
@@ -356,6 +365,9 @@ class BacktestSimulator:
                 "sentiment_score": fg_score,
                 "decision_minute": dm,
                 "window_open_price": window.price_open,
+                "sma5": getattr(self, '_sma5', None),
+                "sma15": getattr(self, '_sma15', None),
+                "sma30": getattr(self, '_sma30', None),
             }
 
             # Ensemble path: blend ML + fusion probabilities
@@ -521,6 +533,12 @@ class BacktestSimulator:
             if i % log_interval == 0:
                 logger.info("Collecting probabilities {}/{} ({})", i + 1, total, window.window_start)
 
+            # Update SMAs for this window's date
+            if self._sma_lookup:
+                date_str = window.window_start.strftime("%Y-%m-%d")
+                smas = self._sma_lookup.get(date_str, (None, None, None))
+                self._sma5, self._sma15, self._sma30 = smas
+
             checkpoints = self._collect_window_probabilities(
                 window, fg_scores, price_history, tick_buffer,
             )
@@ -625,6 +643,9 @@ class BacktestSimulator:
                 "sentiment_score": fg_score,
                 "decision_minute": dm,
                 "window_open_price": window.price_open,
+                "sma5": getattr(self, '_sma5', None),
+                "sma15": getattr(self, '_sma15', None),
+                "sma30": getattr(self, '_sma30', None),
             }
 
             # Get ML probability

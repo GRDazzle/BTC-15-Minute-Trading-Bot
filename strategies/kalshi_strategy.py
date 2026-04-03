@@ -207,10 +207,10 @@ class AssetState:
     weekend_lstm_processor: Optional[Any] = None  # LSTMProcessor for weekends
     weekend_ensemble_weights: Optional[tuple] = None
 
-    # Circuit breaker: stop trading after 3 consecutive losses (auto-reset after 1 hour)
-    consecutive_losses: int = 0
+    # Circuit breaker: pause if asset loses 40% of balance (auto-reset after 1 hour)
     circuit_open: bool = False
     circuit_tripped_at: Optional[datetime] = None
+    session_peak_balance: Optional[float] = None
 
     ws_source: Optional[BinanceWebSocketSource] = None
 
@@ -307,6 +307,10 @@ class KalshiMultiAssetStrategy:
 
         # Live aggTrade writer (persists WS data for backtesting/tuning)
         self._trade_writer = BinanceTradeWriter()
+
+        # SMA cache per asset (recomputed daily)
+        self._asset_smas: dict[str, dict] = {}
+        self._sma_date: str = ""
 
         # Resolve model directory for ML processors
         if model_dir is None:
@@ -827,6 +831,25 @@ class KalshiMultiAssetStrategy:
         except Exception:
             logger.exception("[hot-reload] Failed to reload %s ML model for %s", variant, asset)
 
+    def _update_smas(self) -> None:
+        """Recompute SMA 5/15/30 for all assets (once per day)."""
+        from ml.features import load_daily_closes, compute_daily_smas
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today == self._sma_date:
+            return  # Already computed today
+        for asset in self.assets:
+            daily_closes = load_daily_closes(AGGTRADES_DIR, asset)
+            sma5, sma15, sma30 = compute_daily_smas(daily_closes, today)
+            self._asset_smas[asset] = {"sma5": sma5, "sma15": sma15, "sma30": sma30}
+            logger.info(
+                "SMA updated for %s: sma5=%s sma15=%s sma30=%s",
+                asset,
+                f"{sma5:.2f}" if sma5 else "N/A",
+                f"{sma15:.2f}" if sma15 else "N/A",
+                f"{sma30:.2f}" if sma30 else "N/A",
+            )
+        self._sma_date = today
+
     def _in_blackout(self, utc_time: Optional[dt_time] = None) -> bool:
         """Check if the given UTC time falls within any blackout window."""
         if utc_time is None:
@@ -1049,10 +1072,10 @@ class KalshiMultiAssetStrategy:
                 # Reset circuit breakers for all assets
                 for a, st in self.states.items():
                     if st.circuit_open:
-                        logger.info("[param-tune] Resetting circuit breaker for %s (was %d consecutive losses)", a, st.consecutive_losses)
-                    st.consecutive_losses = 0
+                        logger.info("[param-tune] Resetting circuit breaker for %s", a)
                     st.circuit_open = False
                     st.circuit_tripped_at = None
+                    st.session_peak_balance = None
 
             except asyncio.CancelledError:
                 break
@@ -1316,6 +1339,7 @@ class KalshiMultiAssetStrategy:
                 if window_id != self._last_reload_window and elapsed < self.ENTRY_GATE_START_S + 10:
                     self._last_reload_window = window_id
                     self._check_and_reload()
+                    self._update_smas()
                     # Log window transition
                     prices = {a: f"${float(s.current_price):.2f}" for a, s in self.states.items() if s.current_price}
                     logger.info("[window] %s | prices: %s", window_id, prices)
@@ -1383,17 +1407,21 @@ class KalshiMultiAssetStrategy:
                 )
                 return
 
-        # Circuit breaker: stop trading after 3 consecutive losses, auto-reset after 1 hour
+        # Circuit breaker: pause asset if balance drops 40% from session peak, auto-reset after 1 hour
         if state.circuit_open:
             elapsed_since_trip = (datetime.now(tz=timezone.utc) - state.circuit_tripped_at).total_seconds()
             if elapsed_since_trip >= 3600:
-                logger.info("[%s] Circuit breaker auto-reset after 1 hour (%d consecutive losses)", asset, state.consecutive_losses)
+                logger.info("[%s] Circuit breaker auto-reset after 1 hour", asset)
                 state.circuit_open = False
-                state.consecutive_losses = 0
                 state.circuit_tripped_at = None
+                state.session_peak_balance = None  # Reset peak on resume
             else:
                 mins_left = (3600 - elapsed_since_trip) / 60
-                logger.warning("[%s] Circuit breaker open (%d consecutive losses), %.0f min until reset", asset, state.consecutive_losses, mins_left)
+                if not hasattr(self, '_last_cb_log') or self._last_cb_log.get(asset) != window_id:
+                    if not hasattr(self, '_last_cb_log'):
+                        self._last_cb_log = {}
+                    self._last_cb_log[asset] = window_id
+                    logger.warning("[%s] Circuit breaker open (40%% drawdown), %.0f min until reset", asset, mins_left)
                 return
 
         # Blackout window check: skip trading during configured UTC hours
@@ -1764,6 +1792,12 @@ class KalshiMultiAssetStrategy:
         # sentiment feed. Using 50 (neutral) for now.
         meta["sentiment_score"] = 50.0
 
+        # SMA features (precomputed per asset)
+        smas = self._asset_smas.get(state.asset, {})
+        meta["sma5"] = smas.get("sma5")
+        meta["sma15"] = smas.get("sma15")
+        meta["sma30"] = smas.get("sma30")
+
         return meta
 
     # -- trade CSV logging -----------------------------------------------------
@@ -1950,19 +1984,22 @@ class KalshiMultiAssetStrategy:
                             self._log_balance("settlement", trade.asset)
                             settled.append(trade)
 
-                            # Circuit breaker: track consecutive losses
-                            won = trade.side == trade.settlement_outcome
-                            if won:
-                                state.consecutive_losses = 0
-                            else:
-                                state.consecutive_losses += 1
-                                if state.consecutive_losses >= 3 and not state.circuit_open:
-                                    state.circuit_open = True
-                                    state.circuit_tripped_at = datetime.now(tz=timezone.utc)
-                                    logger.warning(
-                                        "[%s] Circuit breaker TRIPPED: %d consecutive losses",
-                                        trade.asset, state.consecutive_losses,
-                                    )
+                            # Circuit breaker: check if balance dropped 40% from session peak
+                            acct = self.account_manager.get_account(trade.asset)
+                            if acct:
+                                bal = acct.balance_dollars
+                                if state.session_peak_balance is None or bal > state.session_peak_balance:
+                                    state.session_peak_balance = bal
+                                if state.session_peak_balance > 0:
+                                    drawdown_pct = (state.session_peak_balance - bal) / state.session_peak_balance
+                                    if drawdown_pct >= 0.40 and not state.circuit_open:
+                                        state.circuit_open = True
+                                        state.circuit_tripped_at = datetime.now(tz=timezone.utc)
+                                        logger.warning(
+                                            "[%s] Circuit breaker TRIPPED: %.0f%% drawdown ($%.2f -> $%.2f), pausing 1 hour",
+                                            trade.asset, drawdown_pct * 100,
+                                            state.session_peak_balance, bal,
+                                        )
 
                     for trade in settled:
                         state.pending_settlements.remove(trade)

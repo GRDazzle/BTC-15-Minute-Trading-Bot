@@ -30,7 +30,7 @@ from backtester.data_loader_ticks import (
     generate_tick_windows,
     resample_ticks,
 )
-from ml.features import FEATURE_NAMES, extract_features, build_tick_index
+from ml.features import FEATURE_NAMES, extract_features, build_tick_index, load_daily_closes, compute_daily_smas
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
@@ -41,6 +41,9 @@ def extract_window_features(
     price_history: deque,
     tick_buffer: deque,
     persistent_raw_buffer: deque | None = None,
+    sma5: float | None = None,
+    sma15: float | None = None,
+    sma30: float | None = None,
 ) -> list[dict]:
     """Replay one tick window, extracting features at every 10s checkpoint.
 
@@ -154,6 +157,9 @@ def extract_window_features(
             window_open_price=window.price_open,
             ts_index=ts_idx,
             sorted_ticks=sorted_raw,
+            sma5=sma5,
+            sma15=sma15,
+            sma30=sma30,
         )
         feats["label"] = label
         feats["window_start"] = window.window_start.isoformat()
@@ -214,6 +220,10 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
     tick_buffer: deque = deque(maxlen=300)
     persistent_raw_buffer: deque = deque(maxlen=500000)
 
+    # Precompute daily closing prices for SMA features
+    daily_closes = load_daily_closes(DATA_DIR, asset)
+    logger.info("Loaded {} daily closing prices for SMA computation", len(daily_closes))
+
     all_rows: list[dict] = []
     log_interval = max(1, len(windows) // 20)
 
@@ -221,9 +231,14 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
         if i % log_interval == 0:
             logger.info("Processing window {}/{}", i + 1, len(windows))
 
+        # Compute SMAs for this window's date
+        window_date = window.window_start.strftime("%Y-%m-%d")
+        sma5, sma15, sma30 = compute_daily_smas(daily_closes, window_date)
+
         rows = extract_window_features(
             window, price_history, tick_buffer,
             persistent_raw_buffer=persistent_raw_buffer,
+            sma5=sma5, sma15=sma15, sma30=sma30,
         )
         all_rows.extend(rows)
 

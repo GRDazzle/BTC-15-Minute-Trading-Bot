@@ -34,6 +34,7 @@ from core.strategy_brain.signal_processors.ml_processor import MLProcessor
 from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine
 from ml.lstm_model import load_model as load_lstm
 from ml.lstm_features import extract_lstm_sequence, LSTM_SEQ_LEN
+from ml.features import load_daily_closes, compute_daily_smas
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 KALSHI_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
@@ -210,6 +211,16 @@ def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8, model_suffix:
                               min_ticks=5, min_confidence=0.55),
     ]
     sim = BacktestSimulator(procs, SignalFusionEngine(), ml_processor=ml, min_dm=min_dm)
+
+    # Build SMA lookup for this asset
+    daily_closes = load_daily_closes(DATA_DIR, asset)
+    sma_lookup = {}
+    all_dates = sorted(set(w.window_start.strftime("%Y-%m-%d") for w in windows))
+    for d in all_dates:
+        sma5, sma15, sma30 = compute_daily_smas(daily_closes, d)
+        sma_lookup[d] = (sma5, sma15, sma30)
+    sim.set_sma_lookup(sma_lookup)
+
     window_data = sim.run_ticks_collect_probabilities(windows, fg)
 
     # Load LSTM model

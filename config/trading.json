@@ -12,33 +12,33 @@
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
-        "ml_weight": 0.2,
+        "ml_weight": 0.3,
         "threshold": 0.7,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 1109.0,
+        "max_price_cents": 75,
+        "pnl_sweep_total_pnl": 1059.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 82.4,
-        "traded_count": 669
+        "win_rate": 77.4,
+        "traded_count": 660
       },
       "ensemble_weekend": {
-        "ml_weight": 0.2,
-        "threshold": 0.7,
+        "ml_weight": 0.1,
+        "threshold": 0.65,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 520.8,
+        "pnl_sweep_total_pnl": 551.0,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 81.8,
-        "traded_count": 274
+        "win_rate": 84.6,
+        "traded_count": 234
       },
       "ensemble_weekday": {
-        "ml_weight": 0.1,
+        "ml_weight": 0.3,
         "threshold": 0.7,
         "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 833.0,
+        "pnl_sweep_total_pnl": 902.0,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 82.4,
-        "traded_count": 347
+        "win_rate": 78.0,
+        "traded_count": 519
       }
     },
     "ETH": {
@@ -48,32 +48,32 @@
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.3,
-        "threshold": 0.7,
+        "threshold": 0.65,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 622.4,
+        "max_price_cents": 75,
+        "pnl_sweep_total_pnl": 693.0,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 84.3,
-        "traded_count": 597
+        "win_rate": 80.7,
+        "traded_count": 616
       },
       "ensemble_weekend": {
-        "ml_weight": 0.2,
-        "threshold": 0.6,
-        "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 253.0,
-        "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 78.2,
-        "traded_count": 257
-      },
-      "ensemble_weekday": {
         "ml_weight": 0.3,
         "threshold": 0.7,
         "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 411.5,
+        "pnl_sweep_total_pnl": 245.5,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 78.5,
-        "traded_count": 470
+        "win_rate": 81.5,
+        "traded_count": 200
+      },
+      "ensemble_weekday": {
+        "ml_weight": 0.3,
+        "threshold": 0.65,
+        "max_price_cents": 75,
+        "pnl_sweep_total_pnl": 504.2,
+        "pnl_sweep_source": "ensemble_combo_sweep",
+        "win_rate": 80.0,
+        "traded_count": 484
       }
     },
     "SOL": {
@@ -83,32 +83,32 @@
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.2,
-        "threshold": 0.65,
+        "threshold": 0.62,
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 563.9,
+        "pnl_sweep_total_pnl": 750.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 83.7,
-        "traded_count": 406
+        "win_rate": 81.1,
+        "traded_count": 646
       },
       "ensemble_weekend": {
-        "ml_weight": 0.1,
+        "ml_weight": 0.2,
         "threshold": 0.7,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 244.0,
+        "pnl_sweep_total_pnl": 269.2,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 84.9,
-        "traded_count": 225
+        "win_rate": 86.3,
+        "traded_count": 219
       },
       "ensemble_weekday": {
         "ml_weight": 0.1,
-        "threshold": 0.7,
-        "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 505.9,
+        "threshold": 0.65,
+        "max_price_cents": 75,
+        "pnl_sweep_total_pnl": 543.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 84.6,
-        "traded_count": 454
+        "win_rate": 83.5,
+        "traded_count": 395
       }
     },
     "XRP": {
@@ -117,33 +117,33 @@
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
-        "ml_weight": 0.1,
+        "ml_weight": 0.2,
         "threshold": 0.7,
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 517.3,
+        "pnl_sweep_total_pnl": 743.3,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 84.5,
-        "traded_count": 465
+        "win_rate": 85.1,
+        "traded_count": 644
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
         "threshold": 0.7,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 224.1,
+        "pnl_sweep_total_pnl": 190.8,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 83.5,
-        "traded_count": 236
+        "win_rate": 82.5,
+        "traded_count": 212
       },
       "ensemble_weekday": {
-        "ml_weight": 0.1,
+        "ml_weight": 0.2,
         "threshold": 0.7,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 527.3,
+        "pnl_sweep_total_pnl": 620.5,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 88.1,
-        "traded_count": 371
+        "win_rate": 85.7,
+        "traded_count": 509
       }
     }
   }

@@ -96,6 +96,16 @@ def run_model_variant(suffix, label):
             TickVelocityProcessor(velocity_threshold_60s=0.001, velocity_threshold_30s=0.0007, min_ticks=5, min_confidence=0.55),
         ]
         sim = BacktestSimulator(procs, SignalFusionEngine(), ml_processor=ml, min_dm=2)
+
+        # Build SMA lookup
+        from ml.features import load_daily_closes, compute_daily_smas
+        daily_closes = load_daily_closes(DATA_DIR, asset)
+        sma_lookup = {}
+        for d in sorted(set(w.window_start.strftime("%Y-%m-%d") for w in windows)):
+            sma5, sma15, sma30 = compute_daily_smas(daily_closes, d)
+            sma_lookup[d] = (sma5, sma15, sma30)
+        sim.set_sma_lookup(sma_lookup)
+
         window_data = sim.run_ticks_collect_probabilities(windows, {})
 
         a_pnl = 0.0
@@ -220,8 +230,8 @@ def main():
     print()
 
     # Test v7 (new features)
-    print("Running v7 (weekday, 26 features)...")
-    v7 = run_model_variant("_v7", "v7")
+    print("Running v8 (weekday, 31 XGB + 21 LSTM features)...")
+    v7 = run_model_variant("_v8", "v8")
 
     # Compare
     print()
