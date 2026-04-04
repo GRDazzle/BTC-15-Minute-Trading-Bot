@@ -1,12 +1,18 @@
-"""Out-of-sample comparison: v6 vs v7 models on Monday-Tuesday data only.
+"""Test consensus entry strategies against Kalshi data.
 
-Uses pre-Sunday params (from snapshot) to avoid look-ahead bias.
-Tests only on 2026-03-31 and 2026-04-01 Kalshi data.
+Compares:
+1. Baseline: enter on first signal (current behavior)
+2. Confirm: require 2 consecutive checkpoints to agree on direction
+3. Strengthen: require second checkpoint confidence >= first
+
+Uses existing ensemble_combo_sweep infrastructure to get per-checkpoint
+predictions, then applies different entry rules.
 """
 import sys
+import math
 from pathlib import Path
 from collections import deque
-from datetime import date, datetime
+from datetime import date
 
 import numpy as np
 import torch
@@ -26,6 +32,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine
 from backtester.simulator import BacktestSimulator
 from ml.lstm_model import load_model as load_lstm
 from ml.lstm_features import extract_lstm_sequence
+from ml.features import load_daily_closes, compute_daily_smas
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
 KALSHI_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
@@ -33,42 +40,30 @@ MODEL_DIR = PROJECT_ROOT / "models"
 FEE = 2
 K = 4.5
 
-# Pre-Sunday params (from snapshot, no look-ahead bias)
 PARAMS = {
-    "BTC": {"ml_w": 0.20, "thresh": 0.65, "max_p": 80, "min_p": 60, "contracts": 20},
-    "ETH": {"ml_w": 0.10, "thresh": 0.65, "max_p": 80, "min_p": 60, "contracts": 10},
-    "SOL": {"ml_w": 0.10, "thresh": 0.70, "max_p": 80, "min_p": 60, "contracts": 10},
-    "XRP": {"ml_w": 0.10, "thresh": 0.70, "max_p": 80, "min_p": 60, "contracts": 10},
+    "BTC": {"ml_w": 0.30, "thresh": 0.70, "max_p": 80, "min_p": 60, "contracts": 20, "init_bal": 50.0},
+    "ETH": {"ml_w": 0.30, "thresh": 0.65, "max_p": 75, "min_p": 60, "contracts": 10, "init_bal": 25.0},
+    "SOL": {"ml_w": 0.10, "thresh": 0.65, "max_p": 75, "min_p": 60, "contracts": 10, "init_bal": 25.0},
+    "XRP": {"ml_w": 0.20, "thresh": 0.70, "max_p": 80, "min_p": 60, "contracts": 10, "init_bal": 25.0},
 }
 
-# Only test on Monday-Tuesday (out-of-sample)
 OOS_START = date(2026, 3, 31)
 
 
-def run_model_variant(suffix, label):
-    """Run one model variant on OOS data and return results."""
+def run_strategy(mode="baseline"):
+    """Run one strategy variant. mode: baseline, confirm, strengthen."""
     total_pnl = 0
     total_w = 0
     total_l = 0
     asset_results = {}
-    hourly = {}
-
-    # Circuit breaker state per asset
-    cb_state = {}
-    for a in ["BTC", "ETH", "SOL", "XRP"]:
-        init_bal = 50.0 if a == "BTC" else 25.0
-        cb_state[a] = {"balance": init_bal, "peak": init_bal, "open": False, "tripped_at": None}
 
     for asset in ["BTC", "ETH", "SOL", "XRP"]:
         p = PARAMS[asset]
         kalshi_windows = load_kalshi_windows(KALSHI_DIR, asset)
         if not kalshi_windows:
             continue
-
-        # Filter to OOS dates only
         kalshi_windows = {k: v for k, v in kalshi_windows.items() if k.date() >= OOS_START}
         if not kalshi_windows:
-            print(f"  No OOS Kalshi data for {asset}")
             continue
 
         kalshi_close_times = set(kalshi_windows.keys())
@@ -79,21 +74,15 @@ def run_model_variant(suffix, label):
             continue
         windows = generate_tick_windows(ticks, min_warmup_ticks=1, min_during_ticks=1)
         windows = [w for w in windows if w.window_end in kalshi_close_times]
-        # Weekday only
         windows = [w for w in windows if w.window_start.weekday() < 5]
 
         try:
-            ml = MLProcessor(asset=asset, model_dir=MODEL_DIR, confidence_threshold=0.60, model_suffix=suffix)
+            ml = MLProcessor(asset=asset, model_dir=MODEL_DIR, confidence_threshold=0.60, model_suffix="_weekday")
         except FileNotFoundError:
-            print(f"  No {label} XGB model for {asset}")
             continue
 
-        # LSTM: use suffix if exists, fall back to _weekday
-        lstm_path = MODEL_DIR / f"{asset}{suffix}_lstm.pt"
+        lstm_path = MODEL_DIR / f"{asset}_weekday_lstm.pt"
         if not lstm_path.exists():
-            lstm_path = MODEL_DIR / f"{asset}_weekday_lstm.pt"
-        if not lstm_path.exists():
-            print(f"  No LSTM model for {asset}")
             continue
         lstm_model, lstm_meta = load_lstm(str(lstm_path))
         scaler_mean = np.array(lstm_meta.get("scaler_mean", []), dtype=np.float32)
@@ -106,8 +95,6 @@ def run_model_variant(suffix, label):
         ]
         sim = BacktestSimulator(procs, SignalFusionEngine(), ml_processor=ml, min_dm=2)
 
-        # Build SMA lookup
-        from ml.features import load_daily_closes, compute_daily_smas
         daily_closes = load_daily_closes(DATA_DIR, asset)
         sma_lookup = {}
         for d in sorted(set(w.window_start.strftime("%Y-%m-%d") for w in windows)):
@@ -120,6 +107,8 @@ def run_model_variant(suffix, label):
         a_pnl = 0.0
         a_w = 0
         a_l = 0
+        balance = p["init_bal"]
+        peak = balance
 
         for win in window_data:
             we = win.get("window_end")
@@ -141,6 +130,8 @@ def run_model_variant(suffix, label):
                     tick_buffer.append({"ts": t.ts, "price": t.price, "qty": t.qty, "is_buyer": t.is_buyer})
                 tick_feed_idx = 0
 
+            # Collect all checkpoint signals for this window
+            signals = []
             for cp in win["checkpoints"]:
                 signal_ts = cp.get("signal_ts")
                 dm = cp.get("dm", 0)
@@ -155,7 +146,6 @@ def run_model_variant(suffix, label):
                         tick_feed_idx += 1
                     seq = extract_lstm_sequence(list(tick_buffer), signal_ts, decision_minute=dm, window_open_price=orig_win.price_open)
                     if seq is not None:
-                        # Trim features to match model's scaler (v6=15, v7=18)
                         n_feat = len(scaler_mean)
                         seq = seq[:, :n_feat]
                         seq_norm = (seq - scaler_mean) / scaler_std
@@ -189,127 +179,100 @@ def run_model_variant(suffix, label):
                 if ensemble_p >= p["thresh"]:
                     direction = "BULLISH"
                     entry = kalshi.get("yes_ask", 0)
+                    confidence = ensemble_p
                 elif ensemble_p <= 1.0 - p["thresh"]:
                     direction = "BEARISH"
                     entry = kalshi.get("no_ask", 0)
+                    confidence = 1.0 - ensemble_p
                 else:
+                    signals.append({"direction": None, "entry": 0, "confidence": 0, "ensemble_p": ensemble_p})
                     continue
 
                 if entry < p["min_p"] or entry > p["max_p"] or entry <= 0:
                     continue
 
-                # Circuit breaker: check if asset is paused
-                cb = cb_state[asset]
-                if cb["open"]:
-                    # Check if 1 hour has passed (4 windows x 15 min = 1 hour)
-                    elapsed_windows = 0
-                    if cb["tripped_at"] is not None:
-                        elapsed_windows = sum(
-                            1 for ct in kalshi_windows.keys()
-                            if cb["tripped_at"] < ct <= we
-                        )
-                    if elapsed_windows >= 4:
-                        cb["open"] = False
-                        cb["tripped_at"] = None
-                    else:
-                        break  # Skip this window
+                signals.append({"direction": direction, "entry": entry, "confidence": confidence, "ensemble_p": ensemble_p})
 
-                if cb["open"]:
-                    break
+            # Apply entry strategy
+            trade_signal = None
 
-                # Sqrt position scaling (matches live execution)
-                import math
-                initial_bal = 50.0 if asset == "BTC" else 25.0
-                base_contracts = p["contracts"]
-                ratio = cb["balance"] / initial_bal if initial_bal > 0 else 1.0
-                contracts = max(1, min(int(base_contracts * math.sqrt(ratio)), 500))
+            if mode == "baseline":
+                # Enter on first actionable signal
+                for s in signals:
+                    if s["direction"] is not None:
+                        trade_signal = s
+                        break
 
-                outcome_yes = kw.outcome == "yes"
-                won = (direction == "BULLISH" and outcome_yes) or (direction == "BEARISH" and not outcome_yes)
-                trade_pnl = (100 - entry - FEE) * contracts / 100.0 if won else -(entry + FEE) * contracts / 100.0
+            elif mode == "confirm":
+                # Require 2 consecutive checkpoints with same direction
+                for i in range(1, len(signals)):
+                    if signals[i]["direction"] is not None and signals[i-1]["direction"] is not None:
+                        if signals[i]["direction"] == signals[i-1]["direction"]:
+                            trade_signal = signals[i]
+                            break
 
-                # Update circuit breaker balance
-                cb["balance"] += trade_pnl
-                if cb["balance"] > cb["peak"]:
-                    cb["peak"] = cb["balance"]
-                dd_pct = (cb["peak"] - cb["balance"]) / cb["peak"] if cb["peak"] > 0 else 0
-                if dd_pct >= 0.40 and not cb["open"]:
-                    cb["open"] = True
-                    cb["tripped_at"] = we
-                    cb["peak"] = cb["balance"]  # Reset peak on trip
+            elif mode == "strengthen":
+                # Require second signal confidence >= first signal confidence
+                for i in range(1, len(signals)):
+                    if signals[i]["direction"] is not None and signals[i-1]["direction"] is not None:
+                        if signals[i]["direction"] == signals[i-1]["direction"]:
+                            if signals[i]["confidence"] >= signals[i-1]["confidence"]:
+                                trade_signal = signals[i]
+                                break
 
-                a_pnl += trade_pnl
-                if won:
-                    a_w += 1
-                else:
-                    a_l += 1
+            if trade_signal is None:
+                continue
 
-                # Track hourly
-                hour = we.hour
-                if hour not in hourly:
-                    hourly[hour] = {"w": 0, "l": 0, "pnl": 0.0}
-                hourly[hour]["w" if won else "l"] += 1
-                hourly[hour]["pnl"] += trade_pnl
+            # Circuit breaker
+            dd_pct = (peak - balance) / peak if peak > 0 else 0
+            if dd_pct >= 0.40:
+                continue
 
-                break  # one trade per window
+            # Sqrt position scaling
+            ratio = balance / p["init_bal"] if p["init_bal"] > 0 else 1.0
+            contracts = max(1, min(int(p["contracts"] * math.sqrt(ratio)), 500))
+
+            direction = trade_signal["direction"]
+            entry = trade_signal["entry"]
+            outcome_yes = kw.outcome == "yes"
+            won = (direction == "BULLISH" and outcome_yes) or (direction == "BEARISH" and not outcome_yes)
+            trade_pnl = (100 - entry - FEE) * contracts / 100.0 if won else -(entry + FEE) * contracts / 100.0
+
+            balance += trade_pnl
+            if balance > peak:
+                peak = balance
+
+            a_pnl += trade_pnl
+            if won:
+                a_w += 1
+            else:
+                a_l += 1
 
         asset_results[asset] = {"pnl": a_pnl, "w": a_w, "l": a_l}
         total_pnl += a_pnl
         total_w += a_w
         total_l += a_l
 
-    return {
-        "total_pnl": total_pnl, "w": total_w, "l": total_l,
-        "assets": asset_results, "hourly": hourly,
-    }
+    return {"total_pnl": total_pnl, "w": total_w, "l": total_l, "assets": asset_results}
 
 
 def main():
-    print(f"Out-of-Sample Test: {OOS_START} to {date.today()}")
-    print(f"Using pre-Sunday params (no look-ahead bias)")
+    print(f"Consensus Test: {OOS_START} to {date.today()}")
     print()
 
-    # v6 can't run with new feature code (22 vs 26 features mismatch)
-    # Use live trades.csv as the v6 baseline instead
-    print("v6 baseline: using live trades.csv (actual results)")
-    print()
-
-    # Test v7 (new features)
-    print("Running v9 (weekday, 37 XGB + 21 LSTM features)...")
-    v7 = run_model_variant("_v9", "v9")
-
-    # Compare
-    print()
-    print("=" * 70)
-    print("OUT-OF-SAMPLE RESULTS: v7 on Monday-Tuesday")
-    print("=" * 70)
-
-    t = v7["w"] + v7["l"]
-    wr = v7["w"] / t * 100 if t else 0
-    print(f"\n  v7 (26 feat): {v7['w']}W/{v7['l']}L = {wr:.1f}% WR  PnL=${v7['total_pnl']:+.2f}  trades={t}")
-    for a in ["BTC", "ETH", "SOL", "XRP"]:
-        if a in v7["assets"]:
-            ar = v7["assets"][a]
-            at = ar["w"] + ar["l"]
-            awr = ar["w"] / at * 100 if at else 0
-            print(f"    {a}: {ar['w']}W/{ar['l']}L = {awr:.1f}% WR  PnL=${ar['pnl']:+.2f}")
-
-    print(f"\n  Compare to live v6 session: 300 trades, 78% WR, ~-$25 PnL")
-
-    # Hourly breakdown
-    print()
-    print("=" * 70)
-    print("v7 HOURLY BREAKDOWN")
-    print("=" * 70)
-    all_hours = sorted(v7["hourly"].keys())
-    print(f"\n  {'Hour':>4} {'PT':>4}  {'WR':>7} {'PnL':>9} {'Trades':>7}")
-    print("  " + "-" * 40)
-    for h in all_hours:
-        h7 = v7["hourly"][h]
-        t7 = h7["w"] + h7["l"]
-        wr7 = h7["w"] / t7 * 100 if t7 else 0
-        pt = (h - 7) % 24
-        print(f"  {h:>4} {pt:>3}h  {wr7:>6.0f}% ${h7['pnl']:>+8.2f} {t7:>7}")
+    for mode in ["baseline", "confirm", "strengthen"]:
+        print(f"Running {mode}...")
+        r = run_strategy(mode)
+        t = r["w"] + r["l"]
+        wr = r["w"] / t * 100 if t else 0
+        print(f"\n  {mode}: {r['w']}W/{r['l']}L = {wr:.1f}% WR  PnL=${r['total_pnl']:+.2f}  trades={t}")
+        for a in ["BTC", "ETH", "SOL", "XRP"]:
+            if a in r["assets"]:
+                ar = r["assets"][a]
+                at = ar["w"] + ar["l"]
+                awr = ar["w"] / at * 100 if at else 0
+                print(f"    {a}: {ar['w']}W/{ar['l']}L = {awr:.1f}% WR  PnL=${ar['pnl']:+.2f}")
+        print()
 
 
 if __name__ == "__main__":

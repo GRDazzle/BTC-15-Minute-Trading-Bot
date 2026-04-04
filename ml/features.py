@@ -56,6 +56,13 @@ FEATURE_NAMES = [
     "price_vs_sma5",
     "price_vs_sma15",
     "price_vs_sma30",
+    # Quant indicators (6)
+    "z_score_300s",
+    "z_score_900s",
+    "obv_slope_60s",
+    "obv_slope_300s",
+    "cvd_60s",
+    "cvd_300s",
 ]
 
 
@@ -434,5 +441,65 @@ def extract_features(
         features["price_vs_sma30"] = (current_price - sma30) / sma30
     else:
         features["price_vs_sma30"] = 0.0
+
+    # ---- Quant indicators ----
+
+    # Z-score: how many std devs is current price from rolling mean
+    # ticks_300 and a 900s window already available
+    ticks_900 = _ticks_in_window(tick_buffer, 900, timestamp, ts_index, sorted_ticks)
+
+    if len(ticks_300) >= 5:
+        prices_300 = [t["price"] for t in ticks_300]
+        mean_300 = sum(prices_300) / len(prices_300)
+        std_300 = (sum((p - mean_300) ** 2 for p in prices_300) / len(prices_300)) ** 0.5
+        features["z_score_300s"] = (current_price - mean_300) / std_300 if std_300 > 0 else 0.0
+    else:
+        features["z_score_300s"] = 0.0
+
+    if len(ticks_900) >= 5:
+        prices_900 = [t["price"] for t in ticks_900]
+        mean_900 = sum(prices_900) / len(prices_900)
+        std_900 = (sum((p - mean_900) ** 2 for p in prices_900) / len(prices_900)) ** 0.5
+        features["z_score_900s"] = (current_price - mean_900) / std_900 if std_900 > 0 else 0.0
+    else:
+        features["z_score_900s"] = 0.0
+
+    # OBV slope: on-balance volume trend (volume confirms price?)
+    # Positive slope = volume confirms direction, negative = divergence
+    def _obv_slope(ticks: list[dict]) -> float:
+        if len(ticks) < 3:
+            return 0.0
+        obv = 0.0
+        obv_values = [0.0]
+        for i in range(1, len(ticks)):
+            qty = ticks[i].get("qty", 0)
+            if ticks[i]["price"] > ticks[i - 1]["price"]:
+                obv += qty
+            elif ticks[i]["price"] < ticks[i - 1]["price"]:
+                obv -= qty
+            obv_values.append(obv)
+        # Simple slope: (last - first) / count, normalized by mean abs OBV
+        n = len(obv_values)
+        slope = (obv_values[-1] - obv_values[0]) / n if n > 0 else 0.0
+        mean_abs = sum(abs(v) for v in obv_values) / n if n > 0 else 1.0
+        return slope / mean_abs if mean_abs > 0 else 0.0
+
+    features["obv_slope_60s"] = _obv_slope(ticks_60)
+    features["obv_slope_300s"] = _obv_slope(ticks_300)
+
+    # CVD: cumulative volume delta (net buy - sell pressure), normalized
+    def _cvd_normalized(ticks: list[dict]) -> float:
+        if not ticks:
+            return 0.0
+        buy_vol = sum(t.get("qty", 0) for t in ticks if t.get("is_buyer", False))
+        sell_vol = sum(t.get("qty", 0) for t in ticks if not t.get("is_buyer", False))
+        total = buy_vol + sell_vol
+        if total == 0:
+            return 0.0
+        # Normalized: -1 (all sells) to +1 (all buys)
+        return (buy_vol - sell_vol) / total
+
+    features["cvd_60s"] = _cvd_normalized(ticks_60)
+    features["cvd_300s"] = _cvd_normalized(ticks_300)
 
     return features

@@ -3,12 +3,13 @@
     "initial_balance": 25.0,
     "max_contracts_per_trade": 10,
     "max_price_cents": 80,
-    "min_price_cents": 60
+    "min_price_cents": 60,
+    "require_confirm": false
   },
   "assets": {
     "BTC": {
-      "initial_balance": 50.0,
-      "max_contracts_per_trade": 20,
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10,
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
@@ -24,12 +25,12 @@
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
-        "threshold": 0.65,
+        "threshold": 0.7,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 551.0,
+        "pnl_sweep_total_pnl": 541.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 84.6,
-        "traded_count": 234
+        "win_rate": 82.9,
+        "traded_count": 257
       },
       "ensemble_weekday": {
         "ml_weight": 0.3,
@@ -144,6 +145,39 @@
         "pnl_sweep_source": "ensemble_combo_sweep",
         "win_rate": 85.7,
         "traded_count": 509
+      }
+    },
+    "HYPE": {
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10,
+      "max_price_cents": 80,
+      "min_price_cents": 60,
+      "ensemble": {
+        "ml_weight": 0.1,
+        "threshold": 0.7,
+        "max_price_cents": 80
+      }
+    },
+    "BNB": {
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10,
+      "max_price_cents": 80,
+      "min_price_cents": 60,
+      "ensemble": {
+        "ml_weight": 0.1,
+        "threshold": 0.7,
+        "max_price_cents": 80
+      }
+    },
+    "DOGE": {
+      "initial_balance": 25.0,
+      "max_contracts_per_trade": 10,
+      "max_price_cents": 80,
+      "min_price_cents": 60,
+      "ensemble": {
+        "ml_weight": 0.1,
+        "threshold": 0.7,
+        "max_price_cents": 80
       }
     }
   }

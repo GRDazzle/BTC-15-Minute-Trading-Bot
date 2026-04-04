@@ -8,6 +8,9 @@ SERIES_MAP: dict[str, str] = {
     "ETH": "KXETH15M",
     "SOL": "KXSOL15M",
     "XRP": "KXXRP15M",
+    "HYPE": "KXHYPE15M",
+    "BNB": "KXBNB15M",
+    "DOGE": "KXDOGE15M",
 }
 
 

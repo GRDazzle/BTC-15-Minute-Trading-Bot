@@ -169,7 +169,7 @@ def main():
     parser.add_argument(
         "--assets",
         type=str,
-        default="BTC,ETH,SOL,XRP",
+        default="BTC,ETH,SOL,XRP,HYPE,BNB,DOGE",
         help="Comma-separated assets (default: BTC,ETH,SOL,XRP)",
     )
     parser.add_argument(

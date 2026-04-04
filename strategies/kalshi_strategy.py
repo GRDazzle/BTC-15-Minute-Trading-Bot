@@ -158,6 +158,9 @@ BINANCE_SYMBOLS: dict[str, str] = {
     "ETH": "ethusdt",
     "SOL": "solusdt",
     "XRP": "xrpusdt",
+    "HYPE": "hypeusdt",
+    "BNB": "bnbusdt",
+    "DOGE": "dogeusdt",
 }
 
 
@@ -272,7 +275,7 @@ class KalshiMultiAssetStrategy:
     # dm 9 = window_start + 14min (elapsed 840s), mtc=1
     ENTRY_GATE_START_S = 420   # dm=2: 7 min into window (mtc=8)
     ENTRY_GATE_END_S = 840     # dm=9: 14 min into window (mtc=1)
-    BLOCKED_HOURS = {15}       # UTC hours to skip (15:00 UTC = 8am PT, US market open)
+    BLOCKED_HOURS = set()      # No blocked hours (v8 SMA features handle market open)
 
     CONFIG_PATH = Path("config/trading.json")
 
@@ -311,6 +314,17 @@ class KalshiMultiAssetStrategy:
         # SMA cache per asset (recomputed daily)
         self._asset_smas: dict[str, dict] = {}
         self._sma_date: str = ""
+
+        # Consensus confirm: require 2 consecutive checkpoints to agree before entry
+        self._require_confirm = False
+        try:
+            with open(self.CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            self._require_confirm = cfg.get("defaults", {}).get("require_confirm", False)
+            if self._require_confirm:
+                logger.info("Consensus confirm mode ENABLED")
+        except Exception:
+            pass
 
         # Resolve model directory for ML processors
         if model_dir is None:
@@ -1414,7 +1428,7 @@ class KalshiMultiAssetStrategy:
                 logger.info("[%s] Circuit breaker auto-reset after 1 hour", asset)
                 state.circuit_open = False
                 state.circuit_tripped_at = None
-                state.session_peak_balance = None  # Reset peak on resume
+                # Peak was already reset when breaker tripped
             else:
                 mins_left = (3600 - elapsed_since_trip) / 60
                 if not hasattr(self, '_last_cb_log') or self._last_cb_log.get(asset) != window_id:
@@ -1556,6 +1570,21 @@ class KalshiMultiAssetStrategy:
 
             score = confidence * 100
             lstm_str = f" lstm={lstm_p:.3f}" if lstm_p is not None else ""
+
+            # Consensus confirm: require 2 consecutive checkpoints to agree
+            if self._require_confirm:
+                confirm_key = f"{asset}_{window_id}"
+                if not hasattr(self, '_last_signal'):
+                    self._last_signal = {}
+                prev = self._last_signal.get(confirm_key)
+                self._last_signal[confirm_key] = direction
+                if prev != direction:
+                    logger.info(
+                        "[%s] Ensemble %s (%s): p=%.3f price=%dc [AWAITING CONFIRM]",
+                        asset, direction, model_label, ensemble_p, entry_price,
+                    )
+                    return
+
             logger.info(
                 "[%s] Ensemble %s (%s): p=%.3f (xgb=%.3f%s fus=%.3f) price=%dc%s",
                 asset, direction, model_label, ensemble_p, ml_p, lstm_str, fusion_p, entry_price,
@@ -1985,9 +2014,13 @@ class KalshiMultiAssetStrategy:
                             settled.append(trade)
 
                             # Circuit breaker: check if balance dropped 40% from session peak
-                            acct = self.account_manager.get_account(trade.asset)
-                            if acct:
+                            try:
+                                series = self.states[trade.asset].series
+                                acct = self.account_manager.get_account(series)
                                 bal = acct.balance_dollars
+                            except (KeyError, AttributeError):
+                                bal = None
+                            if bal is not None:
                                 if state.session_peak_balance is None or bal > state.session_peak_balance:
                                     state.session_peak_balance = bal
                                 if state.session_peak_balance > 0:

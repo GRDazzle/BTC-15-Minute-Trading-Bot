@@ -30,6 +30,9 @@ ASSET_TO_PRODUCT = {
     "ETH": "ETH-USD",
     "SOL": "SOL-USD",
     "XRP": "XRP-USD",
+    "HYPE": "HYPE-USD",
+    "BNB": "BNB-USD",
+    "DOGE": "DOGE-USD",
 }
 
 ASSET_TO_SYMBOL = {
@@ -37,6 +40,9 @@ ASSET_TO_SYMBOL = {
     "ETH": "ETHUSDT",
     "SOL": "SOLUSDT",
     "XRP": "XRPUSDT",
+    "HYPE": "HYPEUSDT",
+    "BNB": "BNBUSDT",
+    "DOGE": "DOGEUSDT",
 }
 
 

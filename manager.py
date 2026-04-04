@@ -529,7 +529,7 @@ class BotManager:
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Trading Bot Manager")
-    parser.add_argument("--assets", default="BTC,ETH,SOL,XRP", help="Assets to trade")
+    parser.add_argument("--assets", default="BTC,ETH,SOL,XRP,HYPE,BNB,DOGE", help="Assets to trade")
     parser.add_argument("--real", action="store_true", help="Enable real trading (default: dry run)")
     parser.add_argument("--retrain-day", default="sunday", help="Day to retrain (default: sunday)")
     parser.add_argument("--retrain-hour", type=int, default=6, help="UTC hour to retrain (default: 6)")

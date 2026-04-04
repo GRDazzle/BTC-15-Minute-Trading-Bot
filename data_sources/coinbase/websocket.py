@@ -21,6 +21,9 @@ ASSET_TO_PRODUCT = {
     "ETH": "ETH-USD",
     "SOL": "SOL-USD",
     "XRP": "XRP-USD",
+    "HYPE": "HYPE-USD",
+    "BNB": "BNB-USD",
+    "DOGE": "DOGE-USD",
 }
 
 WS_URL = "wss://ws-feed.exchange.coinbase.com"
