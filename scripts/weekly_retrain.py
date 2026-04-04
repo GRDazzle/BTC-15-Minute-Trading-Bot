@@ -203,6 +203,7 @@ def main():
     min_dm = str(args.min_dm)
 
     day_type = args.day_type
+    asset_list = [a.strip() for a in assets.split(",")]
 
     log("=" * 60)
     log(f"Weekly retrain: assets={assets} days={days} min_dm={min_dm} day_type={day_type}")
@@ -211,10 +212,10 @@ def main():
     pipeline_start = time.time()
     failed = []
 
-    # Step 1: Download fresh tick data
+    # Step 1: Download fresh tick data from Coinbase
     if not args.skip_download:
-        ok = run_step("Download aggTrades", [
-            python, "scripts/download_binance_aggtrades.py",
+        ok = run_step("Download Coinbase trades", [
+            python, "scripts/fetch_coinbase_trades.py",
             "--assets", assets,
             "--days", days,
         ])
@@ -317,7 +318,6 @@ def main():
         log("WARNING: LSTM data generation failed, LSTM models will not be updated")
 
     # Step 5: Train LSTM models (one at a time to avoid memory crashes)
-    asset_list = [a.strip() for a in assets.split(",")]
     lstm_failed = False
     for asset in asset_list:
         ok = run_step(f"Train LSTM model ({asset})", [
@@ -330,15 +330,7 @@ def main():
     if lstm_failed:
         log("WARNING: Some LSTM models failed to train")
 
-    # Step 6: Fetch recent aggTrades via REST (fills gap if bot was offline)
-    ok = run_step("Fetch recent aggTrades (REST)", [
-        python, "scripts/fetch_recent_aggtrades.py",
-        "--assets", assets, "--hours", "48",
-    ])
-    if not ok:
-        log("WARNING: REST aggTrades fetch failed, continuing with existing data")
-
-    # Step 7: Purge old data (>14 days) — after fetch so new data isn't purged
+    # Step 6: Purge old data (>45 days)
     purge_kalshi_polls(max_age_days=45)
     purge_old_aggtrades(max_age_days=45)
 

@@ -93,6 +93,8 @@ def fetch_asset(asset: str, days: int) -> None:
     after_id = None
     done = False
     page = 0
+    consecutive_existing = 0
+    last_checked_date = None
 
     while not done:
         page += 1
@@ -118,7 +120,16 @@ def fetch_asset(asset: str, days: int) -> None:
                 if csv_path.exists() and csv_path.stat().st_size > 100:
                     # Skip this date — already have data
                     files[date_str] = None
+                    # Track consecutive existing dates to stop early
+                    if date_str != last_checked_date:
+                        last_checked_date = date_str
+                        consecutive_existing += 1
+                        if consecutive_existing >= 3:
+                            print(f"  3 consecutive dates already exist, stopping early")
+                            done = True
+                            break
                 else:
+                    consecutive_existing = 0  # Reset — found a new date
                     fh = open(csv_path, "w", newline="", encoding="utf-8")
                     files[date_str] = (fh, csv.writer(fh))
 
@@ -187,7 +198,7 @@ def fetch_asset(asset: str, days: int) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Download Coinbase historical trades")
-    parser.add_argument("--assets", default="BTC,ETH,SOL,XRP")
+    parser.add_argument("--assets", default="BTC,ETH,SOL,XRP,HYPE,BNB,DOGE")
     parser.add_argument("--days", type=int, default=30)
     args = parser.parse_args()
 
