@@ -246,6 +246,7 @@ def main():
             "--asset", assets, "--min-dm", min_dm,
             "--data-suffix", suffix, "--model-suffix", suffix,
         ])
+        xgb_ok = ok
         if not ok:
             failed.append(f"train_xgb_{day_type}")
 
@@ -257,6 +258,7 @@ def main():
         if not ok:
             log(f"WARNING: {day_type} LSTM data gen failed")
 
+        lstm_ok = True
         for asset in asset_list:
             ok = run_step(f"Train LSTM ({asset} {day_type})", [
                 python, "scripts/train_lstm.py",
@@ -264,16 +266,23 @@ def main():
                 "--data-suffix", suffix, "--model-suffix", suffix,
             ])
             if not ok:
+                lstm_ok = False
                 log(f"WARNING: {day_type} LSTM training failed for {asset}")
 
-        ok = run_step(f"Ensemble sweep ({day_type})", [
-            python, "scripts/ensemble_combo_sweep.py",
-            "--asset", assets,
-            "--min-dm", min_dm, "--max-dm", "8",
-            "--model-suffix", suffix, "--day-filter", day_type,
-        ])
-        if not ok:
-            log(f"WARNING: {day_type} ensemble sweep failed")
+        # Only run ensemble sweep if both XGB and LSTM trained successfully
+        if xgb_ok and lstm_ok:
+            ok = run_step(f"Ensemble sweep ({day_type})", [
+                python, "scripts/ensemble_combo_sweep.py",
+                "--asset", assets,
+                "--min-dm", min_dm, "--max-dm", "8",
+                "--model-suffix", suffix, "--day-filter", day_type,
+                "--kalshi-days", "14",
+            ])
+            if not ok:
+                log(f"WARNING: {day_type} ensemble sweep failed")
+        else:
+            log(f"SKIPPING ensemble sweep — XGB ok={xgb_ok}, LSTM ok={lstm_ok}")
+            failed.append(f"sweep_skipped_{day_type}")
 
         total = time.time() - pipeline_start
         log("=" * 60)
@@ -318,7 +327,7 @@ def main():
         log("WARNING: LSTM data generation failed, LSTM models will not be updated")
 
     # Step 5: Train LSTM models (one at a time to avoid memory crashes)
-    lstm_failed = False
+    lstm_ok = True
     for asset in asset_list:
         ok = run_step(f"Train LSTM model ({asset})", [
             python, "scripts/train_lstm.py",
@@ -326,22 +335,26 @@ def main():
             "--min-dm", min_dm,
         ])
         if not ok:
-            lstm_failed = True
-    if lstm_failed:
+            lstm_ok = False
+    if not lstm_ok:
         log("WARNING: Some LSTM models failed to train")
 
     # Step 6: Purge old data (>45 days)
     purge_kalshi_polls(max_age_days=45)
     purge_old_aggtrades(max_age_days=45)
 
-    # Step 8: 3-way ensemble combo sweep (XGB + LSTM + Fusion with dynamic weighting)
-    ok = run_step("Ensemble combo sweep (3-way)", [
-        python, "scripts/ensemble_combo_sweep.py",
-        "--asset", assets,
-        "--min-dm", min_dm, "--max-dm", "8",
-    ])
-    if not ok:
-        log("WARNING: Ensemble combo sweep failed")
+    # Step 7: 3-way ensemble combo sweep (only if both XGB and LSTM succeeded)
+    if lstm_ok:
+        ok = run_step("Ensemble combo sweep (3-way)", [
+            python, "scripts/ensemble_combo_sweep.py",
+            "--asset", assets,
+            "--min-dm", min_dm, "--max-dm", "8",
+            "--kalshi-days", "14",
+        ])
+        if not ok:
+            log("WARNING: Ensemble combo sweep failed")
+    else:
+        log("SKIPPING ensemble sweep — LSTM training incomplete")
 
     # Step 9: Weekday/weekend model variants
     for day_filter in ["weekday", "weekend"]:
@@ -356,12 +369,12 @@ def main():
             log(f"WARNING: {day_filter} XGB data gen failed, skipping {day_filter} models")
             continue
 
-        ok = run_step(f"Train XGB models ({day_filter})", [
+        var_xgb_ok = run_step(f"Train XGB models ({day_filter})", [
             python, "scripts/train_xgb.py",
             "--asset", assets, "--min-dm", min_dm,
             "--data-suffix", suffix, "--model-suffix", suffix,
         ])
-        if not ok:
+        if not var_xgb_ok:
             log(f"WARNING: {day_filter} XGB training failed")
 
         ok = run_step(f"Generate LSTM data ({day_filter})", [
@@ -372,6 +385,7 @@ def main():
         if not ok:
             log(f"WARNING: {day_filter} LSTM data gen failed")
 
+        var_lstm_ok = True
         for asset in asset_list:
             ok = run_step(f"Train LSTM ({asset} {day_filter})", [
                 python, "scripts/train_lstm.py",
@@ -379,13 +393,19 @@ def main():
                 "--data-suffix", suffix, "--model-suffix", suffix,
             ])
             if not ok:
+                var_lstm_ok = False
                 log(f"WARNING: {day_filter} LSTM training failed for {asset}")
+
+        if not (var_xgb_ok and var_lstm_ok):
+            log(f"SKIPPING {day_filter} ensemble sweep — XGB ok={var_xgb_ok}, LSTM ok={var_lstm_ok}")
+            continue
 
         ok = run_step(f"Ensemble sweep ({day_filter})", [
             python, "scripts/ensemble_combo_sweep.py",
             "--asset", assets,
             "--min-dm", min_dm, "--max-dm", "8",
             "--model-suffix", suffix, "--day-filter", day_filter,
+            "--kalshi-days", "14",
         ])
         if not ok:
             log(f"WARNING: {day_filter} ensemble sweep failed")

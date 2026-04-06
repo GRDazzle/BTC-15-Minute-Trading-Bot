@@ -226,9 +226,9 @@ def build_dashboard(
     else:
         last_line = "Never"
 
-    # Next retrain: Sunday 8 UTC (weekday) or Monday 8 UTC (weekend)
-    next_sun = next_retrain_time(6, 8)  # Sunday 8 UTC
-    next_mon = next_retrain_time(0, 8)  # Monday 8 UTC
+    # Next retrain: Sunday 15 UTC (weekday) or Monday 15 UTC (weekend)
+    next_sun = next_retrain_time(6, 15)  # Sunday 15 UTC = 8 AM PT
+    next_mon = next_retrain_time(0, 15)  # Monday 15 UTC = 8 AM PT
     next_dt = min(next_sun, next_mon)
     next_type = "weekday" if next_dt == next_sun else "weekend"
     remaining = (next_dt - now).total_seconds()
@@ -239,8 +239,8 @@ def build_dashboard(
     retrain_color = "yellow" if retrain_running else "green"
 
     retrain_text = (
-        f"  Sun 08:00 UTC (1AM PT) -> weekday models\n"
-        f"  Mon 08:00 UTC (1AM PT) -> weekend models\n"
+        f"  Sun 15:00 UTC (8AM PT) -> weekday models\n"
+        f"  Mon 15:00 UTC (8AM PT) -> weekend models\n"
         f"  Last: {last_line}\n"
         f"  Next: {next_type} {next_str} ({remaining_str})\n"
         f"  Status: [{retrain_color}]{retrain_status}[/]"
@@ -412,8 +412,8 @@ class BotManager:
         """Check if it's time to retrain.
 
         Schedule:
-          Sunday 8 UTC (1 AM PT) -> retrain weekday models
-          Monday 8 UTC (1 AM PT) -> retrain weekend models
+          Sunday 15 UTC (8 AM PT) -> retrain weekday models
+          Monday 15 UTC (8 AM PT) -> retrain weekend models
         """
         now = datetime.now(timezone.utc)
 
@@ -422,7 +422,7 @@ class BotManager:
         day_type = schedule.get(now.weekday())
         if day_type is None:
             return
-        if now.hour != 8:  # 8 UTC = 1 AM PT
+        if now.hour != 15:  # 15 UTC = 8 AM PT
             return
 
         state = load_retrain_state()

@@ -399,6 +399,8 @@ class KalshiMultiAssetStrategy:
                         asset=asset,
                         model_dir=model_dir,
                     )
+                    lstm_path = model_dir / f"{asset}_lstm.pt"
+                    self._model_mtimes[f"{asset}_lstm"] = self._get_mtime(lstm_path)
                     logger.info("LSTM model loaded for %s", asset)
                 except FileNotFoundError:
                     logger.info("No LSTM model for %s", asset)
@@ -464,6 +466,8 @@ class KalshiMultiAssetStrategy:
                             asset=asset, model_dir=model_dir, model_suffix=suffix,
                         )
                         setattr(state, f"{variant}_lstm_processor", lstm_proc)
+                        lstm_path = model_dir / f"{asset}{suffix}_lstm.pt"
+                        self._model_mtimes[f"{asset}{suffix}_lstm"] = self._get_mtime(lstm_path)
                         logger.info("%s LSTM model loaded for %s", variant.capitalize(), asset)
                     except (FileNotFoundError, Exception):
                         pass
@@ -619,6 +623,16 @@ class KalshiMultiAssetStrategy:
                     if var_key not in models_changed:
                         models_changed.append(var_key)
 
+            # Check LSTM model files (standard + weekday + weekend)
+            for lstm_suffix in ("", "_weekday", "_weekend"):
+                lstm_key = f"{asset}{lstm_suffix}_lstm"
+                lstm_path = self._model_dir / f"{asset}{lstm_suffix}_lstm.pt"
+                new_lstm_mtime = self._get_mtime(lstm_path)
+                old_lstm_mtime = self._model_mtimes.get(lstm_key, 0.0)
+                if new_lstm_mtime != old_lstm_mtime and new_lstm_mtime > 0:
+                    if lstm_key not in models_changed:
+                        models_changed.append(lstm_key)
+
         if not config_changed and not models_changed:
             return
 
@@ -634,7 +648,12 @@ class KalshiMultiAssetStrategy:
 
         # Reload changed ML models
         for key in models_changed:
-            if key.endswith("_early"):
+            if key.endswith("_lstm"):
+                # LSTM model reload
+                self._reload_lstm(key)
+                lstm_path = self._model_dir / f"{key}.pt"
+                self._model_mtimes[key] = self._get_mtime(lstm_path)
+            elif key.endswith("_early"):
                 asset = key.replace("_early", "")
                 self._reload_early_model(asset)
                 early_model_path = self._model_dir / f"{asset}_early_xgb.json"
@@ -844,6 +863,34 @@ class KalshiMultiAssetStrategy:
             setattr(state, weights_attr, None)
         except Exception:
             logger.exception("[hot-reload] Failed to reload %s ML model for %s", variant, asset)
+
+    def _reload_lstm(self, key: str) -> None:
+        """Re-load an LSTM model from disk. Key format: {ASSET}{suffix}_lstm."""
+        # Parse key: e.g. "BTC_lstm", "ETH_weekday_lstm", "SOL_weekend_lstm"
+        parts = key.replace("_lstm", "").split("_", 1)
+        asset = parts[0]
+        suffix = f"_{parts[1]}" if len(parts) > 1 else ""
+
+        state = self.states.get(asset)
+        if state is None:
+            return
+
+        try:
+            new_lstm = LSTMProcessor(
+                asset=asset, model_dir=self._model_dir, model_suffix=suffix,
+            )
+            # Determine which state field to update
+            if suffix == "_weekday":
+                state.weekday_lstm_processor = new_lstm
+            elif suffix == "_weekend":
+                state.weekend_lstm_processor = new_lstm
+            else:
+                state.lstm_processor = new_lstm
+            logger.info("[hot-reload] Reloaded LSTM%s model for %s", suffix, asset)
+        except FileNotFoundError:
+            logger.warning("[hot-reload] LSTM%s model disappeared for %s", suffix, asset)
+        except Exception:
+            logger.exception("[hot-reload] Failed to reload LSTM%s for %s", suffix, asset)
 
     def _update_smas(self) -> None:
         """Recompute SMA 5/15/30 for all assets (once per day)."""

@@ -38,7 +38,7 @@ def train_asset(
     model_suffix: str = "",
     data_suffix: str = "",
     epochs: int = 150,
-    batch_size: int = 256,
+    batch_size: int = 128,
     lr: float = 1e-3,
     patience: int = 20,
     warmup_epochs: int = 15,
@@ -53,10 +53,11 @@ def train_asset(
         return
 
     data = np.load(data_path, allow_pickle=True)
-    X = data["X"]
-    y = data["y"]
-    window_starts = data["window_starts"]
-    dms = data["dms"]
+    X = data["X"].copy()  # Copy to own memory (avoid mmap issues on Windows)
+    y = data["y"].copy()
+    window_starts = data["window_starts"].copy()
+    dms = data["dms"].copy()
+    data.close()  # Release the npz file handle
 
     dm_label = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
 
@@ -311,6 +312,13 @@ def train_asset(
     })
     print(f"\nModel saved: {model_path}")
 
+    # Free GPU/CPU memory
+    del model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train LSTM v4 price direction model")
@@ -319,7 +327,7 @@ def main():
     parser.add_argument("--max-dm", type=int, default=None, help="Maximum decision minute")
     parser.add_argument("--model-suffix", type=str, default="", help="Model filename suffix")
     parser.add_argument("--epochs", type=int, default=150, help="Max training epochs")
-    parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--hidden-size", type=int, default=64, help="Hidden size")
     parser.add_argument("--num-layers", type=int, default=2, help="LSTM layers")

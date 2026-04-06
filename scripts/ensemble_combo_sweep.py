@@ -12,7 +12,7 @@ import csv
 import json
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -172,13 +172,22 @@ def sweep_combo(
     }
 
 
-def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8, model_suffix: str = "", day_filter: str = "all"):
+def run_asset(asset: str, min_dm: int = 2, max_dm: int | None = 8, model_suffix: str = "", day_filter: str = "all", kalshi_days: int | None = None):
     """Run all 3 ensemble combinations for one asset."""
     # Load Kalshi data
     kalshi_windows = load_kalshi_windows(KALSHI_DIR, asset)
     if not kalshi_windows:
         print(f"  No Kalshi data for {asset}")
         return
+
+    # Filter Kalshi data to last N days if specified
+    if kalshi_days is not None:
+        cutoff = date.today() - timedelta(days=kalshi_days)
+        kalshi_windows = {k: v for k, v in kalshi_windows.items() if k.date() >= cutoff}
+        if not kalshi_windows:
+            print(f"  No Kalshi data for {asset} in last {kalshi_days} days")
+            return
+
     kalshi_close_times = set(kalshi_windows.keys())
     kalshi_dates = sorted(set(ct.date() for ct in kalshi_windows.keys()))
     days_back = (date.today() - kalshi_dates[0]).days + 2
@@ -432,12 +441,15 @@ def main():
                         help="Model filename suffix (e.g. '_weekday')")
     parser.add_argument("--day-filter", choices=["all", "weekday", "weekend"], default="all",
                         help="Filter windows by day of week")
+    parser.add_argument("--kalshi-days", type=int, default=14,
+                        help="Limit Kalshi data to last N days (default: 14)")
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     for asset in assets:
         run_asset(asset, min_dm=args.min_dm, max_dm=args.max_dm,
-                  model_suffix=args.model_suffix, day_filter=args.day_filter)
+                  model_suffix=args.model_suffix, day_filter=args.day_filter,
+                  kalshi_days=args.kalshi_days)
 
 
 if __name__ == "__main__":
