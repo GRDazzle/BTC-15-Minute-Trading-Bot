@@ -83,7 +83,9 @@ class KalshiExecutionAdapter:
     ):
         self.client = client
         self.account_manager = account_manager
-        self.dry_run = dry_run
+        # dry_run can be a bool (global) or dict (per-asset)
+        self._dry_run_global = dry_run
+        self._dry_run_per_asset: dict[str, bool] = {}
         # Accept either a per-asset dict or a single int (backwards compat)
         self._max_contracts = (
             max_contracts_per_trade
@@ -103,13 +105,26 @@ class KalshiExecutionAdapter:
         # Per-asset initial balances for contract scaling
         self._initial_balances: dict[str, float] = initial_balances or {}
 
+    def is_dry_run(self, asset: str) -> bool:
+        """Check if an asset is in dry-run mode. Per-asset overrides global."""
+        return self._dry_run_per_asset.get(asset, self._dry_run_global)
+
+    def set_dry_run(self, asset: str, dry_run: bool) -> None:
+        """Set per-asset dry-run mode."""
+        self._dry_run_per_asset[asset] = dry_run
+
+    @property
+    def dry_run(self) -> bool:
+        """Global dry-run flag (backwards compat)."""
+        return self._dry_run_global
+
     # Hard cap to avoid disrupting Kalshi market liquidity
     MAX_CONTRACTS_CAP = 500
 
     def _get_max_contracts(self, asset: str) -> int:
-        """Get max contracts for an asset, sqrt-scaled by balance ratio.
+        """Get max contracts for an asset, power-scaled by balance ratio.
 
-        Grows slowly: 2x balance = 1.41x contracts. Also scales down on losses.
+        Power 0.67: 2x balance = 1.59x contracts, 6x balance = 3.4x contracts.
         Capped at MAX_CONTRACTS_CAP to avoid disrupting market liquidity.
         """
         base = self._max_contracts.get(asset, self._max_contracts.get("_default", self.DEFAULT_MAX_CONTRACTS))
@@ -125,7 +140,7 @@ class KalshiExecutionAdapter:
 
         current = acct.balance_dollars
         ratio = current / initial
-        scaled = int(base * math.sqrt(ratio))
+        scaled = int(base * (ratio ** 0.67))
         scaled = max(1, min(scaled, self.MAX_CONTRACTS_CAP))
         return scaled
 
@@ -191,7 +206,7 @@ class KalshiExecutionAdapter:
             direction=direction,
             confidence=confidence,
             score=score,
-            dry_run=self.dry_run,
+            dry_run=self.is_dry_run(asset),
             placed_at=datetime.now(timezone.utc),
         )
 
@@ -202,7 +217,7 @@ class KalshiExecutionAdapter:
             logger.warning("[kalshi-exec] Reserve failed for %s: %s", asset, e)
             return None
 
-        if self.dry_run:
+        if self.is_dry_run(asset):
             record.filled = count
             self.account_manager.record_fill(account_name, cost, fees)
             logger.info(

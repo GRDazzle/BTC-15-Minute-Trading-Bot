@@ -141,7 +141,7 @@ def configure_logging(level: str):
     log_dir.mkdir(exist_ok=True)
     logger.add(
         "logs/trading.log",
-        level="DEBUG",
+        level="INFO",
         rotation="10 MB",
         retention="7 days",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {message}",
@@ -263,6 +263,14 @@ async def main():
         min_price_cents=per_asset_min_price,
         initial_balances=per_asset_initial_balance,
     )
+
+    # Set per-asset dry_run from config (overrides global --real flag)
+    for a in assets:
+        asset_cfg = get_asset_config(trading_config, a)
+        if "dry_run" in asset_cfg:
+            execution_adapter.set_dry_run(a, asset_cfg["dry_run"])
+            if not asset_cfg["dry_run"]:
+                logger.info("LIVE TRADING enabled for %s", a)
 
     # Create strategy
     strategy = KalshiMultiAssetStrategy(

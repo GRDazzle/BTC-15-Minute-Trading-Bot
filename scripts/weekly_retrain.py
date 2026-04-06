@@ -48,11 +48,17 @@ def run_step(name: str, cmd: list[str], max_retries: int = 2) -> bool:
         log(f"  cmd: {' '.join(cmd)}")
         start = time.time()
 
+        # Run with below-normal priority so live bot isn't starved
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+
         result = subprocess.run(
             cmd,
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
+            creationflags=creation_flags,
         )
 
         elapsed = time.time() - start
