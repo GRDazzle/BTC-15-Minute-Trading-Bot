@@ -317,12 +317,18 @@ class KalshiMultiAssetStrategy:
 
         # Consensus confirm: require 2 consecutive checkpoints to agree before entry
         self._require_confirm = False
+        # Blocked decision minutes (skip entries at these dms)
+        self._blocked_dms: set[int] = set()
         try:
             with open(self.CONFIG_PATH, "r") as f:
                 cfg = json.load(f)
-            self._require_confirm = cfg.get("defaults", {}).get("require_confirm", False)
+            defaults = cfg.get("defaults", {})
+            self._require_confirm = defaults.get("require_confirm", False)
+            self._blocked_dms = set(defaults.get("blocked_dms", []))
             if self._require_confirm:
                 logger.info("Consensus confirm mode ENABLED")
+            if self._blocked_dms:
+                logger.info("Blocked dms: %s", sorted(self._blocked_dms))
         except Exception:
             pass
 
@@ -892,6 +898,45 @@ class KalshiMultiAssetStrategy:
         except Exception:
             logger.exception("[hot-reload] Failed to reload LSTM%s for %s", suffix, asset)
 
+    def _process_deposits(self) -> None:
+        """Apply queued deposits from data/deposits.json to in-memory accounts."""
+        deposits_path = Path("data/deposits.json")
+        if not deposits_path.exists():
+            return
+        try:
+            with open(deposits_path, "r") as f:
+                queue = json.load(f)
+            pending = queue.get("pending", [])
+            if not pending:
+                return
+            applied = []
+            for dep in pending:
+                series = dep.get("series")
+                amount = dep.get("amount", 0)
+                asset = dep.get("asset", "?")
+                try:
+                    self.account_manager.deposit(amount, target=series)
+                    # Reset circuit breaker peak for this asset (fresh slate)
+                    state = self.states.get(asset)
+                    if state is not None:
+                        state.session_peak_balance = None
+                        if state.circuit_open:
+                            state.circuit_open = False
+                            state.circuit_tripped_at = None
+                            logger.info("[deposit] %s circuit breaker reset", asset)
+                    logger.info(
+                        "[deposit] Credited %s (%s) +$%.2f", asset, series, amount,
+                    )
+                    applied.append(dep)
+                except Exception as e:
+                    logger.error("[deposit] Failed for %s: %s", asset, e)
+            # Remove applied deposits and write back
+            queue["pending"] = [d for d in pending if d not in applied]
+            with open(deposits_path, "w") as f:
+                json.dump(queue, f, indent=2)
+        except Exception as e:
+            logger.warning("[deposit] Failed to process deposits queue: %s", e)
+
     def _update_smas(self) -> None:
         """Recompute SMA 5/15/30 for all assets (once per day)."""
         from ml.features import load_daily_closes, compute_daily_smas
@@ -1401,6 +1446,7 @@ class KalshiMultiAssetStrategy:
                     self._last_reload_window = window_id
                     self._check_and_reload()
                     self._update_smas()
+                    self._process_deposits()
                     # Log window transition
                     prices = {a: f"${float(s.current_price):.2f}" for a, s in self.states.items() if s.current_price}
                     logger.info("[window] %s | prices: %s", window_id, prices)
@@ -1427,6 +1473,10 @@ class KalshiMultiAssetStrategy:
                             logger.info("[window] Hour %d UTC blocked, signals only (no trades)", current_hour)
                     dm = int((elapsed - 300) / 60)
                     mtc = 10 - dm
+                    # Skip blocked decision minutes (configurable)
+                    if dm in self._blocked_dms:
+                        await asyncio.sleep(2)
+                        continue
                     for asset, state in self.states.items():
                         await self._process_asset_window(
                             asset, state, window_id, dm=dm, mtc=mtc,

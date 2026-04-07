@@ -4,7 +4,8 @@
     "max_contracts_per_trade": 10,
     "max_price_cents": 80,
     "min_price_cents": 60,
-    "require_confirm": false
+    "require_confirm": false,
+    "blocked_dms": []
   },
   "assets": {
     "BTC": {
