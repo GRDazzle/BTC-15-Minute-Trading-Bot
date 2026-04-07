@@ -22,7 +22,13 @@ from loguru import logger
 
 from sdk.kalshi.client import KalshiClient, KalshiConfig, load_config
 from sdk.kalshi.account import AccountManager
-from sdk.kalshi.orders import fetch_balance
+from sdk.kalshi.orders import (
+    fetch_balance,
+    fetch_positions,
+    fetch_resting_orders,
+    cancel_all_resting,
+    fetch_settlements,
+)
 from sdk.kalshi.ticker import SERIES_MAP, series_for_asset
 from execution.kalshi_execution import KalshiExecutionAdapter
 from strategies.kalshi_strategy import KalshiMultiAssetStrategy
@@ -184,6 +190,142 @@ def initialize_sub_accounts(
             )
 
 
+def startup_reconcile(
+    client: KalshiClient,
+    account_manager: AccountManager,
+    live_assets: list[str],
+):
+    """Pre-flight check for live mode. Logs unexpected state but does not abort.
+
+    Steps:
+      1. Fetch open Kalshi positions -- log if any (downtime survivors)
+      2. Fetch resting orders -- cancel any (15-min markets shouldn't have resting orders)
+      3. Fetch recent settlements -- log any whose ticker isn't in trades.csv
+         (means a trade settled while bot was down)
+      4. Three-way balance check: ledger / in-memory / Kalshi
+    """
+    logger.info("=" * 60)
+    logger.info("STARTUP RECONCILIATION (live assets: %s)", ", ".join(live_assets))
+    logger.info("=" * 60)
+
+    # 1. Open positions
+    try:
+        positions = fetch_positions(client)
+    except Exception as e:
+        logger.warning("[startup-recon] positions fetch failed: %s", e)
+        positions = []
+    if positions:
+        logger.warning("[startup-recon] %d open Kalshi position(s):", len(positions))
+        for pos in positions:
+            logger.warning("  %s", pos)
+    else:
+        logger.info("[startup-recon] No open Kalshi positions")
+
+    # 2. Resting orders -- should always be empty for 15-min markets
+    try:
+        resting = fetch_resting_orders(client)
+    except Exception as e:
+        logger.warning("[startup-recon] resting orders fetch failed: %s", e)
+        resting = []
+    if resting:
+        logger.warning(
+            "[startup-recon] %d resting order(s) found, cancelling them all...",
+            len(resting),
+        )
+        try:
+            cancelled = cancel_all_resting(client)
+            logger.info("[startup-recon] Cancelled %d resting orders", cancelled)
+        except Exception as e:
+            logger.error("[startup-recon] Failed to cancel resting orders: %s", e)
+    else:
+        logger.info("[startup-recon] No resting orders")
+
+    # 3. Recent settlements not in local trades.csv
+    try:
+        settlements = fetch_settlements(client, limit=200)
+    except Exception as e:
+        logger.warning("[startup-recon] settlements fetch failed: %s", e)
+        settlements = []
+
+    known_tickers = _load_known_market_tickers()
+    unknown = [
+        s for s in settlements
+        if (s.get("ticker") or s.get("market_ticker")) not in known_tickers
+    ]
+    if unknown:
+        logger.warning(
+            "[startup-recon] %d settlement(s) not in local trades.csv:",
+            len(unknown),
+        )
+        for s in unknown[:10]:  # cap log spam
+            logger.warning("  %s", s)
+        if len(unknown) > 10:
+            logger.warning("  ...and %d more", len(unknown) - 10)
+    else:
+        logger.info(
+            "[startup-recon] All %d recent Kalshi settlements present in local history",
+            len(settlements),
+        )
+
+    # 4. Three-way balance check
+    try:
+        kalshi_balance = fetch_balance(client)
+    except Exception as e:
+        logger.warning("[startup-recon] balance fetch failed: %s", e)
+        kalshi_balance = None
+
+    local_live_total = 0.0
+    for asset in live_assets:
+        try:
+            acct = account_manager.get_account(series_for_asset(asset))
+            local_live_total += acct.balance_dollars
+        except KeyError:
+            logger.warning("[startup-recon] no sub-account for live asset %s", asset)
+
+    if kalshi_balance is not None:
+        diff = kalshi_balance - local_live_total
+        logger.info(
+            "[startup-recon] Live balance: local=$%.2f Kalshi=$%.2f diff=$%+.2f",
+            local_live_total, kalshi_balance, diff,
+        )
+        if abs(diff) > 1.0:
+            logger.warning(
+                "[startup-recon] BALANCE DRIFT > $1.00 -- "
+                "run `python scripts/reconcile.py --kalshi` for the per-asset breakdown"
+            )
+        elif abs(diff) > 0.10:
+            logger.info(
+                "[startup-recon] minor drift $%+.2f (within $1 tolerance)",
+                diff,
+            )
+
+    logger.info("=" * 60)
+    logger.info("STARTUP RECONCILIATION complete")
+    logger.info("=" * 60)
+
+
+def _load_known_market_tickers() -> set[str]:
+    """Read every market_ticker from output/trades.csv into a set.
+
+    Used by startup reconciliation to detect Kalshi settlements that the
+    bot has no record of (e.g., trades placed during downtime).
+    """
+    import csv
+    trades_path = Path("output/trades.csv")
+    if not trades_path.exists():
+        return set()
+    tickers: set[str] = set()
+    try:
+        with open(trades_path, "r") as f:
+            for row in csv.DictReader(f):
+                tk = (row.get("market_ticker") or "").strip()
+                if tk:
+                    tickers.add(tk)
+    except Exception:
+        pass
+    return tickers
+
+
 async def main():
     args = parse_args()
     configure_logging(args.log_level)
@@ -271,6 +413,11 @@ async def main():
             execution_adapter.set_dry_run(a, asset_cfg["dry_run"])
             if not asset_cfg["dry_run"]:
                 logger.info("LIVE TRADING enabled for %s", a)
+
+    # Startup reconciliation -- only when at least one asset is live
+    live_assets = [a for a in assets if not execution_adapter.is_dry_run(a)]
+    if live_assets:
+        startup_reconcile(client, account_manager, live_assets)
 
     # Create strategy
     strategy = KalshiMultiAssetStrategy(

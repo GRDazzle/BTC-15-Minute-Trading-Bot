@@ -19,7 +19,7 @@ from typing import Any, Optional
 from sdk.kalshi.client import KalshiClient
 from sdk.kalshi.account import AccountManager
 from sdk.kalshi.markets import fetch_current_market, fetch_event_outcome
-from sdk.kalshi.orders import place_limit_order
+from sdk.kalshi.orders import place_limit_order, find_settlement_for_ticker
 from sdk.kalshi.ticker import series_for_asset
 
 logger = logging.getLogger(__name__)
@@ -59,8 +59,15 @@ class TradeRecord:
 
     # Settlement
     settlement_outcome: Optional[str] = None  # "yes" / "no" / None
-    revenue_dollars: float = 0.0
+    revenue_dollars: float = 0.0               # what we credited the sub-account (expected at settlement time)
     settled_at: Optional[datetime] = None
+
+    # Live verification (Phase 2). Always None for dry trades.
+    expected_revenue_dollars: Optional[float] = None   # filled * $1 for winners, 0 for losers
+    verified_revenue_dollars: Optional[float] = None   # actual revenue from Kalshi /portfolio/settlements
+    settlement_verified: bool = False                  # True after Kalshi confirms (or skipped for dry)
+    verified_at: Optional[datetime] = None
+    verification_warned: bool = False                  # set after first STALE warning to avoid spam
 
 
 class KalshiExecutionAdapter:
@@ -268,6 +275,11 @@ class KalshiExecutionAdapter:
         Works for both live and dry-run trades. Dry-run fetches the real
         Kalshi outcome (public data) and simulates the PnL on the sub-account.
 
+        For LIVE trades, this credits the *expected* revenue immediately
+        (filled * $1) and stores it on the trade. A separate
+        verify_settlement() call will later fetch Kalshi's actual revenue
+        and apply any delta. For DRY trades, expected == actual == filled*$1.
+
         Mutates and returns the same TradeRecord.
         """
         if trade.settlement_outcome is not None:
@@ -288,6 +300,7 @@ class KalshiExecutionAdapter:
         if won:
             revenue = trade.filled * 1.00  # $1 per winning contract
             trade.revenue_dollars = revenue
+            trade.expected_revenue_dollars = revenue
             self.account_manager.record_settlement(trade.series, revenue)
             logger.info(
                 "[kalshi-exec] %sWON %s: side=%s outcome=%s -> +$%.2f",
@@ -295,13 +308,108 @@ class KalshiExecutionAdapter:
             )
         else:
             trade.revenue_dollars = 0.0
+            trade.expected_revenue_dollars = 0.0
             logger.info(
                 "[kalshi-exec] %sLOST %s: side=%s outcome=%s -> -$%.2f",
                 prefix, trade.asset, trade.side, outcome,
                 trade.cost_dollars + trade.fees_dollars,
             )
 
+        # Dry-run trades don't need verification -- mark immediately
+        if trade.dry_run:
+            trade.settlement_verified = True
+            trade.verified_revenue_dollars = trade.expected_revenue_dollars
+            trade.verified_at = trade.settled_at
+
         return trade
+
+    def verify_settlement(self, trade: TradeRecord) -> bool:
+        """Fetch actual revenue from Kalshi and apply any delta.
+
+        Returns True if verification completed (or trade is dry-run, no-op).
+        Returns False if Kalshi's settlement record isn't available yet
+        (caller should retry later).
+
+        On non-zero delta, applies the difference to the sub-account so
+        the local balance matches Kalshi exactly. Logs WARN on any drift.
+        """
+        if trade.settlement_verified:
+            return True
+        if trade.dry_run:
+            # Should already have been marked in settle_window, but be safe
+            trade.settlement_verified = True
+            trade.verified_revenue_dollars = trade.expected_revenue_dollars or 0.0
+            trade.verified_at = datetime.now(timezone.utc)
+            return True
+        if trade.settlement_outcome is None:
+            return False  # not even settled yet, nothing to verify
+
+        # Live trade -- query Kalshi
+        try:
+            settlement = find_settlement_for_ticker(
+                self.client, trade.market_ticker, limit=200,
+            )
+        except Exception as e:
+            logger.warning(
+                "[verify] %s lookup failed: %s", trade.market_ticker, e,
+            )
+            return False
+
+        if settlement is None:
+            return False  # not in Kalshi history yet
+
+        actual_revenue = self._extract_settlement_revenue(settlement, trade)
+        expected = trade.expected_revenue_dollars or 0.0
+        delta = actual_revenue - expected
+
+        if abs(delta) > 0.005:
+            # Apply correction to sub-account
+            self.account_manager.record_settlement(trade.series, delta)
+            logger.warning(
+                "[verify] %s %s drift: expected=$%.4f actual=$%.4f delta=$%+.4f -> applied",
+                trade.asset, trade.market_ticker, expected, actual_revenue, delta,
+            )
+        else:
+            logger.info(
+                "[verify] %s %s OK $%.4f",
+                trade.asset, trade.market_ticker, actual_revenue,
+            )
+
+        trade.verified_revenue_dollars = actual_revenue
+        trade.revenue_dollars = actual_revenue   # update to authoritative value
+        trade.settlement_verified = True
+        trade.verified_at = datetime.now(timezone.utc)
+        return True
+
+    def _extract_settlement_revenue(
+        self, settlement: dict[str, Any], trade: TradeRecord,
+    ) -> float:
+        """Extract revenue in dollars from a Kalshi settlement record.
+
+        Tries multiple field names because Kalshi mixes units across
+        endpoints (some use cents, some use dollars). Falls back to the
+        expected revenue (no delta applied) if the record can't be parsed,
+        with a warning -- safer than applying a bogus correction.
+        """
+        # Try in priority order: dollar fields first, then cent fields
+        for field_name, divisor in (
+            ("revenue_dollars", 1.0),
+            ("payout_dollars", 1.0),
+            ("revenue", 100.0),    # cents
+            ("payout", 100.0),     # cents
+        ):
+            if field_name not in settlement:
+                continue
+            try:
+                return float(settlement[field_name]) / divisor
+            except (ValueError, TypeError):
+                continue
+
+        logger.warning(
+            "[verify] could not extract revenue from settlement (using expected): %s",
+            settlement,
+        )
+        return trade.expected_revenue_dollars or 0.0
 
     # -- helpers ---------------------------------------------------------------
 

@@ -180,6 +180,7 @@ class AssetState:
     window_open_price: Optional[float] = None  # Price at minute 0 of current window
     traded_windows: set = field(default_factory=set)
     pending_settlements: list = field(default_factory=list)
+    pending_verifications: list = field(default_factory=list)  # live trades awaiting Kalshi verification
 
     # Live Kalshi prices (updated by WebSocket or REST poller)
     kalshi_market_ticker: Optional[str] = None
@@ -1020,6 +1021,11 @@ class KalshiMultiAssetStrategy:
         # 4. Reconciliation loop
         self._tasks.append(
             asyncio.create_task(self._reconciliation_loop(), name="reconcile-loop"),
+        )
+
+        # 4b. Settlement verification loop (live trades only -- no-op if all dry-run)
+        self._tasks.append(
+            asyncio.create_task(self._verification_loop(), name="verification-loop"),
         )
 
         # 5. Kalshi WebSocket for real-time prices
@@ -2153,6 +2159,9 @@ class KalshiMultiAssetStrategy:
 
                     for trade in settled:
                         state.pending_settlements.remove(trade)
+                        # Live trades go to verification queue (Kalshi confirms revenue)
+                        if not trade.dry_run and not trade.settlement_verified:
+                            state.pending_verifications.append(trade)
 
                 await asyncio.sleep(self.settlement_delay_seconds)
 
@@ -2162,22 +2171,111 @@ class KalshiMultiAssetStrategy:
                 logger.exception("[settlement-loop] Error")
                 await asyncio.sleep(self.settlement_delay_seconds)
 
+    # -- settlement verification (live trades only) ----------------------------
+
+    async def _verification_loop(self):
+        """Confirm live trade payouts against Kalshi /portfolio/settlements.
+
+        Runs every 60s. For each live trade in pending_verifications:
+          - Wait at least 60s after settlement (Kalshi posting delay)
+          - Call execution.verify_settlement(trade) which fetches Kalshi's
+            actual revenue and applies any delta
+          - On success: remove from queue
+          - On failure (settlement not yet in Kalshi history): leave in queue
+            and retry next iteration. After 5 minutes, log STALE warning once
+            but keep retrying.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+                now = datetime.now(timezone.utc)
+                for state in self.states.values():
+                    if not state.pending_verifications:
+                        continue
+                    verified = []
+                    for trade in state.pending_verifications:
+                        if trade.settled_at is None:
+                            continue
+                        elapsed = (now - trade.settled_at).total_seconds()
+                        if elapsed < 60:
+                            continue
+                        try:
+                            ok = self.execution.verify_settlement(trade)
+                        except Exception:
+                            logger.exception(
+                                "[verify] error verifying %s", trade.market_ticker,
+                            )
+                            ok = False
+                        if ok:
+                            verified.append(trade)
+                        elif elapsed > 300 and not trade.verification_warned:
+                            logger.warning(
+                                "[verify] STALE %s -- not in Kalshi history after %.0fs, will keep retrying",
+                                trade.market_ticker, elapsed,
+                            )
+                            trade.verification_warned = True
+                    for trade in verified:
+                        state.pending_verifications.remove(trade)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[verification-loop] Error")
+                await asyncio.sleep(60)
+
     # -- reconciliation --------------------------------------------------------
 
+    def _live_assets(self) -> list[str]:
+        """List of assets currently running in live mode (dry_run=False)."""
+        return [a for a in self.assets if not self.execution.is_dry_run(a)]
+
     async def _reconciliation_loop(self):
-        """Periodically compare sub-accounts against real Kalshi balance."""
+        """Periodically compare LIVE sub-accounts against real Kalshi balance.
+
+        Only sums sub-accounts for assets where dry_run=False, since the
+        Kalshi balance only reflects actual on-exchange holdings. Dry-run
+        sub-accounts have no Kalshi counterpart and would skew the diff.
+
+        If no assets are live, the loop logs once and skips the API call.
+        """
+        first_pass_no_live_logged = False
         while self._running:
             try:
                 await asyncio.sleep(1800)  # Every 30 minutes
 
+                live_assets = self._live_assets()
+                if not live_assets:
+                    if not first_pass_no_live_logged:
+                        logger.info(
+                            "[reconcile] No live assets -- skipping Kalshi balance check"
+                        )
+                        first_pass_no_live_logged = True
+                    continue
+                first_pass_no_live_logged = False  # reset if assets become live later
+
                 balance = fetch_balance(self.client)
-                if balance is not None:
-                    result = self.account_manager.reconcile(balance)
-                    logger.info(
-                        "[reconcile] local=$%.2f actual=$%.2f diff=$%.2f",
-                        result["local_total"],
-                        result["actual_balance"],
-                        result["discrepancy"],
+                if balance is None:
+                    continue
+
+                # Sum only LIVE sub-accounts
+                local_live_total = 0.0
+                for asset in live_assets:
+                    try:
+                        acct = self.account_manager.get_account(
+                            self.states[asset].series
+                        )
+                        local_live_total += acct.balance_dollars
+                    except (KeyError, AttributeError):
+                        continue
+
+                discrepancy = balance - local_live_total
+                logger.info(
+                    "[reconcile] live local=$%.2f kalshi=$%.2f diff=$%+.2f (assets: %s)",
+                    local_live_total, balance, discrepancy, ",".join(live_assets),
+                )
+                if abs(discrepancy) > 1.0:
+                    logger.warning(
+                        "[reconcile] LIVE BALANCE DRIFT > $1.00 -- run scripts/reconcile.py --kalshi for details"
                     )
 
             except asyncio.CancelledError:

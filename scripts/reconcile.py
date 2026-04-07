@@ -56,6 +56,19 @@ def load_initial_balances(config_path: Path) -> dict[str, float]:
     return out
 
 
+def load_live_assets(config_path: Path) -> set[str]:
+    """Read which assets have dry_run=false in config/trading.json."""
+    if not config_path.exists():
+        return set()
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    live: set[str] = set()
+    for asset, asset_cfg in cfg.get("assets", {}).items():
+        if asset_cfg.get("dry_run") is False:
+            live.add(asset.upper())
+    return live
+
+
 def sum_pnl_per_asset(trades_path: Path) -> tuple[dict[str, float], dict[str, int]]:
     """Walk trades.csv and sum PnL per asset.
 
@@ -152,29 +165,35 @@ def reconcile(
     pnl, counts = sum_pnl_per_asset(trades_path)
     deposits = sum_deposits_per_asset(deposits_log)
     in_memory = load_in_memory_balances(state_path)
+    live_assets = load_live_assets(config_path)
 
     # Universe of assets = anything that appears in any source
     all_assets = sorted(
         set(initial.keys()) | set(pnl.keys()) | set(deposits.keys()) | set(in_memory.keys())
     )
 
-    print("=" * 78)
+    print("=" * 82)
     print("LEDGER RECONCILIATION")
-    print("=" * 78)
+    print("=" * 82)
     print(f"  state file  : {state_path}")
     print(f"  trades csv  : {trades_path}")
     print(f"  deposits log: {deposits_log}{' (missing)' if not deposits_log.exists() else ''}")
     print(f"  config      : {config_path}")
+    if live_assets:
+        print(f"  live assets : {', '.join(sorted(live_assets))}")
+    else:
+        print(f"  live assets : (none -- all dry-run)")
     print()
     print(
-        f"{'Asset':<7} {'Initial':>10} {'+ PnL':>10} {'+ Deposits':>12} "
-        f"{'= Ledger':>10} {'In-Memory':>11} {'Diff':>10} {'Trades':>8}"
+        f"{'Asset':<8} {'Initial':>10} {'+ PnL':>10} {'+ Deposits':>12} "
+        f"{'= Ledger':>10} {'In-Memory':>11} {'Diff':>10} {'Trades':>7}"
     )
-    print("-" * 78)
+    print("-" * 82)
 
     total_ledger = 0.0
     total_in_memory = 0.0
-    biggest_drift = 0.0
+    live_ledger = 0.0
+    live_in_memory = 0.0
     drifted: list[str] = []
 
     for asset in all_assets:
@@ -185,55 +204,75 @@ def reconcile(
         memory = in_memory.get(asset, 0.0)
         diff = memory - ledger
         n = counts.get(asset, 0)
+        is_live = asset in live_assets
 
         total_ledger += ledger
         total_in_memory += memory
-        if abs(diff) > abs(biggest_drift):
-            biggest_drift = diff
+        if is_live:
+            live_ledger += ledger
+            live_in_memory += memory
         if abs(diff) > 0.50:
             drifted.append(asset)
 
+        marker = "L" if is_live else " "
         flag = "" if abs(diff) < 0.50 else " *"
         print(
-            f"{asset:<7} ${init:>9.2f} ${p:>+9.2f} ${d:>+11.2f} "
-            f"${ledger:>9.2f} ${memory:>10.2f} ${diff:>+9.2f}{flag} {n:>7}"
+            f"{marker} {asset:<6} ${init:>9.2f} ${p:>+9.2f} ${d:>+11.2f} "
+            f"${ledger:>9.2f} ${memory:>10.2f} ${diff:>+9.2f}{flag} {n:>6}"
         )
 
-    print("-" * 78)
+    print("-" * 82)
     total_diff = total_in_memory - total_ledger
     print(
-        f"{'TOTAL':<7} {'':>10} {'':>10} {'':>12} "
+        f"  {'TOTAL':<6} {'':>10} {'':>10} {'':>12} "
         f"${total_ledger:>9.2f} ${total_in_memory:>10.2f} ${total_diff:>+9.2f}"
     )
+    if live_assets:
+        live_diff = live_in_memory - live_ledger
+        print(
+            f"  {'LIVE':<6} {'':>10} {'':>10} {'':>12} "
+            f"${live_ledger:>9.2f} ${live_in_memory:>10.2f} ${live_diff:>+9.2f}"
+        )
     print()
 
-    # Optional Kalshi 3-way check
+    # Optional Kalshi 3-way check (LIVE assets only)
     if fetch_kalshi:
-        print("Fetching live Kalshi balance...")
-        kalshi_bal = fetch_kalshi_balance()
-        if kalshi_bal is not None:
-            kalshi_diff = kalshi_bal - total_in_memory
-            print(
-                f"  Kalshi total : ${kalshi_bal:.2f}  "
-                f"(in-memory: ${total_in_memory:.2f}, diff: ${kalshi_diff:+.2f})"
-            )
-            if abs(kalshi_diff) > 0.50:
-                print("  WARNING: Kalshi balance differs from in-memory total")
+        if not live_assets:
+            print("Skipping Kalshi check -- no live assets configured")
+        else:
+            print("Fetching live Kalshi balance...")
+            kalshi_bal = fetch_kalshi_balance()
+            if kalshi_bal is not None:
+                kalshi_diff = kalshi_bal - live_in_memory
                 print(
-                    "  Note: Kalshi balance reflects ALL of your account, including "
-                    "manual trades and any other bots. Local sub-accounts only track "
-                    "what this bot has done."
+                    f"  Kalshi balance : ${kalshi_bal:.2f}"
                 )
+                print(
+                    f"  Live in-memory : ${live_in_memory:.2f}  "
+                    f"(diff: ${kalshi_diff:+.2f})"
+                )
+                if abs(kalshi_diff) > 0.50:
+                    print("  WARNING: Kalshi balance differs from live in-memory total")
+                    print(
+                        "  Note: Kalshi balance reflects your entire account. "
+                        "If you have positions outside this bot, that explains the diff."
+                    )
+                else:
+                    print("  OK: live in-memory matches Kalshi within tolerance")
         print()
 
     if drifted:
-        print(f"DRIFT DETECTED for {len(drifted)} asset(s): {', '.join(drifted)}")
-        print("Possible causes:")
-        print("  - Deposits made before deposits_log.csv tracking was added")
-        print("  - Manual edits to account_state.json")
-        print("  - Trades in flight (pending settlement, not in trades.csv yet)")
-        print("  - Bot state divergence (bug)")
-        return 1
+        # Distinguish drift in live vs dry assets
+        live_drifted = [a for a in drifted if a in live_assets]
+        dry_drifted = [a for a in drifted if a not in live_assets]
+        if live_drifted:
+            print(f"LIVE DRIFT for {len(live_drifted)} asset(s): {', '.join(live_drifted)}")
+            print("  This is real money discrepancy -- investigate immediately")
+        if dry_drifted:
+            print(f"Dry-run drift for {len(dry_drifted)} asset(s): {', '.join(dry_drifted)}")
+            print("  Likely historical untracked deposits or manual edits (not real-money)")
+        # Only fail the exit code on LIVE drift -- dry drift is informational
+        return 1 if live_drifted else 0
 
     print("OK: all sub-accounts match within tolerance")
     return 0
