@@ -144,12 +144,14 @@ def build_dashboard(
     bal_table.add_column("Balance", justify="right", width=12)
     bal_table.add_column("PnL", justify="right", width=12)
     bal_table.add_column("Trades", justify="right", width=8)
-    bal_table.add_column("Win Rate", justify="right", width=10)
+    bal_table.add_column("WR All", justify="right", width=8)
+    bal_table.add_column("WR L15", justify="right", width=8)
 
     total_bal = 0.0
     total_pnl = 0.0
     total_trades_count = 0
     total_wins = 0
+    total_l15_trades: list = []
 
     for series_key, acct in account_state.items():
         asset = series_key.replace("KX", "").replace("15M", "")
@@ -166,6 +168,17 @@ def build_dashboard(
         total_trades_count += count
         total_wins += wins
 
+        # Rolling WR over last 15 settled trades for this asset
+        l15 = asset_trades[-15:]
+        l15_wins = sum(1 for t in l15 if float(t.get("pnl", "0").replace("+", "")) > 0)
+        if l15:
+            wr_l15_pct = l15_wins / len(l15) * 100
+            l15_color = "green" if wr_l15_pct >= 70 else ("yellow" if wr_l15_pct >= 55 else "red")
+            wr_l15 = f"[{l15_color}]{wr_l15_pct:.0f}%[/]"
+        else:
+            wr_l15 = "--"
+        total_l15_trades.extend(l15)
+
         pnl_style = "green" if pnl >= 0 else "red"
         bal_table.add_row(
             asset,
@@ -173,9 +186,15 @@ def build_dashboard(
             f"[{pnl_style}]${pnl:+.2f}[/]",
             str(count),
             wr,
+            wr_l15,
         )
 
     total_wr = f"{total_wins/total_trades_count*100:.0f}%" if total_trades_count > 0 else "--"
+    if total_l15_trades:
+        tl15_wins = sum(1 for t in total_l15_trades if float(t.get("pnl", "0").replace("+", "")) > 0)
+        total_l15_wr = f"{tl15_wins/len(total_l15_trades)*100:.0f}%"
+    else:
+        total_l15_wr = "--"
     total_pnl_style = "green" if total_pnl >= 0 else "red"
     bal_table.add_row(
         "[bold]TOTAL[/]",
@@ -183,6 +202,7 @@ def build_dashboard(
         f"[bold {total_pnl_style}]${total_pnl:+.2f}[/]",
         f"[bold]{total_trades_count}[/]",
         f"[bold]{total_wr}[/]",
+        f"[bold]{total_l15_wr}[/]",
         style="bold",
     )
 
