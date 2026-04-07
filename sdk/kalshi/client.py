@@ -293,3 +293,61 @@ class KalshiClient:
             "GET", "/portfolio/settlements",
             params={"limit": limit}, auth=True,
         )
+
+    def get_positions(
+        self,
+        *,
+        ticker: str | None = None,
+        event_ticker: str | None = None,
+        limit: int = 100,
+    ) -> tuple[int, Any]:
+        """GET /portfolio/positions (authenticated).
+
+        Returns currently-held positions. Optionally filter by market or event.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        return self.request("GET", "/portfolio/positions", params=params, auth=True)
+
+    def get_orders(
+        self,
+        *,
+        status: str | None = None,
+        ticker: str | None = None,
+        event_ticker: str | None = None,
+        limit: int = 100,
+    ) -> tuple[int, Any]:
+        """GET /portfolio/orders (authenticated).
+
+        List orders, optionally filtered by status (e.g. ``"resting"``).
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        if ticker:
+            params["ticker"] = ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        return self.request("GET", "/portfolio/orders", params=params, auth=True)
+
+    def get_fills(
+        self,
+        *,
+        ticker: str | None = None,
+        order_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[int, Any]:
+        """GET /portfolio/fills (authenticated).
+
+        Returns the user's fill history. Useful for reconciling actual fill
+        prices when the order response is incomplete.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if order_id:
+            params["order_id"] = order_id
+        return self.request("GET", "/portfolio/fills", params=params, auth=True)

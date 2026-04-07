@@ -180,3 +180,110 @@ def fetch_settlements(client: KalshiClient, limit: int = 100) -> list[dict[str, 
     except Exception as e:
         logger.warning("settlements fetch error: %s", e)
         return []
+
+
+def find_settlement_for_ticker(
+    client: KalshiClient,
+    market_ticker: str,
+    limit: int = 200,
+) -> Optional[dict[str, Any]]:
+    """Look up a settlement record for a specific market ticker.
+
+    Returns the matching settlement dict if present in the most recent
+    ``limit`` settlements, otherwise None. Used by the post-settlement
+    verification step to fetch Kalshi's actual revenue for a trade.
+    """
+    settlements = fetch_settlements(client, limit=limit)
+    for s in settlements:
+        if s.get("ticker") == market_ticker or s.get("market_ticker") == market_ticker:
+            return s
+    return None
+
+
+def fetch_positions(
+    client: KalshiClient,
+    *,
+    ticker: str | None = None,
+    event_ticker: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Fetch currently-held positions. Returns list of position dicts."""
+    try:
+        st, data = client.get_positions(
+            ticker=ticker, event_ticker=event_ticker, limit=limit,
+        )
+        if st != 200:
+            logger.warning("positions fetch failed status=%s", st)
+            return []
+        # Kalshi returns positions under either "positions" or "market_positions"
+        return (
+            data.get("market_positions")
+            or data.get("positions")
+            or []
+        )
+    except Exception as e:
+        logger.warning("positions fetch error: %s", e)
+        return []
+
+
+def fetch_resting_orders(
+    client: KalshiClient,
+    *,
+    ticker: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Fetch unfilled (resting) orders.
+
+    For 15-min markets these should typically be empty -- our orders are
+    fill-or-kill within the same window. Any resting orders at startup
+    likely indicate the bot was killed mid-window.
+    """
+    try:
+        st, data = client.get_orders(status="resting", ticker=ticker, limit=limit)
+        if st != 200:
+            logger.warning("resting orders fetch failed status=%s", st)
+            return []
+        return data.get("orders", []) or []
+    except Exception as e:
+        logger.warning("resting orders fetch error: %s", e)
+        return []
+
+
+def cancel_all_resting(
+    client: KalshiClient,
+    *,
+    ticker: str | None = None,
+) -> int:
+    """Cancel every resting order. Returns the number cancelled."""
+    orders = fetch_resting_orders(client, ticker=ticker)
+    cancelled = 0
+    for order in orders:
+        order_id = order.get("order_id")
+        if not order_id:
+            continue
+        try:
+            result = cancel_order(client, order_id)
+            if result.status not in ("error", "unknown"):
+                cancelled += 1
+        except Exception as e:
+            logger.warning("cancel_all_resting: failed to cancel %s: %s", order_id, e)
+    return cancelled
+
+
+def fetch_fills(
+    client: KalshiClient,
+    *,
+    order_id: str | None = None,
+    ticker: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Fetch fill history. Useful for reconciling actual fill prices."""
+    try:
+        st, data = client.get_fills(order_id=order_id, ticker=ticker, limit=limit)
+        if st != 200:
+            logger.warning("fills fetch failed status=%s", st)
+            return []
+        return data.get("fills", []) or []
+    except Exception as e:
+        logger.warning("fills fetch error: %s", e)
+        return []

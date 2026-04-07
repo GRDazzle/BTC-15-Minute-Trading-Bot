@@ -927,6 +927,7 @@ class KalshiMultiAssetStrategy:
                     logger.info(
                         "[deposit] Credited %s (%s) +$%.2f", asset, series, amount,
                     )
+                    self._log_deposit_applied(asset, series, amount)
                     applied.append(dep)
                 except Exception as e:
                     logger.error("[deposit] Failed for %s: %s", asset, e)
@@ -936,6 +937,25 @@ class KalshiMultiAssetStrategy:
                 json.dump(queue, f, indent=2)
         except Exception as e:
             logger.warning("[deposit] Failed to process deposits queue: %s", e)
+
+    def _log_deposit_applied(self, asset: str, series: str, amount: float) -> None:
+        """Append an applied deposit to data/deposits_log.csv for ledger reconcile."""
+        log_path = Path("data/deposits_log.csv")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not log_path.exists()
+        try:
+            with open(log_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if new_file:
+                    writer.writerow(["timestamp", "asset", "series", "amount_dollars"])
+                writer.writerow([
+                    datetime.now(timezone.utc).isoformat(),
+                    asset,
+                    series,
+                    f"{amount:.4f}",
+                ])
+        except Exception as e:
+            logger.warning("[deposit] Failed to log deposit: %s", e)
 
     def _update_smas(self) -> None:
         """Recompute SMA 5/15/30 for all assets (once per day)."""

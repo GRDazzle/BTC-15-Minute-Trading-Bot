@@ -67,6 +67,7 @@ def main():
 
     print(f"Queued deposit: {asset} +${args.amount:.2f}")
     print(f"Bot will apply at next window boundary (within 15 min)")
+    print(f"Once applied, the deposit will appear in data/deposits_log.csv")
 
 
 if __name__ == "__main__":
