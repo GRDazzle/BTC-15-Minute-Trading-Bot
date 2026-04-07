@@ -312,6 +312,25 @@ class KalshiMultiAssetStrategy:
         # Live aggTrade writer (persists WS data for backtesting/tuning)
         self._trade_writer = BinanceTradeWriter()
 
+        # Runtime stats published to data/runtime_state.json for the manager UI.
+        # Updated by the verification and reconciliation loops.
+        self._runtime_state: dict = {
+            "last_updated": None,
+            "reconciliation": {
+                "last_run_at": None,
+                "kalshi_balance": None,       # last fetched
+                "live_local_total": None,
+                "drift": None,
+                "live_assets": [],
+            },
+            "verification": {
+                "pending_count": 0,
+                "stale_count": 0,
+                "total_corrections": 0,       # cumulative since bot start
+                "total_drift_dollars": 0.0,   # cumulative since bot start
+            },
+        }
+
         # SMA cache per asset (recomputed daily)
         self._asset_smas: dict[str, dict] = {}
         self._sma_date: str = ""
@@ -2184,11 +2203,16 @@ class KalshiMultiAssetStrategy:
           - On failure (settlement not yet in Kalshi history): leave in queue
             and retry next iteration. After 5 minutes, log STALE warning once
             but keep retrying.
+
+        Also publishes pending/stale counts to data/runtime_state.json so
+        the manager UI can render the reconciliation panel.
         """
         while self._running:
             try:
                 await asyncio.sleep(60)
                 now = datetime.now(timezone.utc)
+                pending_total = 0
+                stale_total = 0
                 for state in self.states.values():
                     if not state.pending_verifications:
                         continue
@@ -2199,6 +2223,7 @@ class KalshiMultiAssetStrategy:
                         elapsed = (now - trade.settled_at).total_seconds()
                         if elapsed < 60:
                             continue
+                        expected_before = trade.expected_revenue_dollars or 0.0
                         try:
                             ok = self.execution.verify_settlement(trade)
                         except Exception:
@@ -2208,20 +2233,49 @@ class KalshiMultiAssetStrategy:
                             ok = False
                         if ok:
                             verified.append(trade)
-                        elif elapsed > 300 and not trade.verification_warned:
-                            logger.warning(
-                                "[verify] STALE %s -- not in Kalshi history after %.0fs, will keep retrying",
-                                trade.market_ticker, elapsed,
-                            )
-                            trade.verification_warned = True
+                            actual = trade.verified_revenue_dollars or 0.0
+                            delta = actual - expected_before
+                            if abs(delta) > 0.005:
+                                self._runtime_state["verification"]["total_corrections"] += 1
+                                self._runtime_state["verification"]["total_drift_dollars"] += delta
+                        elif elapsed > 300:
+                            stale_total += 1
+                            if not trade.verification_warned:
+                                logger.warning(
+                                    "[verify] STALE %s -- not in Kalshi history after %.0fs, will keep retrying",
+                                    trade.market_ticker, elapsed,
+                                )
+                                trade.verification_warned = True
                     for trade in verified:
                         state.pending_verifications.remove(trade)
+                    pending_total += len(state.pending_verifications)
+
+                # Publish current verification stats to runtime state
+                self._runtime_state["verification"]["pending_count"] = pending_total
+                self._runtime_state["verification"]["stale_count"] = stale_total
+                self._write_runtime_state()
 
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("[verification-loop] Error")
                 await asyncio.sleep(60)
+
+    def _write_runtime_state(self) -> None:
+        """Persist runtime state for the manager UI to read.
+
+        Best-effort, never raises. Manager polls this file once per second
+        so the file should be small and the write should be quick.
+        """
+        try:
+            self._runtime_state["last_updated"] = datetime.now(timezone.utc).isoformat()
+            path = Path("data/runtime_state.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._runtime_state, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.debug("[runtime-state] write failed: %s", e)
 
     # -- reconciliation --------------------------------------------------------
 
@@ -2236,9 +2290,15 @@ class KalshiMultiAssetStrategy:
         Kalshi balance only reflects actual on-exchange holdings. Dry-run
         sub-accounts have no Kalshi counterpart and would skew the diff.
 
-        If no assets are live, the loop logs once and skips the API call.
+        If no assets are live, the loop logs once and skips the API call
+        but still publishes a fresh runtime_state snapshot so the manager
+        UI can render an empty live row instead of stale data.
         """
         first_pass_no_live_logged = False
+        # Publish initial state immediately so manager has something to read
+        self._update_reconciliation_state(live_assets=[], kalshi_balance=None,
+                                          local_live_total=None, drift=None)
+        self._write_runtime_state()
         while self._running:
             try:
                 await asyncio.sleep(1800)  # Every 30 minutes
@@ -2250,6 +2310,11 @@ class KalshiMultiAssetStrategy:
                             "[reconcile] No live assets -- skipping Kalshi balance check"
                         )
                         first_pass_no_live_logged = True
+                    self._update_reconciliation_state(
+                        live_assets=[], kalshi_balance=None,
+                        local_live_total=None, drift=None,
+                    )
+                    self._write_runtime_state()
                     continue
                 first_pass_no_live_logged = False  # reset if assets become live later
 
@@ -2278,8 +2343,33 @@ class KalshiMultiAssetStrategy:
                         "[reconcile] LIVE BALANCE DRIFT > $1.00 -- run scripts/reconcile.py --kalshi for details"
                     )
 
+                self._update_reconciliation_state(
+                    live_assets=live_assets,
+                    kalshi_balance=balance,
+                    local_live_total=local_live_total,
+                    drift=discrepancy,
+                )
+                self._write_runtime_state()
+
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("[reconcile-loop] Error")
                 await asyncio.sleep(1800)
+
+    def _update_reconciliation_state(
+        self,
+        *,
+        live_assets: list[str],
+        kalshi_balance: Optional[float],
+        local_live_total: Optional[float],
+        drift: Optional[float],
+    ) -> None:
+        """Update the in-memory reconciliation snapshot for runtime_state.json."""
+        self._runtime_state["reconciliation"] = {
+            "last_run_at": datetime.now(timezone.utc).isoformat(),
+            "kalshi_balance": kalshi_balance,
+            "live_local_total": local_live_total,
+            "drift": drift,
+            "live_assets": live_assets,
+        }
