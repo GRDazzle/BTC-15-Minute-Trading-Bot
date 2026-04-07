@@ -260,7 +260,24 @@ class KalshiMultiAssetStrategy:
         "outcome", "pnl", "balance_after",
     ]
 
+    # Live trade log -- richer schema with execution audit trail
+    TRADE_LOG_LIVE_PATH = Path("output/trades_live.csv")
+    TRADE_LOG_LIVE_FIELDS = [
+        "timestamp", "asset", "window_id", "market_ticker", "event_ticker",
+        "direction", "side",
+        "intended_price_cents", "fill_price_cents",
+        "intended_count", "filled_count",
+        "cost", "fees",
+        "kalshi_order_id",
+        "dm", "mtc", "confidence", "score",
+        "outcome",
+        "expected_revenue", "verified_revenue",
+        "settlement_verified", "verified_at",
+        "pnl", "balance_after",
+    ]
+
     BALANCE_LOG_PATH = Path("output/balance.csv")
+    BALANCE_LOG_LIVE_PATH = Path("output/balance_live.csv")
     BALANCE_LOG_FIELDS = ["timestamp", "event", "asset", "balance", "pnl", "kalshi_balance"]
 
     SIGNAL_LOG_PATH = Path("output/signal_log.csv")
@@ -1974,15 +1991,30 @@ class KalshiMultiAssetStrategy:
     # -- trade CSV logging -----------------------------------------------------
 
     def _ensure_trade_log(self):
-        """Create the CSV file with headers if it doesn't exist."""
+        """Create the dry CSV file with headers if it doesn't exist."""
         if self.TRADE_LOG_PATH.exists():
             return
         self.TRADE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(self.TRADE_LOG_PATH, "w", newline="") as f:
             csv.writer(f).writerow(self.TRADE_LOG_FIELDS)
 
+    def _ensure_trade_log_live(self):
+        """Create the live CSV file with headers if it doesn't exist."""
+        if self.TRADE_LOG_LIVE_PATH.exists():
+            return
+        self.TRADE_LOG_LIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.TRADE_LOG_LIVE_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=self.TRADE_LOG_LIVE_FIELDS).writeheader()
+
     def _log_trade_entry(self, trade: TradeRecord, dm: int, mtc: int):
-        """Append a row when a trade is placed."""
+        """Append a row when a trade is placed. Routes to live or dry CSV."""
+        if trade.dry_run:
+            self._log_trade_entry_dry(trade, dm, mtc)
+        else:
+            self._log_trade_entry_live(trade, dm, mtc)
+
+    def _log_trade_entry_dry(self, trade: TradeRecord, dm: int, mtc: int):
+        """Append a row to trades.csv (dry schema)."""
         with self._csv_lock:
             self._ensure_trade_log()
             with open(self.TRADE_LOG_PATH, "a", newline="") as f:
@@ -2006,8 +2038,52 @@ class KalshiMultiAssetStrategy:
                     "",  # balance_after
                 ])
 
+    def _log_trade_entry_live(self, trade: TradeRecord, dm: int, mtc: int):
+        """Append a row to trades_live.csv (live schema with execution audit)."""
+        with self._csv_lock:
+            self._ensure_trade_log_live()
+            row = {
+                "timestamp": trade.placed_at.isoformat() if trade.placed_at else "",
+                "asset": trade.asset,
+                "window_id": trade.window_id,
+                "market_ticker": trade.market_ticker,
+                "event_ticker": trade.event_ticker,
+                "direction": trade.direction,
+                "side": trade.side,
+                "intended_price_cents": trade.price_cents,
+                "fill_price_cents": "",   # populated at settlement (avg fill from cost/filled)
+                "intended_count": trade.count,
+                "filled_count": trade.filled,
+                "cost": f"{trade.cost_dollars:.4f}",
+                "fees": f"{trade.fees_dollars:.4f}",
+                "kalshi_order_id": trade.order_id or "",
+                "dm": dm,
+                "mtc": mtc,
+                "confidence": f"{trade.confidence:.4f}",
+                "score": f"{trade.score:.2f}",
+                "outcome": "",
+                "expected_revenue": "",
+                "verified_revenue": "",
+                "settlement_verified": "False",
+                "verified_at": "",
+                "pnl": "",
+                "balance_after": "",
+            }
+            with open(self.TRADE_LOG_LIVE_PATH, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=self.TRADE_LOG_LIVE_FIELDS).writerow(row)
+
     def _log_settlement(self, trade: TradeRecord):
-        """Update the trade's row with outcome and PnL after settlement."""
+        """Update the trade's row with outcome and PnL after settlement.
+
+        Routes to dry or live CSV based on trade.dry_run.
+        """
+        if trade.dry_run:
+            self._log_settlement_dry(trade)
+        else:
+            self._log_settlement_live(trade)
+
+    def _log_settlement_dry(self, trade: TradeRecord):
+        """Update the dry trade's row with outcome and PnL."""
         with self._csv_lock:
             if not self.TRADE_LOG_PATH.exists():
                 return
@@ -2021,7 +2097,6 @@ class KalshiMultiAssetStrategy:
                 for row in reader:
                     # Match by market_ticker + event_ticker (columns 3,4)
                     if len(row) > 4 and row[3] == trade.market_ticker and row[4] == trade.event_ticker:
-                        won = trade.side == trade.settlement_outcome
                         pnl = trade.revenue_dollars - (trade.cost_dollars + trade.fees_dollars)
                         try:
                             acct = self.account_manager.get_account(trade.series)
@@ -2036,19 +2111,102 @@ class KalshiMultiAssetStrategy:
             with open(self.TRADE_LOG_PATH, "w", newline="") as f:
                 csv.writer(f).writerows(rows)
 
+    def _log_settlement_live(self, trade: TradeRecord):
+        """Update the live trade's row with outcome + expected_revenue.
+
+        Verified fields (verified_revenue, settlement_verified, verified_at,
+        balance_after, final pnl) are filled in later by _log_verification.
+        """
+        with self._csv_lock:
+            if not self.TRADE_LOG_LIVE_PATH.exists():
+                return
+            self._update_live_row(
+                trade,
+                outcome=trade.settlement_outcome or "",
+                expected_revenue=f"{(trade.expected_revenue_dollars or 0.0):.4f}",
+            )
+
+    def _log_verification(self, trade: TradeRecord):
+        """Final update to a live trade row after Kalshi verification.
+
+        Sets verified_revenue, settlement_verified, verified_at, fill_price,
+        final pnl, balance_after.
+        """
+        if trade.dry_run:
+            return
+        with self._csv_lock:
+            if not self.TRADE_LOG_LIVE_PATH.exists():
+                return
+            try:
+                acct = self.account_manager.get_account(trade.series)
+                balance = f"{acct.balance_dollars:.2f}"
+            except KeyError:
+                balance = ""
+            verified_rev = trade.verified_revenue_dollars
+            if verified_rev is None:
+                verified_rev = trade.expected_revenue_dollars or 0.0
+            pnl = verified_rev - (trade.cost_dollars + trade.fees_dollars)
+            # Compute average fill price from cost / filled
+            fill_px = ""
+            if trade.filled and trade.filled > 0:
+                fill_px = f"{int(round(trade.cost_dollars / trade.filled * 100))}"
+            self._update_live_row(
+                trade,
+                fill_price_cents=fill_px,
+                verified_revenue=f"{verified_rev:.4f}",
+                settlement_verified="True",
+                verified_at=trade.verified_at.isoformat() if trade.verified_at else "",
+                pnl=f"{pnl:+.4f}",
+                balance_after=balance,
+            )
+
+    def _update_live_row(self, trade: TradeRecord, **fields_to_update):
+        """In-place update of a live trade row matched by market_ticker + event_ticker.
+
+        Reads, updates, rewrites the entire CSV. Same approach as the dry
+        settlement updater.
+        """
+        rows: list[dict] = []
+        try:
+            with open(self.TRADE_LOG_LIVE_PATH, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if (row.get("market_ticker") == trade.market_ticker
+                            and row.get("event_ticker") == trade.event_ticker):
+                        for k, v in fields_to_update.items():
+                            row[k] = v
+                    rows.append(row)
+        except Exception as e:
+            logger.warning("[trade-log] failed to read live CSV: %s", e)
+            return
+
+        try:
+            with open(self.TRADE_LOG_LIVE_PATH, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.TRADE_LOG_LIVE_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as e:
+            logger.warning("[trade-log] failed to write live CSV: %s", e)
+
     # -- balance CSV logging ---------------------------------------------------
 
-    def _ensure_balance_log(self):
+    def _ensure_balance_log(self, live: bool = False):
         """Create the balance CSV with headers if it doesn't exist."""
-        if self.BALANCE_LOG_PATH.exists():
+        path = self.BALANCE_LOG_LIVE_PATH if live else self.BALANCE_LOG_PATH
+        if path.exists():
             return
-        self.BALANCE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.BALANCE_LOG_PATH, "w", newline="") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="") as f:
             csv.writer(f).writerow(self.BALANCE_LOG_FIELDS)
 
+    def _balance_log_path_for(self, asset: str) -> Path:
+        """Return live balance CSV for live assets, dry one otherwise."""
+        if self.execution.is_dry_run(asset):
+            return self.BALANCE_LOG_PATH
+        return self.BALANCE_LOG_LIVE_PATH
+
     def _log_balance(self, event: str, asset: str = ""):
-        """Append a balance snapshot row."""
-        self._ensure_balance_log()
+        """Append a balance snapshot row. Routes per-asset to live or dry CSV."""
         now = datetime.now(timezone.utc).isoformat()
 
         # Fetch real Kalshi balance (best-effort)
@@ -2066,7 +2224,9 @@ class KalshiMultiAssetStrategy:
             series = series_for_asset(asset)
             try:
                 acct = self.account_manager.get_account(series)
-                with open(self.BALANCE_LOG_PATH, "a", newline="") as f:
+                path = self._balance_log_path_for(asset)
+                self._ensure_balance_log(live=(path == self.BALANCE_LOG_LIVE_PATH))
+                with open(path, "a", newline="") as f:
                     csv.writer(f).writerow([
                         now, event, asset,
                         f"{acct.balance_dollars:.2f}",
@@ -2076,12 +2236,14 @@ class KalshiMultiAssetStrategy:
             except KeyError:
                 pass
         else:
-            # Log all assets
+            # Log all assets -- each routed independently
             for a in self.assets:
                 series = series_for_asset(a)
                 try:
                     acct = self.account_manager.get_account(series)
-                    with open(self.BALANCE_LOG_PATH, "a", newline="") as f:
+                    path = self._balance_log_path_for(a)
+                    self._ensure_balance_log(live=(path == self.BALANCE_LOG_LIVE_PATH))
+                    with open(path, "a", newline="") as f:
                         csv.writer(f).writerow([
                             now, event, a,
                             f"{acct.balance_dollars:.2f}",
@@ -2238,6 +2400,8 @@ class KalshiMultiAssetStrategy:
                             if abs(delta) > 0.005:
                                 self._runtime_state["verification"]["total_corrections"] += 1
                                 self._runtime_state["verification"]["total_drift_dollars"] += delta
+                            # Persist the final verified row to trades_live.csv
+                            self._log_verification(trade)
                         elif elapsed > 300:
                             stale_total += 1
                             if not trade.verification_warned:
