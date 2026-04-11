@@ -19,10 +19,14 @@
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 1992.4,
+        "pnl_sweep_total_pnl": 2047.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 81.9,
-        "traded_count": 1096
+        "win_rate": 82.0,
+        "traded_count": 1114,
+        "xgb_min_w": 0.1,
+        "xgb_max_w": 0.8,
+        "lstm_min_w": 0.2,
+        "lstm_max_w": 0.4
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
@@ -54,10 +58,14 @@
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 1119.8,
+        "pnl_sweep_total_pnl": 1138.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
         "win_rate": 83.1,
-        "traded_count": 1135
+        "traded_count": 1151,
+        "xgb_min_w": 0.1,
+        "xgb_max_w": 0.8,
+        "lstm_min_w": 0.2,
+        "lstm_max_w": 0.4
       },
       "ensemble_weekend": {
         "ml_weight": 0.2,
@@ -84,15 +92,19 @@
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
-        "ml_weight": 0.3,
-        "threshold": 0.62,
+        "ml_weight": 0.2,
+        "threshold": 0.65,
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 1025.6,
+        "pnl_sweep_total_pnl": 1028.6,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 77.8,
-        "traded_count": 1168
+        "win_rate": 83.2,
+        "traded_count": 788,
+        "xgb_min_w": 0.2,
+        "xgb_max_w": 0.8,
+        "lstm_min_w": 0.1,
+        "lstm_max_w": 0.4
       },
       "ensemble_weekend": {
         "ml_weight": 0.2,
@@ -124,10 +136,14 @@
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 80,
-        "pnl_sweep_total_pnl": 1225.4,
+        "pnl_sweep_total_pnl": 1283.8,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 84.8,
-        "traded_count": 1067
+        "win_rate": 84.5,
+        "traded_count": 1136,
+        "xgb_min_w": 0.1,
+        "xgb_max_w": 0.8,
+        "lstm_min_w": 0.2,
+        "lstm_max_w": 0.4
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
