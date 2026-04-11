@@ -14,15 +14,15 @@
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
-        "ml_weight": 0.3,
-        "threshold": 0.65,
+        "ml_weight": 0.1,
+        "threshold": 0.7,
         "min_dm": 2,
         "max_dm": 8,
-        "max_price_cents": 75,
-        "pnl_sweep_total_pnl": 1131.8,
+        "max_price_cents": 80,
+        "pnl_sweep_total_pnl": 1992.4,
         "pnl_sweep_source": "ensemble_combo_sweep",
-        "win_rate": 78.4,
-        "traded_count": 615
+        "win_rate": 81.9,
+        "traded_count": 1096
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,

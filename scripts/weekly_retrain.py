@@ -441,7 +441,7 @@ def main():
                 "--asset", ",".join(promoted_assets),
                 "--min-dm", min_dm, "--max-dm", "8",
                 "--model-suffix", live_variant, "--day-filter", day_type,
-                "--kalshi-days", "14",
+                "--kalshi-days", "28",
             ])
             if not ok:
                 log(f"WARNING: {day_type} ensemble sweep failed")
@@ -633,7 +633,7 @@ def main():
             python, "scripts/ensemble_combo_sweep.py",
             "--asset", promoted_csv,
             "--min-dm", min_dm, "--max-dm", "8",
-            "--kalshi-days", "14",
+            "--kalshi-days", "28",
         ])
         if not ok:
             log("WARNING: Standard ensemble sweep failed")
@@ -644,7 +644,7 @@ def main():
             "--asset", promoted_csv,
             "--min-dm", min_dm, "--max-dm", "8",
             "--model-suffix", "_weekday", "--day-filter", "weekday",
-            "--kalshi-days", "14",
+            "--kalshi-days", "28",
         ])
         if not ok:
             log("WARNING: weekday ensemble sweep failed")
@@ -655,7 +655,7 @@ def main():
             "--asset", promoted_csv,
             "--min-dm", min_dm, "--max-dm", "8",
             "--model-suffix", "_weekend", "--day-filter", "weekend",
-            "--kalshi-days", "14",
+            "--kalshi-days", "28",
         ])
         if not ok:
             log("WARNING: weekend ensemble sweep failed")

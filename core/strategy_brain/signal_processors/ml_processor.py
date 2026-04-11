@@ -127,6 +127,10 @@ class MLProcessor(BaseSignalProcessor):
             sma5=metadata.get("sma5"),
             sma15=metadata.get("sma15"),
             sma30=metadata.get("sma30"),
+            kalshi_yes_ask=metadata.get("kalshi_yes_ask"),
+            kalshi_yes_bid=metadata.get("kalshi_yes_bid"),
+            kalshi_no_ask=metadata.get("kalshi_no_ask"),
+            kalshi_mins_to_close=metadata.get("kalshi_mins_to_close"),
         )
 
         # Build feature vector in correct order
@@ -237,6 +241,10 @@ class MLProcessor(BaseSignalProcessor):
             sma5=metadata.get("sma5"),
             sma15=metadata.get("sma15"),
             sma30=metadata.get("sma30"),
+            kalshi_yes_ask=metadata.get("kalshi_yes_ask"),
+            kalshi_yes_bid=metadata.get("kalshi_yes_bid"),
+            kalshi_no_ask=metadata.get("kalshi_no_ask"),
+            kalshi_mins_to_close=metadata.get("kalshi_mins_to_close"),
         )
 
         X = [[feats.get(name, 0.0) for name in FEATURE_NAMES]]

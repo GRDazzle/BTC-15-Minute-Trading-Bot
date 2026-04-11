@@ -31,8 +31,10 @@ from backtester.data_loader_ticks import (
     resample_ticks,
 )
 from ml.features import FEATURE_NAMES, extract_features, build_tick_index, load_daily_closes, compute_daily_smas
+from ml.kalshi_features import KalshiPollIndex, window_start_to_event_ticker
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
+KALSHI_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 
 
@@ -44,6 +46,8 @@ def extract_window_features(
     sma5: float | None = None,
     sma15: float | None = None,
     sma30: float | None = None,
+    kalshi_index: KalshiPollIndex | None = None,
+    asset: str = "",
 ) -> list[dict]:
     """Replay one tick window, extracting features at every 10s checkpoint.
 
@@ -147,6 +151,20 @@ def extract_window_features(
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
 
+        # Kalshi market data lookup (if available)
+        k_yes_ask = None
+        k_yes_bid = None
+        k_no_ask = None
+        k_mtc = None
+        if kalshi_index and asset:
+            event_ticker = window_start_to_event_ticker(asset, window.window_end)
+            poll = kalshi_index.find_poll(event_ticker, current_check)
+            if poll:
+                k_yes_ask = poll["yes_ask"]
+                k_yes_bid = poll["yes_bid"]
+                k_no_ask = poll["no_ask"]
+                k_mtc = poll["mins_to_close"]
+
         # Use pre-built sorted index for O(log n) lookups
         feats = extract_features(
             tick_buffer=None,
@@ -160,6 +178,10 @@ def extract_window_features(
             sma5=sma5,
             sma15=sma15,
             sma30=sma30,
+            kalshi_yes_ask=k_yes_ask,
+            kalshi_yes_bid=k_yes_bid,
+            kalshi_no_ask=k_no_ask,
+            kalshi_mins_to_close=k_mtc,
         )
         feats["label"] = label
         feats["window_start"] = window.window_start.isoformat()
@@ -224,6 +246,15 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
     daily_closes = load_daily_closes(DATA_DIR, asset)
     logger.info("Loaded {} daily closing prices for SMA computation", len(daily_closes))
 
+    # Load Kalshi poll data for market-aware features (v10)
+    kalshi_index = None
+    if KALSHI_DIR.exists():
+        logger.info("Loading Kalshi poll data for {} ...", asset)
+        kalshi_index = KalshiPollIndex(KALSHI_DIR, asset)
+        logger.info("Kalshi polls loaded: {} events, {} polls", len(kalshi_index.event_tickers), kalshi_index.n_polls())
+    else:
+        logger.info("No Kalshi poll data found -- Kalshi features will use defaults")
+
     all_rows: list[dict] = []
     log_interval = max(1, len(windows) // 20)
 
@@ -239,6 +270,7 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
             window, price_history, tick_buffer,
             persistent_raw_buffer=persistent_raw_buffer,
             sma5=sma5, sma15=sma15, sma30=sma30,
+            kalshi_index=kalshi_index, asset=asset,
         )
         all_rows.extend(rows)
 

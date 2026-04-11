@@ -1645,6 +1645,14 @@ class KalshiMultiAssetStrategy:
         metadata = self._build_metadata(state)
         metadata["kalshi_market"] = market_info
         metadata["decision_minute"] = dm
+        # v10 Kalshi features for ML processor
+        metadata["kalshi_yes_ask"] = kalshi_yes_ask
+        metadata["kalshi_yes_bid"] = state.kalshi_yes_bid
+        metadata["kalshi_no_ask"] = kalshi_no_ask
+        metadata["kalshi_mins_to_close"] = state.kalshi_last_update and (
+            (datetime.fromisoformat(state.kalshi_close_time) - datetime.now(timezone.utc)).total_seconds() / 60.0
+            if state.kalshi_close_time else None
+        )
         spot_price = float(state.current_price) if state.current_price else 0.0
 
         # Select model variant based on day of week (fallback to standard)

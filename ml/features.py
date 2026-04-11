@@ -55,7 +55,7 @@ FEATURE_NAMES = [
     "momentum_strength_180s",
     "price_vs_sma5",
     "price_vs_sma15",
-    "price_vs_sma30",
+    "price_vs_sma_1h",
     # Quant indicators (6)
     "z_score_300s",
     "z_score_900s",
@@ -63,6 +63,16 @@ FEATURE_NAMES = [
     "obv_slope_300s",
     "cvd_60s",
     "cvd_300s",
+    # Stability features (4) — v10
+    "price_stability_60s",
+    "velocity_stability_60s",
+    "direction_changes_60s",
+    "range_vs_trend_60s",
+    # Kalshi market features (4) — v10
+    "kalshi_yes_ask",
+    "kalshi_spread",
+    "kalshi_mid",
+    "kalshi_mins_to_close",
 ]
 
 
@@ -254,7 +264,11 @@ def extract_features(
     sorted_ticks: list[dict] = None,
     sma5: Optional[float] = None,
     sma15: Optional[float] = None,
-    sma30: Optional[float] = None,
+    sma30: Optional[float] = None,  # kept for backward compat, unused in v10
+    kalshi_yes_ask: Optional[int] = None,
+    kalshi_yes_bid: Optional[int] = None,
+    kalshi_no_ask: Optional[int] = None,
+    kalshi_mins_to_close: Optional[float] = None,
 ) -> dict[str, float]:
     """Extract 31 features for one decision point.
 
@@ -437,10 +451,17 @@ def extract_features(
     else:
         features["price_vs_sma15"] = 0.0
 
-    if sma30 is not None and sma30 != 0:
-        features["price_vs_sma30"] = (current_price - sma30) / sma30
+    # SMA 1h: computed from tick buffer (3600s lookback)
+    ticks_3600 = _ticks_in_window(tick_buffer, 3600, timestamp, ts_index, sorted_ticks)
+    if ticks_3600 and len(ticks_3600) >= 10:
+        sma_1h_prices = [t.get("price", 0) for t in ticks_3600 if t.get("price", 0) > 0]
+        if sma_1h_prices:
+            sma_1h = sum(sma_1h_prices) / len(sma_1h_prices)
+            features["price_vs_sma_1h"] = (current_price - sma_1h) / sma_1h if sma_1h > 0 else 0.0
+        else:
+            features["price_vs_sma_1h"] = 0.0
     else:
-        features["price_vs_sma30"] = 0.0
+        features["price_vs_sma_1h"] = 0.0
 
     # ---- Quant indicators ----
 
@@ -501,5 +522,75 @@ def extract_features(
 
     features["cvd_60s"] = _cvd_normalized(ticks_60)
     features["cvd_300s"] = _cvd_normalized(ticks_300)
+
+    # ---- Stability features (v10) ----
+    # Price stability: coefficient of variation over 60s (low = trending, high = choppy)
+    if ticks_60 and len(ticks_60) >= 2:
+        t60_prices = [t.get("price", 0) for t in ticks_60 if t.get("price", 0) > 0]
+        if len(t60_prices) >= 2:
+            mean_p = sum(t60_prices) / len(t60_prices)
+            std_p = (sum((p - mean_p) ** 2 for p in t60_prices) / len(t60_prices)) ** 0.5
+            features["price_stability_60s"] = std_p / mean_p if mean_p > 0 else 0.0
+        else:
+            features["price_stability_60s"] = 0.0
+    else:
+        features["price_stability_60s"] = 0.0
+
+    # Velocity stability: stdev of 5s velocity samples over 60s
+    # Sample velocity at ~5s intervals by splitting ticks_60 into 12 buckets
+    if ticks_60 and len(ticks_60) >= 10:
+        bucket_size = max(1, len(ticks_60) // 12)
+        velocities = []
+        for j in range(0, len(ticks_60) - bucket_size, bucket_size):
+            p_start = ticks_60[j].get("price", 0)
+            p_end = ticks_60[j + bucket_size - 1].get("price", 0)
+            if p_start and p_start > 0:
+                velocities.append((p_end - p_start) / p_start)
+        if len(velocities) >= 2:
+            mean_v = sum(velocities) / len(velocities)
+            std_v = (sum((v - mean_v) ** 2 for v in velocities) / len(velocities)) ** 0.5
+            features["velocity_stability_60s"] = std_v
+        else:
+            features["velocity_stability_60s"] = 0.0
+    else:
+        features["velocity_stability_60s"] = 0.0
+
+    # Direction changes: how many times price crosses window_open in last 60s
+    if ticks_60 and window_open_price and window_open_price > 0:
+        changes = 0
+        prev_side = None  # True = above, False = below
+        for t in ticks_60:
+            p = t.get("price", 0)
+            if p == 0:
+                continue
+            current_side = p > window_open_price
+            if prev_side is not None and current_side != prev_side:
+                changes += 1
+            prev_side = current_side
+        features["direction_changes_60s"] = float(changes)
+    else:
+        features["direction_changes_60s"] = 0.0
+
+    # Range vs trend: (high-low) / abs(close-open). High = chop, low = clean trend.
+    if ticks_60 and len(ticks_60) >= 2:
+        t60_prices = [t.get("price", 0) for t in ticks_60 if t.get("price", 0) > 0]
+        if len(t60_prices) >= 2:
+            hi = max(t60_prices)
+            lo = min(t60_prices)
+            rng = hi - lo
+            trend = abs(t60_prices[-1] - t60_prices[0])
+            features["range_vs_trend_60s"] = rng / trend if trend > 0 else 10.0  # cap at 10
+        else:
+            features["range_vs_trend_60s"] = 0.0
+    else:
+        features["range_vs_trend_60s"] = 0.0
+
+    # ---- Kalshi market features (v10) ----
+    # These are passed in from the caller (training: from JSONL, live: from AssetState)
+    features["kalshi_yes_ask"] = float(kalshi_yes_ask) if kalshi_yes_ask is not None else 50.0
+    yes_bid = float(kalshi_yes_bid) if kalshi_yes_bid is not None else 50.0
+    features["kalshi_spread"] = features["kalshi_yes_ask"] - yes_bid
+    features["kalshi_mid"] = (features["kalshi_yes_ask"] + yes_bid) / 2.0
+    features["kalshi_mins_to_close"] = float(kalshi_mins_to_close) if kalshi_mins_to_close is not None else 7.5
 
     return features
