@@ -1698,14 +1698,15 @@ class KalshiMultiAssetStrategy:
             # Dynamic weight: scales exponentially with each model's confidence
             dynamic_k = 4.5
             xgb_conf = abs(ml_p - 0.5) * 2.0
-            # ml_w from config acts as xgb_min_w
-            xgb_max_w = 0.60
-            dyn_xgb_w = ml_w + (xgb_max_w - ml_w) * (xgb_conf ** dynamic_k)
+            # Read per-asset dynamic weight params from config (sweep-optimized)
+            xgb_min_w = ml_w  # from config ensemble.ml_weight
+            xgb_max_w = self._get_ensemble_param(asset, model_label, "xgb_max_w", 0.60)
+            dyn_xgb_w = xgb_min_w + (xgb_max_w - xgb_min_w) * (xgb_conf ** dynamic_k)
 
             if lstm_p is not None:
                 lstm_conf = abs(lstm_p - 0.5) * 2.0
-                lstm_min_w = 0.10
-                lstm_max_w = 0.40
+                lstm_min_w = self._get_ensemble_param(asset, model_label, "lstm_min_w", 0.10)
+                lstm_max_w = self._get_ensemble_param(asset, model_label, "lstm_max_w", 0.40)
                 dyn_lstm_w = lstm_min_w + (lstm_max_w - lstm_min_w) * (lstm_conf ** dynamic_k)
                 dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w - dyn_lstm_w)
                 ensemble_p = dyn_xgb_w * ml_p + dyn_lstm_w * lstm_p + dyn_fusion_w * fusion_p
@@ -2450,6 +2451,38 @@ class KalshiMultiAssetStrategy:
             logger.debug("[runtime-state] write failed: %s", e)
 
     # -- reconciliation --------------------------------------------------------
+
+    def _get_ensemble_param(self, asset: str, model_label: str, key: str, default: float) -> float:
+        """Read a dynamic weight param from config/trading.json ensemble block.
+
+        Looks up the correct ensemble block based on model_label (standard,
+        weekday, weekend), then falls back to the standard block, then to
+        the hardcoded default.
+        """
+        try:
+            with open(self.CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            asset_cfg = cfg.get("assets", {}).get(asset, {})
+
+            # Determine which ensemble block to read
+            if model_label == "weekday":
+                ens = asset_cfg.get("ensemble_weekday", {})
+            elif model_label == "weekend":
+                ens = asset_cfg.get("ensemble_weekend", {})
+            else:
+                ens = asset_cfg.get("ensemble", {})
+
+            val = ens.get(key)
+            if val is not None:
+                return float(val)
+
+            # Fall back to standard ensemble block
+            val = asset_cfg.get("ensemble", {}).get(key)
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
+        return default
 
     def _live_assets(self) -> list[str]:
         """List of assets currently running in live mode (dry_run=False)."""

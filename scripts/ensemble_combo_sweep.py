@@ -421,6 +421,12 @@ def _write_config(asset: str, best: dict, config_key: str = "ensemble"):
     ens["pnl_sweep_source"] = "ensemble_combo_sweep"
     ens["win_rate"] = round(best["win_rate"], 1)
     ens["traded_count"] = best["traded_count"]
+    # Full dynamic weight params (xgb + lstm)
+    ens["xgb_min_w"] = best["min_w_a"]
+    ens["xgb_max_w"] = best["max_w_a"]
+    if "min_w_b" in best:
+        ens["lstm_min_w"] = best["min_w_b"]
+        ens["lstm_max_w"] = best["max_w_b"]
 
     asset_cfg[config_key] = ens
     cfg.setdefault("assets", {})[asset] = asset_cfg
