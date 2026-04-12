@@ -145,8 +145,13 @@ def window_start_to_event_ticker(asset: str, window_start: datetime) -> str:
          -> KXSOL15M-26APR062015
     """
     series = SERIES_MAP.get(asset.upper(), f"KX{asset.upper()}15M")
-    # Convert UTC -> ET (UTC-4). Kalshi uses fixed -4 offset (EDT).
-    et = window_start - timedelta(hours=4)
+    # Convert UTC -> US Eastern (EDT=UTC-4, EST=UTC-5)
+    try:
+        from zoneinfo import ZoneInfo
+        et = window_start.astimezone(ZoneInfo("America/New_York"))
+    except ImportError:
+        # Fallback for Python < 3.9: assume EDT (UTC-4), correct Mar-Nov
+        et = window_start - timedelta(hours=4)
     month_abbr = et.strftime("%b").upper()
     return f"{series}-{et.strftime('%y')}{month_abbr}{et.strftime('%d%H%M')}"
 

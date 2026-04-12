@@ -201,8 +201,8 @@ def generate_tick_windows(
         window_start = boundary
         window_end = boundary + timedelta(minutes=15)
         decision_start = window_start + timedelta(minutes=warmup_minutes)
-        # price_close reference: 1 min before window end
-        close_ref = window_end - timedelta(minutes=1)
+        # price_close reference: use full window (Kalshi settles on minute 15)
+        close_ref = window_end
 
         # Collect warmup ticks (minute 0 to warmup_minutes)
         warmup_ticks = []
