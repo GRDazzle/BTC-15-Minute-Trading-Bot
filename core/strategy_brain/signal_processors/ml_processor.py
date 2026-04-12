@@ -270,7 +270,14 @@ class MLProcessor(BaseSignalProcessor):
             kalshi_mins_to_close=metadata.get("kalshi_mins_to_close"),
         )
 
-        X = [[feats.get(name, 0.0) for name in FEATURE_NAMES]]
+        # Inject stacked LSTM prediction if available
+        lstm_p = metadata.get("lstm_p")
+        if lstm_p is not None:
+            feats["lstm_p"] = float(lstm_p)
+        else:
+            feats["lstm_p"] = 0.5
+
+        X = [[feats.get(name, 0.0) for name in self._feature_names]]
 
         proba = self.model.predict_proba(X)[0]
         return float(proba[1])  # P(BULLISH)
