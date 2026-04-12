@@ -1673,46 +1673,30 @@ class KalshiMultiAssetStrategy:
             active_lstm = state.lstm_processor
             model_label = "standard"
 
-        # Ensemble path: blend ML + fusion probabilities
+        # Stacked ensemble: LSTM → XGB (lstm_p is an XGB feature)
         if active_weights is not None and active_ml is not None:
-            ml_w, ens_threshold = active_weights
+            _ml_w, ens_threshold = active_weights
 
-            # Get ML raw probability
-            ml_p = active_ml.predict_proba(
-                state.current_price, list(state.price_history), metadata,
-            )
-            if ml_p is None:
-                logger.debug("[%s] Ensemble (%s): ML returned None for window %s", asset, model_label, window_id)
-                return
-
-            # Get fusion probability
-            fusion_p = self._get_fusion_probability(state, metadata)
-
-            # Get LSTM probability (if available)
+            # Step 1: Get LSTM probability first (feeds into XGB)
             lstm_p = None
             if active_lstm is not None:
                 lstm_p = active_lstm.predict_proba(
                     state.current_price, list(state.price_history), metadata,
                 )
+            metadata["lstm_p"] = lstm_p if lstm_p is not None else 0.5
 
-            # Dynamic weight: scales exponentially with each model's confidence
-            dynamic_k = 4.5
-            xgb_conf = abs(ml_p - 0.5) * 2.0
-            # Read per-asset dynamic weight params from config (sweep-optimized)
-            xgb_min_w = ml_w  # from config ensemble.ml_weight
-            xgb_max_w = self._get_ensemble_param(asset, model_label, "xgb_max_w", 0.60)
-            dyn_xgb_w = xgb_min_w + (xgb_max_w - xgb_min_w) * (xgb_conf ** dynamic_k)
+            # Step 2: Run XGB with lstm_p as a stacked feature
+            # XGB was trained with lstm_p baked in, so its output IS the
+            # final probability. No dynamic weighting or fusion needed.
+            ml_p = active_ml.predict_proba(
+                state.current_price, list(state.price_history), metadata,
+            )
+            if ml_p is None:
+                logger.debug("[%s] Ensemble (%s): XGB returned None for window %s", asset, model_label, window_id)
+                return
 
-            if lstm_p is not None:
-                lstm_conf = abs(lstm_p - 0.5) * 2.0
-                lstm_min_w = self._get_ensemble_param(asset, model_label, "lstm_min_w", 0.10)
-                lstm_max_w = self._get_ensemble_param(asset, model_label, "lstm_max_w", 0.40)
-                dyn_lstm_w = lstm_min_w + (lstm_max_w - lstm_min_w) * (lstm_conf ** dynamic_k)
-                dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w - dyn_lstm_w)
-                ensemble_p = dyn_xgb_w * ml_p + dyn_lstm_w * lstm_p + dyn_fusion_w * fusion_p
-            else:
-                dyn_fusion_w = 1.0 - dyn_xgb_w
-                ensemble_p = dyn_xgb_w * ml_p + dyn_fusion_w * fusion_p
+            ensemble_p = ml_p
+            fusion_p = 0.5  # kept for logging only, not used in decision
 
             # Decision
             if ensemble_p >= ens_threshold:

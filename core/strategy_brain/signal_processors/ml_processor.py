@@ -54,9 +54,25 @@ class MLProcessor(BaseSignalProcessor):
 
         self.model = xgb.XGBClassifier()
         self.model.load_model(str(model_path))
+
+        # Load per-asset feature list (trimmed features from ablation study)
+        self._feature_names = list(FEATURE_NAMES)  # default
+        features_path = model_dir / f"{asset.upper()}{model_suffix}_xgb_features.json"
+        if features_path.exists():
+            try:
+                import json
+                with open(features_path) as f:
+                    self._feature_names = json.load(f).get("features", list(FEATURE_NAMES))
+                logger.info(
+                    "MLProcessor using %d trimmed features for %s",
+                    len(self._feature_names), asset,
+                )
+            except Exception:
+                pass
+
         logger.info(
-            "MLProcessor loaded model for %s from %s (threshold=%.2f)",
-            asset, model_path, confidence_threshold,
+            "MLProcessor loaded model for %s from %s (threshold=%.2f, features=%d)",
+            asset, model_path, confidence_threshold, len(self._feature_names),
         )
 
         # Sub-processor: used to generate meta-features, not for direct trading
@@ -133,8 +149,15 @@ class MLProcessor(BaseSignalProcessor):
             kalshi_mins_to_close=metadata.get("kalshi_mins_to_close"),
         )
 
-        # Build feature vector in correct order
-        X = [[feats.get(name, 0.0) for name in FEATURE_NAMES]]
+        # Inject stacked LSTM prediction if available (passed via metadata)
+        lstm_p = metadata.get("lstm_p")
+        if lstm_p is not None:
+            feats["lstm_p"] = float(lstm_p)
+        else:
+            feats["lstm_p"] = 0.5  # neutral default
+
+        # Build feature vector in correct order (per-asset trimmed list)
+        X = [[feats.get(name, 0.0) for name in self._feature_names]]
 
         # Predict
         proba = self.model.predict_proba(X)[0]

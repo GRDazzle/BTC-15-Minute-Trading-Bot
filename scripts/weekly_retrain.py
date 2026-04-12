@@ -288,8 +288,8 @@ def main():
     parser.add_argument(
         "--days",
         type=int,
-        default=30,
-        help="Days of data to use (default: 30)",
+        default=45,
+        help="Days of data to use for training (default: 45)",
     )
     parser.add_argument(
         "--min-dm",
@@ -356,12 +356,12 @@ def main():
     promoted_assets: list[str] = []
     kept_assets: list[str] = []
 
-    # Step 1: Download fresh tick data from Coinbase
+    # Step 1: Download fresh tick data from Coinbase (always 60 days for data retention)
     if not args.skip_download:
         ok = run_step("Download Coinbase trades", [
             python, "scripts/fetch_coinbase_trades.py",
             "--assets", assets,
-            "--days", days,
+            "--days", "60",
         ])
         if not ok:
             failed.append("download")
@@ -576,8 +576,8 @@ def main():
         log("WARNING: weekend XGB data gen failed -- skipping weekend models")
 
     # ---- Purge old data ----
-    purge_kalshi_polls(max_age_days=45)
-    purge_old_aggtrades(max_age_days=45)
+    purge_kalshi_polls(max_age_days=75)
+    purge_old_aggtrades(max_age_days=75)
 
     # ---- Decide which assets to PROMOTE (based on recent live PnL) ----
     if args.promote_all:

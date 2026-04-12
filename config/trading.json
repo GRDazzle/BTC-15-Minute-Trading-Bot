@@ -89,7 +89,7 @@
     "SOL": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 80,
+      "max_price_cents": 75,
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.2,
@@ -167,7 +167,7 @@
     "HYPE": {
       "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
-      "max_price_cents": 80,
+      "max_price_cents": 70,
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.2,

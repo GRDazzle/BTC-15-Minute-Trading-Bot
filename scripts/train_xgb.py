@@ -36,6 +36,28 @@ MODEL_DIR = PROJECT_ROOT / "models"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "ml"
 
 
+def load_feature_list(asset: str) -> list[str]:
+    """Load per-asset trimmed feature list if available, else use full FEATURE_NAMES.
+
+    Checks for models/{ASSET}_v10_trimmed_features.json which is produced
+    by the feature ablation study (scripts/feature_trim_perasset.py).
+    """
+    trim_path = MODEL_DIR / f"{asset.upper()}_v10_trimmed_features.json"
+    if trim_path.exists():
+        try:
+            import json
+            with open(trim_path) as f:
+                data = json.load(f)
+            features = data.get("features", [])
+            if features:
+                print(f"Using trimmed feature set for {asset}: {len(features)} features "
+                      f"(removed: {', '.join(data.get('removed_groups', []))})")
+                return features
+        except Exception as e:
+            print(f"Warning: failed to load trimmed features for {asset}: {e}")
+    return list(FEATURE_NAMES)
+
+
 def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None, exclude_hours: list[int] | None = None, data_suffix: str = "") -> pd.DataFrame:
     """Load training data CSV for an asset."""
     path = DATA_DIR / f"{asset.upper()}_features{data_suffix}.csv"
@@ -374,11 +396,17 @@ def train_asset(
     data_suffix: str = "",
 ) -> None:
     """Full training pipeline for one asset."""
+    global FEATURE_NAMES  # Override with per-asset trimmed list if available
+
     dm_range = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
     suffix_label = f" (suffix='{model_suffix}')" if model_suffix else ""
     print(f"\n{'='*60}")
     print(f"Training XGBoost for {asset} [{dm_range}]{suffix_label}")
     print(f"{'='*60}")
+
+    # Load per-asset trimmed feature list (falls back to full FEATURE_NAMES)
+    asset_features = load_feature_list(asset)
+    FEATURE_NAMES = asset_features  # Override global for this training run
 
     df = load_data(asset, min_dm=min_dm, max_dm=max_dm, exclude_hours=exclude_hours, data_suffix=data_suffix)
 
@@ -399,6 +427,13 @@ def train_asset(
     print(f"Model saved: {model_path}")
 
     save_feature_importance(model, asset)
+
+    # Also save the feature list used, so inference knows which features to pass
+    import json
+    meta_path = MODEL_DIR / f"{asset.upper()}{model_suffix}_xgb_features.json"
+    with open(meta_path, "w") as f:
+        json.dump({"features": asset_features, "n_features": len(asset_features)}, f, indent=2)
+    print(f"Feature list saved: {meta_path}")
 
 
 def main():
