@@ -181,6 +181,7 @@ class AssetState:
     traded_windows: set = field(default_factory=set)
     pending_settlements: list = field(default_factory=list)
     pending_verifications: list = field(default_factory=list)  # live trades awaiting Kalshi verification
+    min_dm: int = 2  # Per-asset min decision minute (from walk-forward sweep)
 
     # Live Kalshi prices (updated by WebSocket or REST poller)
     kalshi_market_ticker: Optional[str] = None
@@ -454,10 +455,13 @@ class KalshiMultiAssetStrategy:
             if asset in ensemble_config and state.ml_processor is not None:
                 ens = ensemble_config[asset]
                 state.ensemble_weights = (ens["ml_weight"], ens["threshold"])
+                # Per-asset min_dm from walk-forward sweep
+                if "min_dm" in ens:
+                    state.min_dm = int(ens["min_dm"])
                 ensemble_loaded.append(asset)
                 logger.info(
-                    "Ensemble mode for %s: ml_weight=%.2f threshold=%.2f",
-                    asset, ens["ml_weight"], ens["threshold"],
+                    "Ensemble mode for %s: threshold=%.2f min_dm=%d",
+                    asset, ens["threshold"], state.min_dm,
                 )
                 # Apply ensemble max_price_cents if present
                 if "max_price_cents" in ens:
@@ -727,7 +731,7 @@ class KalshiMultiAssetStrategy:
         for asset, state in self.states.items():
             asset_cfg = {**defaults, **asset_configs.get(asset, {})}
 
-            # Update ensemble weights (standard model, dm 4+)
+            # Update ensemble weights (standard model)
             ens = asset_cfg.get("ensemble")
             if ens and "ml_weight" in ens and "threshold" in ens and state.ml_processor is not None:
                 old = state.ensemble_weights
@@ -735,9 +739,17 @@ class KalshiMultiAssetStrategy:
                 if old != new:
                     state.ensemble_weights = new
                     logger.info(
-                        "[hot-reload] %s ensemble: %s -> ml_weight=%.2f threshold=%.2f",
-                        asset, old, new[0], new[1],
+                        "[hot-reload] %s ensemble: %s -> threshold=%.2f",
+                        asset, old, new[1],
                     )
+                # Hot-reload min_dm
+                new_min_dm = int(ens.get("min_dm", state.min_dm))
+                if new_min_dm != state.min_dm:
+                    logger.info(
+                        "[hot-reload] %s min_dm: %d -> %d",
+                        asset, state.min_dm, new_min_dm,
+                    )
+                    state.min_dm = new_min_dm
 
             # Update early ensemble weights (dm 2-3)
             ens_early = asset_cfg.get("ensemble_early")
@@ -1540,6 +1552,9 @@ class KalshiMultiAssetStrategy:
                         await asyncio.sleep(2)
                         continue
                     for asset, state in self.states.items():
+                        # Per-asset min_dm gate (from walk-forward sweep)
+                        if dm < state.min_dm:
+                            continue
                         await self._process_asset_window(
                             asset, state, window_id, dm=dm, mtc=mtc,
                             blocked=blocked,
