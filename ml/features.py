@@ -73,6 +73,13 @@ FEATURE_NAMES = [
     "kalshi_spread",
     "kalshi_mid",
     "kalshi_mins_to_close",
+    # Cross-exchange features (6) — v11
+    "kraken_coinbase_price_diff",   # (kraken - coinbase) / coinbase — lead/lag signal
+    "bitstamp_coinbase_price_diff", # (bitstamp - coinbase) / coinbase
+    "kraken_velocity_60s",          # Kraken's price velocity (independent signal)
+    "kraken_volume_ratio_60s",      # kraken_vol / (coinbase_vol + kraken_vol)
+    "bitstamp_volume_60s",          # Bitstamp volume (from OHLCV in training, WS live)
+    "exchange_price_std",           # stdev of prices across exchanges — disagreement signal
 ]
 
 
@@ -269,6 +276,10 @@ def extract_features(
     kalshi_yes_bid: Optional[int] = None,
     kalshi_no_ask: Optional[int] = None,
     kalshi_mins_to_close: Optional[float] = None,
+    kraken_tick_buffer: Optional[list[dict]] = None,
+    kraken_current_price: Optional[float] = None,
+    bitstamp_tick_buffer: Optional[list[dict]] = None,
+    bitstamp_current_price: Optional[float] = None,
 ) -> dict[str, float]:
     """Extract 31 features for one decision point.
 
@@ -592,5 +603,51 @@ def extract_features(
     features["kalshi_spread"] = features["kalshi_yes_ask"] - yes_bid
     features["kalshi_mid"] = (features["kalshi_yes_ask"] + yes_bid) / 2.0
     features["kalshi_mins_to_close"] = float(kalshi_mins_to_close) if kalshi_mins_to_close is not None else 7.5
+
+    # ---- Cross-exchange features (v11) ----
+    # Price divergence: (other_exchange - coinbase) / coinbase
+    # Positive = other exchange has higher price (leading indicator of upward move)
+    kr_price = float(kraken_current_price) if kraken_current_price is not None else current_price
+    bs_price = float(bitstamp_current_price) if bitstamp_current_price is not None else current_price
+
+    if current_price > 0:
+        features["kraken_coinbase_price_diff"] = (kr_price - current_price) / current_price
+        features["bitstamp_coinbase_price_diff"] = (bs_price - current_price) / current_price
+    else:
+        features["kraken_coinbase_price_diff"] = 0.0
+        features["bitstamp_coinbase_price_diff"] = 0.0
+
+    # Kraken velocity 60s (independent directional signal)
+    kr_ticks = kraken_tick_buffer or []
+    if kr_ticks and len(kr_ticks) >= 2:
+        # Get ticks in last 60s
+        kr_ticks_60 = [t for t in kr_ticks if (timestamp - t.get("ts", timestamp)).total_seconds() <= 60] if hasattr(kr_ticks[0].get("ts", 0), "timestamp") else kr_ticks[-20:]
+        if len(kr_ticks_60) >= 2:
+            kr_first = kr_ticks_60[0].get("price", 0)
+            kr_last = kr_ticks_60[-1].get("price", 0)
+            features["kraken_velocity_60s"] = (kr_last - kr_first) / kr_first if kr_first > 0 else 0.0
+        else:
+            features["kraken_velocity_60s"] = 0.0
+    else:
+        features["kraken_velocity_60s"] = 0.0
+
+    # Kraken volume ratio: kraken / (coinbase + kraken)
+    kr_vol = sum(t.get("qty", 0) for t in kr_ticks[-50:]) if kr_ticks else 0
+    cb_vol = features.get("volume_60s", 0)
+    total_vol = kr_vol + cb_vol
+    features["kraken_volume_ratio_60s"] = kr_vol / total_vol if total_vol > 0 else 0.5
+
+    # Bitstamp volume (from tick buffer in live, from OHLCV in training)
+    bs_ticks = bitstamp_tick_buffer or []
+    features["bitstamp_volume_60s"] = sum(t.get("qty", 0) for t in bs_ticks[-50:]) if bs_ticks else 0.0
+
+    # Exchange price standard deviation — disagreement signal
+    prices = [p for p in [current_price, kr_price, bs_price] if p and p > 0]
+    if len(prices) >= 2:
+        mean_p = sum(prices) / len(prices)
+        std_p = (sum((p - mean_p) ** 2 for p in prices) / len(prices)) ** 0.5
+        features["exchange_price_std"] = std_p / mean_p if mean_p > 0 else 0.0
+    else:
+        features["exchange_price_std"] = 0.0
 
     return features

@@ -147,6 +147,10 @@ class MLProcessor(BaseSignalProcessor):
             kalshi_yes_bid=metadata.get("kalshi_yes_bid"),
             kalshi_no_ask=metadata.get("kalshi_no_ask"),
             kalshi_mins_to_close=metadata.get("kalshi_mins_to_close"),
+            kraken_tick_buffer=metadata.get("kraken_tick_buffer"),
+            kraken_current_price=metadata.get("kraken_current_price"),
+            bitstamp_tick_buffer=metadata.get("bitstamp_tick_buffer"),
+            bitstamp_current_price=metadata.get("bitstamp_current_price"),
         )
 
         # Inject stacked LSTM prediction if available (passed via metadata)
@@ -268,6 +272,10 @@ class MLProcessor(BaseSignalProcessor):
             kalshi_yes_bid=metadata.get("kalshi_yes_bid"),
             kalshi_no_ask=metadata.get("kalshi_no_ask"),
             kalshi_mins_to_close=metadata.get("kalshi_mins_to_close"),
+            kraken_tick_buffer=metadata.get("kraken_tick_buffer"),
+            kraken_current_price=metadata.get("kraken_current_price"),
+            bitstamp_tick_buffer=metadata.get("bitstamp_tick_buffer"),
+            bitstamp_current_price=metadata.get("bitstamp_current_price"),
         )
 
         # Inject stacked LSTM prediction if available

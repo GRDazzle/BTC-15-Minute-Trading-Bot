@@ -32,8 +32,11 @@ from backtester.data_loader_ticks import (
 )
 from ml.features import FEATURE_NAMES, extract_features, build_tick_index, load_daily_closes, compute_daily_smas
 from ml.kalshi_features import KalshiPollIndex, window_start_to_event_ticker
+from ml.multi_exchange import KrakenTickIndex, BitstampOHLCVIndex
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
+KRAKEN_DIR = PROJECT_ROOT / "data" / "aggtrades_kraken"
+BITSTAMP_DIR = PROJECT_ROOT / "data" / "ohlcv_bitstamp"
 KALSHI_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 
@@ -49,6 +52,8 @@ def extract_window_features(
     kalshi_index: KalshiPollIndex | None = None,
     asset: str = "",
     kalshi_settlements: dict | None = None,
+    kraken_index: KrakenTickIndex | None = None,
+    bitstamp_index: BitstampOHLCVIndex | None = None,
 ) -> list[dict]:
     """Replay one tick window, extracting features at every 10s checkpoint.
 
@@ -176,6 +181,25 @@ def extract_window_features(
                 k_no_ask = poll["no_ask"]
                 k_mtc = poll["mins_to_close"]
 
+        # Cross-exchange data lookup
+        kr_price = None
+        kr_ticks = None
+        bs_price = None
+        bs_ticks = None
+        if kraken_index:
+            kr_price = kraken_index.get_price_at(current_check)
+            # Get Kraken ticks in last 60s for velocity/volume features
+            from datetime import timedelta as _td
+            kr_ticks = kraken_index.get_ticks_in_window(
+                current_check - _td(seconds=60), current_check,
+            )
+        if bitstamp_index:
+            bs_price = bitstamp_index.get_price_at(current_check)
+            # Get Bitstamp candles in last 60s for volume
+            candle = bitstamp_index.get_candle_at(current_check)
+            if candle:
+                bs_ticks = [{"qty": candle["volume"], "ts": candle["ts"], "price": candle["close"]}]
+
         # Use pre-built sorted index for O(log n) lookups
         feats = extract_features(
             tick_buffer=None,
@@ -193,6 +217,10 @@ def extract_window_features(
             kalshi_yes_bid=k_yes_bid,
             kalshi_no_ask=k_no_ask,
             kalshi_mins_to_close=k_mtc,
+            kraken_tick_buffer=kr_ticks,
+            kraken_current_price=kr_price,
+            bitstamp_tick_buffer=bs_ticks,
+            bitstamp_current_price=bs_price,
         )
         feats["label"] = label
         feats["window_start"] = window.window_start.isoformat()
@@ -278,6 +306,20 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
     else:
         logger.info("No Kalshi settlement data for {} -- using Coinbase price labels", asset)
 
+    # Load Kraken tick data for cross-exchange features
+    kraken_index = None
+    if KRAKEN_DIR.exists():
+        logger.info("Loading Kraken tick data for {} ...", asset)
+        kraken_index = KrakenTickIndex(KRAKEN_DIR, asset)
+        logger.info("Kraken ticks loaded: {}", kraken_index.n_ticks())
+
+    # Load Bitstamp OHLCV data for cross-exchange features
+    bitstamp_index = None
+    if BITSTAMP_DIR.exists():
+        logger.info("Loading Bitstamp OHLCV data for {} ...", asset)
+        bitstamp_index = BitstampOHLCVIndex(BITSTAMP_DIR, asset)
+        logger.info("Bitstamp candles loaded: {}", bitstamp_index.n_candles())
+
     all_rows: list[dict] = []
     log_interval = max(1, len(windows) // 20)
 
@@ -295,6 +337,8 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
             sma5=sma5, sma15=sma15, sma30=sma30,
             kalshi_index=kalshi_index, asset=asset,
             kalshi_settlements=kalshi_settlements,
+            kraken_index=kraken_index,
+            bitstamp_index=bitstamp_index,
         )
         all_rows.extend(rows)
 

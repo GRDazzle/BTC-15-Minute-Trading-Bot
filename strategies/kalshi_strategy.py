@@ -183,6 +183,12 @@ class AssetState:
     pending_verifications: list = field(default_factory=list)  # live trades awaiting Kalshi verification
     min_dm: int = 2  # Per-asset min decision minute (from walk-forward sweep)
 
+    # Multi-exchange tick buffers (Kraken + Bitstamp for cross-exchange features)
+    kraken_tick_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
+    bitstamp_tick_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
+    kraken_current_price: Optional[float] = None
+    bitstamp_current_price: Optional[float] = None
+
     # Live Kalshi prices (updated by WebSocket or REST poller)
     kalshi_market_ticker: Optional[str] = None
     kalshi_event_ticker: Optional[str] = None
@@ -1056,6 +1062,17 @@ class KalshiMultiAssetStrategy:
             )
             self._tasks.append(task)
 
+        # 1b. Kraken + Bitstamp WS streams for cross-exchange features
+        for asset, state in self.states.items():
+            self._tasks.append(asyncio.create_task(
+                self._kraken_stream(asset, state),
+                name=f"kraken-ws-{asset}",
+            ))
+            self._tasks.append(asyncio.create_task(
+                self._bitstamp_stream(asset, state),
+                name=f"bitstamp-ws-{asset}",
+            ))
+
         # 2. Window management loop
         self._tasks.append(
             asyncio.create_task(self._window_loop(), name="window-loop"),
@@ -1379,6 +1396,68 @@ class KalshiMultiAssetStrategy:
                 logger.exception("[ws-%s] Coinbase stream error, reconnecting in 5s", asset)
                 await asyncio.sleep(5)
 
+    async def _kraken_stream(self, asset: str, state: AssetState):
+        """Stream Kraken trade matches for cross-exchange features."""
+        try:
+            from data_sources.kraken.websocket import KrakenWebSocket, ASSET_TO_PAIR
+        except ImportError:
+            logger.warning("[ws-kraken-%s] Kraken WS module not available", asset)
+            return
+        if asset not in ASSET_TO_PAIR:
+            return  # Asset not on Kraken (e.g. DOGE)
+
+        kr_ws = KrakenWebSocket(asset)
+
+        def on_trade(trade: dict[str, Any]):
+            state.kraken_current_price = trade["price"]
+            state.kraken_tick_buffer.append({
+                "ts": trade["timestamp"],
+                "price": float(trade["price"]),
+                "qty": float(trade["quantity"]),
+                "is_buyer": trade["side"] == "buy",
+            })
+
+        while self._running:
+            try:
+                logger.info("[ws-kraken-%s] Connecting to Kraken stream...", asset)
+                await kr_ws.stream_trades(on_trade)
+            except asyncio.CancelledError:
+                kr_ws.stop()
+                break
+            except Exception:
+                logger.exception("[ws-kraken-%s] Kraken stream error, reconnecting in 5s", asset)
+                await asyncio.sleep(5)
+
+    async def _bitstamp_stream(self, asset: str, state: AssetState):
+        """Stream Bitstamp trade matches for cross-exchange features."""
+        try:
+            from data_sources.bitstamp.websocket import BitstampWebSocket
+        except ImportError:
+            logger.warning("[ws-bitstamp-%s] Bitstamp WS module not available", asset)
+            return
+
+        bs_ws = BitstampWebSocket(asset)
+
+        def on_trade(trade: dict[str, Any]):
+            state.bitstamp_current_price = trade["price"]
+            state.bitstamp_tick_buffer.append({
+                "ts": trade["timestamp"],
+                "price": float(trade["price"]),
+                "qty": float(trade["quantity"]),
+                "is_buyer": trade["side"] == "buy",
+            })
+
+        while self._running:
+            try:
+                logger.info("[ws-bitstamp-%s] Connecting to Bitstamp stream...", asset)
+                await bs_ws.stream_trades(on_trade)
+            except asyncio.CancelledError:
+                bs_ws.stop()
+                break
+            except Exception:
+                logger.exception("[ws-bitstamp-%s] Bitstamp stream error, reconnecting in 5s", asset)
+                await asyncio.sleep(5)
+
     # -- Kalshi WebSocket streaming --------------------------------------------
 
     @staticmethod
@@ -1668,6 +1747,12 @@ class KalshiMultiAssetStrategy:
             (datetime.fromisoformat(state.kalshi_close_time) - datetime.now(timezone.utc)).total_seconds() / 60.0
             if state.kalshi_close_time else None
         )
+        # v11 cross-exchange features for ML processor
+        metadata["kraken_current_price"] = state.kraken_current_price
+        metadata["kraken_tick_buffer"] = list(state.kraken_tick_buffer) if state.kraken_tick_buffer else None
+        metadata["bitstamp_current_price"] = state.bitstamp_current_price
+        metadata["bitstamp_tick_buffer"] = list(state.bitstamp_tick_buffer) if state.bitstamp_tick_buffer else None
+
         spot_price = float(state.current_price) if state.current_price else 0.0
 
         # Select model variant based on day of week (fallback to standard)
