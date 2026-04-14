@@ -48,6 +48,7 @@ def extract_window_features(
     sma30: float | None = None,
     kalshi_index: KalshiPollIndex | None = None,
     asset: str = "",
+    kalshi_settlements: dict | None = None,
 ) -> list[dict]:
     """Replay one tick window, extracting features at every 10s checkpoint.
 
@@ -94,7 +95,17 @@ def extract_window_features(
     # Add raw ticks from decision zone to raw_tick_buffer as we go
     raw_tick_idx = 0
 
-    label = 1 if window.actual_direction == "BULLISH" else 0
+    # Use Kalshi settlement as ground truth if available, else fall back to Coinbase direction
+    label = None
+    if kalshi_settlements and asset:
+        # Look up by close_time (window_end in UTC ISO format)
+        close_time_str = window.window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        kalshi_result = kalshi_settlements.get(close_time_str)
+        if kalshi_result:
+            label = 1 if kalshi_result == "yes" else 0
+    if label is None:
+        # Fallback: use Coinbase price direction
+        label = 1 if window.actual_direction == "BULLISH" else 0
     rows = []
 
     decision_start = window.window_start + timedelta(minutes=5)
@@ -255,6 +266,18 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
     else:
         logger.info("No Kalshi poll data found -- Kalshi features will use defaults")
 
+    # Load Kalshi settlement results for accurate labels (replaces Coinbase price direction)
+    import json as _json
+    kalshi_settlements = None
+    settlements_path = PROJECT_ROOT / "data" / "kalshi_settlements" / f"{asset.upper()}_settlements.json"
+    if settlements_path.exists():
+        with open(settlements_path) as f:
+            sdata = _json.load(f)
+        kalshi_settlements = sdata.get("by_close_time", {})
+        logger.info("Kalshi settlements loaded for {}: {} outcomes", asset, len(kalshi_settlements))
+    else:
+        logger.info("No Kalshi settlement data for {} -- using Coinbase price labels", asset)
+
     all_rows: list[dict] = []
     log_interval = max(1, len(windows) // 20)
 
@@ -271,6 +294,7 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
             persistent_raw_buffer=persistent_raw_buffer,
             sma5=sma5, sma15=sma15, sma30=sma30,
             kalshi_index=kalshi_index, asset=asset,
+            kalshi_settlements=kalshi_settlements,
         )
         all_rows.extend(rows)
 

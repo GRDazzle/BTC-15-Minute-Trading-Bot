@@ -15,7 +15,7 @@
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.1,
-        "threshold": 0.7,
+        "threshold": 0.75,
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 80,
@@ -26,7 +26,9 @@
         "xgb_min_w": 0.1,
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.2,
-        "lstm_max_w": 0.4
+        "lstm_max_w": 0.4,
+        "walk_forward_pnl": 281.15,
+        "walk_forward_wr": 83.7
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
@@ -54,8 +56,8 @@
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.1,
-        "threshold": 0.65,
-        "min_dm": 2,
+        "threshold": 0.75,
+        "min_dm": 3,
         "max_dm": 8,
         "max_price_cents": 80,
         "pnl_sweep_total_pnl": 1138.4,
@@ -65,7 +67,9 @@
         "xgb_min_w": 0.1,
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.2,
-        "lstm_max_w": 0.4
+        "lstm_max_w": 0.4,
+        "walk_forward_pnl": 207.27,
+        "walk_forward_wr": 81.9
       },
       "ensemble_weekend": {
         "ml_weight": 0.2,
@@ -93,7 +97,7 @@
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.2,
-        "threshold": 0.65,
+        "threshold": 0.75,
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 75,
@@ -104,7 +108,9 @@
         "xgb_min_w": 0.2,
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.1,
-        "lstm_max_w": 0.4
+        "lstm_max_w": 0.4,
+        "walk_forward_pnl": 238.85,
+        "walk_forward_wr": 81.9
       },
       "ensemble_weekend": {
         "ml_weight": 0.2,
@@ -132,7 +138,7 @@
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.1,
-        "threshold": 0.7,
+        "threshold": 0.75,
         "min_dm": 2,
         "max_dm": 8,
         "max_price_cents": 80,
@@ -143,7 +149,9 @@
         "xgb_min_w": 0.1,
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.2,
-        "lstm_max_w": 0.4
+        "lstm_max_w": 0.4,
+        "walk_forward_pnl": 241.93,
+        "walk_forward_wr": 82.7
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,

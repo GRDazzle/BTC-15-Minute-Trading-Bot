@@ -35,6 +35,8 @@ OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 def extract_window_sequences(
     window,
     seq_len: int = LSTM_SEQ_LEN,
+    kalshi_settlements: dict | None = None,
+    asset: str = "",
 ) -> list[dict]:
     """Replay one tick window, extracting LSTM sequences at every 10s checkpoint.
 
@@ -51,7 +53,15 @@ def extract_window_sequences(
             "is_buyer": tick.is_buyer,
         })
 
-    label = 1 if window.actual_direction == "BULLISH" else 0
+    # Use Kalshi settlement as ground truth if available
+    label = None
+    if kalshi_settlements and asset:
+        close_time_str = window.window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        kalshi_result = kalshi_settlements.get(close_time_str)
+        if kalshi_result:
+            label = 1 if kalshi_result == "yes" else 0
+    if label is None:
+        label = 1 if window.actual_direction == "BULLISH" else 0
     price_return = 0.0
     if window.price_open != 0:
         price_return = (window.price_close - window.price_open) / window.price_open
@@ -142,6 +152,18 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
 
     logger.info("Generating LSTM training data for {} ({} windows)", asset, len(windows))
 
+    # Load Kalshi settlement results for accurate labels
+    import json as _json
+    kalshi_settlements = None
+    settlements_path = PROJECT_ROOT / "data" / "kalshi_settlements" / f"{asset.upper()}_settlements.json"
+    if settlements_path.exists():
+        with open(settlements_path) as f:
+            sdata = _json.load(f)
+        kalshi_settlements = sdata.get("by_close_time", {})
+        logger.info("Kalshi settlements loaded for {}: {} outcomes", asset, len(kalshi_settlements))
+    else:
+        logger.info("No Kalshi settlement data for {} -- using Coinbase price labels", asset)
+
     all_sequences = []
     all_labels = []
     all_returns = []
@@ -154,7 +176,7 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
         if i % log_interval == 0:
             logger.info("Processing window {}/{}", i + 1, len(windows))
 
-        rows = extract_window_sequences(window)
+        rows = extract_window_sequences(window, kalshi_settlements=kalshi_settlements, asset=asset)
         for row in rows:
             all_sequences.append(row["sequence"])
             all_labels.append(row["label"])
