@@ -1,329 +1,275 @@
 # Kalshi 15-Minute Multi-Asset Trading Bot
 
-Binary options trading bot for Kalshi's 15-minute crypto price prediction markets. Supports BTC, ETH, SOL, XRP, HYPE, BNB, DOGE. Uses a 3-way dynamic ensemble (XGBoost + LSTM + Fusion) with exponential confidence scaling and per-asset live/dry-run routing for safe live deployment.
+Binary options trading bot for Kalshi's 15-minute crypto price prediction markets. Supports BTC, ETH, SOL, XRP, HYPE, BNB, DOGE. Uses a stacked ensemble (LSTM → XGB) with multi-exchange features, Kalshi market awareness, and per-asset parameter optimization via walk-forward selection.
 
 ## Architecture
 
-### 3-Way Dynamic Ensemble
+### Stacked Ensemble (v11)
 
 ```
-ensemble_p = xgb_w * xgb_p + lstm_w * lstm_p + fusion_w * fusion_p
+LSTM(180s bars) → lstm_p
+XGB(51 features + lstm_p) → final probability → threshold gate → trade
 ```
 
-- **XGBoost (v9)**: 37 features, ~88% test accuracy. Looks back 15 minutes via persistent tick buffer. Top features: `price_vs_open`, `velocity_900s`, `velocity_300s`, plus v9 quant indicators (z-score 300s/900s, OBV slope, CVD, SMA crossovers).
-- **LSTM (v4)**: Conv1D + BatchNorm + BiLSTM + Attention, ~87% test accuracy. Looks back 3 minutes (180 x 1-second bars). StandardScaler normalization fitted on training data and saved with the model.
-- **Fusion**: Rule-based signal processors (TickVelocity, DeribitPCR). Acts as a confidence dampener around 0.50.
-- **Dynamic weighting**: `w = min_w + (max_w - min_w) * confidence^4.5`. Uncertain signals get low weight, confident signals get amplified.
+**LSTM runs first**, producing P(BULLISH) from 180 seconds of 1-second price bars. This prediction (`lstm_p`) is fed as a feature into XGB, which makes the final decision. XGB learns *when* to trust LSTM and when to ignore it — no hand-tuned weighting formula.
 
-### Weekday vs Weekend Models
+**XGB (v11):** 51 features + lstm_p = 52 inputs per checkpoint. Per-asset trimmed feature sets (36-44 features depending on asset). Hyperparameters selected by walk-forward PnL optimization.
 
-Each asset has up to 3 model variants:
-- **Standard** (`{ASSET}_xgb.json`, `{ASSET}_lstm.pt`) — fallback, trained on all-day data
-- **Weekday** (`{ASSET}_weekday_*`) — used Mon-Fri, trained on weekday-only data
-- **Weekend** (`{ASSET}_weekend_*`) — used Sat-Sun, trained on weekend-only data
+**LSTM (v4):** Conv1D + BatchNorm + BiLSTM + Attention, ~87% accuracy. Looks back 3 minutes (180 x 1-second bars). StandardScaler normalization fitted on training data.
 
-The strategy auto-selects based on UTC day-of-week. Falls back to standard if a variant isn't loaded.
+### Multi-Exchange Data (v11)
 
-### Data Sources
+Three exchange feeds provide a composite market view:
 
-- **Training**: Coinbase Exchange historical trades (`scripts/fetch_coinbase_trades.py`), 30 days of 1-second tick resolution
-- **Live ticks**: Coinbase Exchange WebSocket (`wss://ws-feed.exchange.coinbase.com`), ~100+ ticks/min/asset
-- **Live Kalshi prices**: Kalshi WebSocket (real-time bid/ask) with REST poller fallback every 2s
-- **Kalshi polling data**: JSONL files for backtesting (2-second snapshots), used by the ensemble combo sweep
+| Exchange | Data Type | Live Feed | Historical |
+|---|---|---|---|
+| **Coinbase** | Tick trades | WebSocket (primary) | REST download |
+| **Kraken** | Tick trades | WebSocket | REST pagination |
+| **Bitstamp** | Tick trades / 1-min OHLCV | WebSocket | REST OHLCV |
+
+Cross-exchange features capture price divergence, volume ratios, and market disagreement — signals that a single exchange misses.
+
+### Feature Set (51 features)
+
+| Category | Count | Features |
+|---|---:|---|
+| Tick-derived | 10 | velocity, volatility, volume, buy ratio, aggressor ratio, tick intensity |
+| Price structure | 2 | VWAP deviation, price range |
+| Time | 3 | hour sin/cos, minute in window |
+| Momentum | 3 | return skew, price vs open, momentum trend |
+| SMA | 3 | price vs SMA 5/15/1h |
+| Market condition | 4 | volume 180s, choppiness, range pct, vol acceleration |
+| Crash detection | 2 | flips per tick, momentum strength |
+| Quant indicators | 6 | z-score 300s/900s, OBV slope, CVD |
+| Stability (v10) | 4 | price/velocity stability, direction changes, range vs trend |
+| Kalshi market (v10) | 4 | yes_ask, spread, mid, mins_to_close |
+| Cross-exchange (v11) | 6 | Kraken/Bitstamp price diff, Kraken velocity/volume, exchange price std |
+| **LSTM stacked** | **1** | **lstm_p** (stacked prediction) |
+
+### Training Labels
+
+Labels come from **Kalshi's actual settlement outcomes** (CF Benchmarks composite price), not Coinbase price direction. This eliminates the ~17% label mismatch caused by cross-exchange price divergence on small moves.
+
+Settlement data fetched via `scripts/fetch_kalshi_settlements.py` from the Kalshi API.
+
+### Walk-Forward Model Selection
+
+Hyperparameters, threshold, min_dm, and max_price are all selected by a unified walk-forward process:
+
+```
+1. For each hyperparameter combo (243 XGB params × 3 min_dm values):
+   a. Walk-forward train/test across 4 time folds
+   b. Sweep threshold × max_price on each fold's predictions (free, no retraining)
+   c. Average OOS PnL across folds = the combo's score
+2. Pick the combo with best average OOS PnL
+3. Train final model on ALL data with those hyperparams
+4. Deploy
+```
+
+This replaces both the old logloss-based model selection AND the separate ensemble sweep with a single PnL-optimized pipeline.
+
+### Per-Asset Configuration
+
+Each asset gets its own:
+- **Trimmed feature set** (ablation study removes noise features per asset)
+- **XGB hyperparameters** (depth, learning rate, regularization)
+- **min_dm** (minimum decision minute — skip noisy early signals)
+- **threshold** (signal confidence gate)
+- **max_price** (maximum Kalshi price to trade at)
+
+These are all selected by the walk-forward sweep and stored in `config/trading.json`.
+
+---
+
+## Data Sources
+
+```
+data/aggtrades_coinbase/{ASSET}/  — Coinbase tick trades (primary signal source)
+data/aggtrades_kraken/{ASSET}/    — Kraken tick trades (cross-exchange features)
+data/ohlcv_bitstamp/{ASSET}/      — Bitstamp 1-min OHLCV (cross-exchange features)
+data/kalshi_settlements/          — Kalshi settlement outcomes (training labels)
+data/kalshi_polls/                — Kalshi bid/ask polls (kalshi_* features)
+```
+
+### Download Historical Data
+
+```bash
+# Coinbase (tick trades, primary)
+python scripts/fetch_coinbase_trades.py --assets BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --days 60
+
+# Kraken (tick trades, cross-exchange)
+python scripts/fetch_kraken_trades.py --assets BTC,ETH,SOL,XRP,HYPE,BNB --days 60
+
+# Bitstamp (1-min OHLCV, cross-exchange)
+python scripts/fetch_bitstamp_ohlcv.py --assets BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --days 60
+
+# Kalshi settlement outcomes (training labels)
+python scripts/fetch_kalshi_settlements.py --assets BTC,ETH,SOL,XRP,HYPE,BNB,DOGE
+```
+
+### Data Retention
+
+| Setting | Value |
+|---|---|
+| Download window | 60 days |
+| Training window | 45 days |
+| Data purge threshold | 75 days |
+| Kalshi sweep window | 28 days |
 
 ---
 
 ## Running
 
 ```bash
-# Terminal UI manager (recommended) -- launches the bot, monitors state, schedules retrains
-python manager.py                          # Default: BTC,ETH,SOL,XRP,HYPE,BNB,DOGE
-python manager.py --assets BTC,ETH         # Specific assets only
-python manager.py --real                   # Pass --real to bot (per-asset dry_run still applies)
+# Terminal UI manager (recommended)
+python manager.py
 
 # Direct bot (without manager)
 python main.py --assets BTC,ETH,SOL,XRP,HYPE,BNB,DOGE
-
-# Manual retrain (foreground, with progress)
-python scripts/weekly_retrain.py
 ```
 
-Live trading is gated **per-asset** via `config/trading.json` (see Live Trading section below). Setting `REAL_TRADE=TRUE` is no longer required if you're using the per-asset `dry_run: false` config flag.
+The bot connects to:
+- 7 Coinbase WebSockets (primary tick data)
+- 7 Kraken WebSockets (cross-exchange ticks)
+- 7 Bitstamp WebSockets (cross-exchange ticks)
+- 1 Kalshi WebSocket (real-time bid/ask)
+- Kalshi REST poller (JSONL recording for backtesting)
 
-### Manager UI
+### What Happens at Runtime
 
-The terminal UI shows:
+1. **Warmup (90s):** Collect ticks from all 3 exchanges
+2. **Window loop (every 2s):** For each 15-min window, at decision minutes >= per-asset min_dm:
+   - Run LSTM on 180s price bars → `lstm_p`
+   - Run XGB with 51 features + `lstm_p` → final probability
+   - If probability >= threshold (0.75) → BULLISH or BEARISH
+   - Validate price against max_price band
+   - Size position by balance (power-0.67 scaling)
+3. **Settlement loop:** Poll Kalshi outcomes, credit/debit sub-accounts
+4. **Verification loop (live only):** Fetch actual Kalshi settlement revenue, correct any drift
+5. **Reconciliation (every 30m):** Compare live sub-accounts to Kalshi balance
 
-- **Header**: bot status, mode, uptime, asset list
-- **Left column**:
-  1. **Model Retrain** — schedule, last/next retrain, status
-  2. **PnL by Entry Price** — band breakdown (55-65, 65-75, 75-85, 85-95)
-  3. **PnL by Entry DM** — by decision minute
-  4. **Reconciliation** — 3-way ledger/in-memory/Kalshi check (live), 2-way for dry, plus pending verification counts
-- **Right column top**:
-  - **LIVE Trading** table (only renders when at least one asset is live)
-  - **Dry Run** table (always renders, shows all assets in dry mode)
-  - Per-asset rolling WR over last 15 trades (`L15` column), with color coding
-  - Per-asset drift glyph `!` next to PnL when in-memory diverges from ledger by > $0.10
-- **Right column bottom**: Recent Trades panel (merges dry + live, V column shows verification status) and Bot Log
+---
 
-The manager polls `data/account_state.json`, `output/trades.csv`, `output/trades_live.csv`, `data/runtime_state.json`, and `config/trading.json` every second. It does NOT call the Kalshi API directly.
+## Training Pipeline
+
+### Full Pipeline (automated)
+
+```bash
+# Run everything: data gen → LSTM OOF → walk-forward selection
+python scripts/run_full_pipeline.py --assets BTC,ETH,SOL,XRP --days 45 --stacked
+
+# With parallel data gen (requires 64GB+ RAM)
+# Pipeline auto-parallelizes XGB and LSTM data gen across assets
+```
+
+### Pipeline Steps
+
+```
+1. Generate XGB training data     (parallel, 4 assets simultaneously)
+   - Loads Coinbase ticks + Kraken ticks + Bitstamp OHLCV + Kalshi polls
+   - Computes 51 features at each 10s checkpoint
+   - Labels from Kalshi settlement outcomes (CF Benchmarks)
+
+2. Generate LSTM training data    (parallel, 4 assets simultaneously)
+   - 180s sequences at each checkpoint
+   - Same Kalshi settlement labels
+
+3. Generate stacked features      (sequential, GPU-intensive)
+   - 5-fold OOF: train LSTM on 4 folds, predict held-out fold
+   - Avoids data leakage (each lstm_p prediction is out-of-sample)
+   - Produces {ASSET}_features_stacked.csv with lstm_p column
+
+4. Walk-forward full combo sweep  (sequential, CPU-intensive)
+   - 729 XGB hyperparam combos × 3 min_dm values × 4 folds
+   - Each model tested against 12 threshold × max_price combos (free)
+   - Scored by average OOS PnL across folds
+   - Winner's hyperparams used to train final model on ALL data
+   - Config updated with best threshold + max_price + min_dm
+```
+
+### Manual Steps
+
+```bash
+# Download fresh data
+python scripts/fetch_coinbase_trades.py --assets BTC,ETH,SOL,XRP --days 60
+python scripts/fetch_kraken_trades.py --assets BTC,ETH,SOL,XRP --days 60
+python scripts/fetch_bitstamp_ohlcv.py --assets BTC,ETH,SOL,XRP --days 60
+python scripts/fetch_kalshi_settlements.py --assets BTC,ETH,SOL,XRP
+
+# Generate training data only
+python scripts/generate_training_data.py --asset BTC --days 45
+
+# Train XGB only (uses per-asset trimmed features)
+python scripts/train_xgb.py --asset BTC --min-dm 2
+
+# Walk-forward selection only
+python scripts/walk_forward_full.py --asset BTC,ETH,SOL,XRP --n-folds 4
+
+# Feature ablation study
+python scripts/feature_ablation.py --asset BTC,ETH,SOL,XRP --cutoff 2026-04-07
+
+# Generate training report
+python scripts/generate_training_report.py --assets BTC,ETH,SOL,XRP
+```
+
+### Weekly Retrain
+
+The manager triggers retrains on schedule:
+- **Sunday 15:00 UTC** (8 AM PT) → weekday models
+- **Monday 15:00 UTC** (8 AM PT) → weekend models
+
+Retrain trains all assets but only **promotes** (replaces live model) for assets with negative 7-day PnL. Profitable assets keep their existing models. Uses date-tagged model snapshots for rollback.
+
+```bash
+python scripts/weekly_retrain.py                  # Train all, promote negatives only
+python scripts/weekly_retrain.py --promote-all    # Force-promote everything
+python scripts/weekly_retrain.py --pnl-days 14    # Use 14-day PnL window
+```
 
 ---
 
 ## Live Trading
 
-Live mode is opt-in **per asset**. Other assets remain in dry-run with their state unchanged.
+Live mode is opt-in **per asset** via `config/trading.json`.
 
-### Going live (cutover)
-
-```bash
-# 1. Stop the bot first (Ctrl+C in the manager)
-
-# 2. Preview the cutover -- shows what would change without modifying anything
-python scripts/go_live.py SOL XRP --balance 50 --dry-run
-
-# 3. Run for real (interactive 'yes' confirmation)
-python scripts/go_live.py SOL XRP --balance 50
-
-# 4. Manually deposit at least N x balance into your Kalshi account
-#    For SOL+XRP at $50 each: deposit $100 minimum
-
-# 5. Restart the bot
-python manager.py
-```
-
-What `go_live.py` does:
-
-1. **Snapshots** `trades.csv`, `balance.csv`, `account_state.json` to date-tagged archive files (full safety net before any modification)
-2. **Strips** the asset's rows out of `trades.csv` and `balance.csv` -- their pre-cutover history lives only in the archive
-3. **Creates** empty `output/trades_live.csv` and `output/balance_live.csv` with the live schemas
-4. **Resets** the asset's sub-account in `account_state.json` to `balance=$<bal>`, `pnl=$0`, `reserved=$0`
-5. **Edits** `config/trading.json`: sets `"dry_run": false` and `"initial_balance": <bal>` for the asset
-
-After restart, the bot will:
-- Log `LIVE TRADING enabled for SOL` etc.
-- Run `startup_reconcile()` (see below) to verify Kalshi state
-- Start the verification loop for live trades
-
-### Rolling back to dry-run
+### Going Live
 
 ```bash
-# 1. Stop the bot
-
-# 2. Roll back. Default --keep-balance preserves current live balance as the new dry-run starting point
-python scripts/go_dry.py SOL XRP
-
-# Alternative: reset to a fresh balance
-python scripts/go_dry.py SOL XRP --reset --reset-balance 25
-
-# 3. Restart
-python manager.py
+python scripts/go_live.py SOL XRP --balance 50      # Preview + execute
+python scripts/go_live.py SOL XRP --balance 50 --dry-run  # Preview only
 ```
 
-What `go_dry.py` does:
-
-1. **Refuses** if pending verifications exist (use `--force` to override -- not recommended; you may end up with state drift)
-2. **Archives** `trades_live.csv` -> `trades_live_archive_YYYY-MM-DD.csv`, similarly for `balance_live.csv`
-3. **Truncates** the live CSVs to header rows (so any other live assets keep working)
-4. **Updates** `account_state.json`: keeps current balance (default) or resets to fresh
-5. **Edits** `config/trading.json`: sets `dry_run: true` for the asset
-
-**Important:** This script does NOT withdraw money from Kalshi. Your cash stays in your Kalshi account. Withdraw it manually through Kalshi's interface if you want it back in your bank.
-
-### Settlement payout verification (live trades only)
-
-Live trades use a two-phase settlement flow:
-
-1. **Phase 1** (immediately when the outcome arrives): bot computes `expected_revenue = filled * $1.00`, credits the live sub-account immediately so the balance updates fast, marks the trade as needing verification.
-
-2. **Phase 2** (>= 60s later, in `_verification_loop`): bot calls Kalshi `/portfolio/settlements`, finds the matching record by `market_ticker`, extracts the actual revenue Kalshi credited, computes `delta = actual - expected`, applies the delta to the sub-account, marks the trade verified.
-
-Logs on non-zero drift:
-```
-[verify] SOL KXSOL15M-... drift: expected=$10.0000 actual=$9.9800 delta=$-0.0200 -> applied
-```
-
-If Kalshi's settlement record isn't in their history yet, the bot retries every 60s. After 5 minutes, it logs a `STALE` warning once and keeps retrying. Verification is fully **dormant for dry-run trades** -- they're auto-marked verified at settlement time.
-
-### Startup position reconciliation (live mode only)
-
-When the bot starts and at least one asset is live, `startup_reconcile()` runs before any signal processing:
-
-1. **Open positions**: queries `/portfolio/positions`. Should be empty or only the current window's. Anything unexpected (e.g. positions held during downtime) gets logged as a warning.
-2. **Resting orders**: queries `/portfolio/orders?status=resting`. Should always be empty for 15-min markets. Any leftover resting orders (from a crash) are **cancelled automatically**.
-3. **Recent settlements**: queries `/portfolio/settlements?limit=200`. Logs any settlement whose `market_ticker` isn't in the local `trades.csv` (means a trade settled while the bot was down).
-4. **Three-way balance check**: sums all live sub-accounts vs Kalshi balance. Drift > $1 -> warning + pointer to `scripts/reconcile.py --kalshi`.
-
-The script logs everything but does NOT abort startup. False-aborts on transient API errors are worse than running with a known drift you can investigate.
-
-### Ledger reconciliation (`scripts/reconcile.py`)
-
-A standalone read-only script that rebuilds each sub-account's balance from history:
-
-```
-ledger(asset) = initial_balance + sum(pnl from trades.csv) + sum(deposits from deposits_log.csv)
-```
+### Rolling Back
 
 ```bash
-# Basic ledger check (no API calls)
-python scripts/reconcile.py
-
-# Three-way check including live Kalshi balance (live assets only)
-python scripts/reconcile.py --kalshi
+python scripts/go_dry.py SOL XRP                    # Keep current balance
+python scripts/go_dry.py SOL XRP --reset             # Reset to $25
 ```
 
-Output shows per-asset `Initial / +PnL / +Deposits / =Ledger / In-Memory / Diff` with an "L" marker for live assets, separate LIVE total, and exit code:
-- **0** if no drift on live assets (dry-run drift is informational only)
-- **1** if any live asset has drift > $0.50
+### Settlement Verification (live trades only)
 
-### Position sizing in live mode
+Live trades have two-phase settlement:
+1. **Phase 1:** Credit expected revenue immediately (`filled × $1`)
+2. **Phase 2:** Verify against Kalshi `/portfolio/settlements`, apply any drift
 
-**Identical to dry-run.** Same power-0.67 scaling formula for both modes:
+### Ledger Reconciliation
+
+```bash
+python scripts/reconcile.py                          # Ledger vs in-memory check
+python scripts/reconcile.py --kalshi                 # 3-way check including Kalshi balance
+```
+
+### Position Sizing
 
 ```python
 max_contracts = base * (current_balance / initial_balance) ** 0.67
 ```
 
-Capped at `MAX_CONTRACTS_CAP = 500`. Example with `max_contracts_per_trade=10`:
+Capped at 500 contracts. Hot-reloadable via config.
 
-| Balance | Ratio | Max contracts |
-|---:|---:|---:|
-| $50  | 1.0x  | 10 |
-| $100 | 2.0x  | 15 |
-| $200 | 4.0x  | 25 |
-| $400 | 8.0x  | 40 |
-| $1,000 | 20x | 73 |
-| $5,000 | 100x | 215 |
+### Circuit Breaker
 
-The actual per-trade size is the minimum of: `max_contracts_per_trade`, `available_balance / cost_per_contract`, and `score-scaled affordability`. At small balances ($25-$50), the per-asset cap is the binding constraint.
-
-`config/trading.json` is hot-reloaded at each window boundary, so you can tune `max_contracts_per_trade` mid-session without restarting.
-
-### Circuit breaker
-
-When a sub-account drops 40% from its session peak balance, the circuit breaker trips and pauses trading for that asset for ~1 hour. Live and dry-run breakers are tracked independently (live breaker only fires on real losses). The breaker resets when:
-
-- 1 hour of pause time elapses
-- A deposit is applied via `add_balance.py`
-- The bot restarts (session_peak_balance resets)
-
-### Manager UI in live mode
-
-When at least one asset has `dry_run: false`, the manager UI changes:
-
-- **Account Balance** splits into stacked **LIVE Trading** and **Dry Run** tables
-- **Reconciliation panel** shows the live 3-way check (Ledger / In-Memory / Kalshi) and dry 2-way (Ledger / In-Memory) plus pending verification counts
-- **Recent Trades V column**: `+` (green) for verified, `.` (yellow) for pending, blank for dry trades
-- **Per-asset drift glyph `!`** next to PnL when in-memory balance diverges from ledger by more than $0.10
-- Border color of the Reconciliation panel reflects severity (green/yellow/red)
-
-The manager reads `data/runtime_state.json` (published by the bot's reconciliation and verification loops) for Kalshi balance and verification stats. The manager itself never calls the Kalshi API.
-
-### Adding balance mid-session
-
-```bash
-python scripts/add_balance.py SOL 25      # Queue a $25 deposit to SOL
-```
-
-This writes to `data/deposits.json`. The bot polls this queue at each 15-minute window boundary, applies the deposit to the sub-account, resets the circuit breaker for that asset, and appends a row to `data/deposits_log.csv` (used by `reconcile.py`).
-
-The bot's `_process_deposits()` runs in the window loop, so a queued deposit takes effect within 15 minutes. Direct edits to `account_state.json` while the bot is running will be overwritten -- use the deposit queue instead.
-
----
-
-## Output Files
-
-| File | Description |
-|------|-------------|
-| `output/trades.csv` | Dry-run trade audit trail (entry, settlement, PnL) |
-| `output/trades_live.csv` | Live trade audit trail (richer schema with order_id, fill_price, fees, expected/verified revenue, settlement_verified, verified_at) |
-| `output/balance.csv` | Dry-run balance snapshots |
-| `output/balance_live.csv` | Live balance snapshots |
-| `output/signal_log.csv` | Every ensemble decision (ml_p, fusion_p, action, etc.) |
-| `output/trades_archive_YYYY-MM-DD.csv` | Pre-cutover snapshot (created by `go_live.py`) |
-| `output/trades_live_archive_YYYY-MM-DD.csv` | Pre-rollback snapshot (created by `go_dry.py`) |
-| `data/account_state.json` | All sub-account balances (live + dry mixed in one file) |
-| `data/runtime_state.json` | Bot-published reconciliation + verification stats (read by manager UI) |
-| `data/deposits.json` | Pending deposit queue |
-| `data/deposits_log.csv` | Applied deposit history (used by `reconcile.py`) |
-| `data/aggtrades/{ASSET}/` | Coinbase historical trade CSVs (training data, auto-pruned >45 days by retrain) |
-| `data/kalshi_polls/` | Kalshi bid/ask polls + outcomes (auto-pruned >45 days by retrain) |
-| `logs/trading.log` | Bot runtime log (10 MB rotation, 7-day retention) |
-| `logs/weekly_retrain.log` | Retrain pipeline log |
-
----
-
-## Pipeline Overview
-
-```
-1. Download           fetch_coinbase_trades.py        (Coinbase, 30 days)
-2. Generate XGB Data  generate_training_data.py       (37 v9 features)
-3. Train XGBoost      train_xgb.py                    (per-asset, dm 2+)
-4. Generate LSTM Data generate_lstm_training_data.py  (180s sequences)
-5. Train LSTM         train_lstm.py                   (Conv1D + BiLSTM, sequential)
-6. Ensemble Sweep     ensemble_combo_sweep.py         (writes config/trading.json)
-```
-
-The retrain pipeline runs weekly via the manager (Sunday/Monday 15:00 UTC = 8 AM PT). It also retrains weekday and weekend variants of all models.
-
----
-
-## Automated Retrain
-
-Models are retrained weekly on a schedule. The live bot **hot-reloads** new models and config at the next 15-minute window boundary -- no restart required.
-
-### Schedule
-
-The manager monitors the clock and triggers:
-- **Sunday 15:00 UTC** (8 AM PT) -> retrain weekday models
-- **Monday 15:00 UTC** (8 AM PT) -> retrain weekend models
-
-The "all" path runs all 3 model variants (standard, weekday, weekend) sequentially.
-
-### Selective replacement (default)
-
-By default, weekly retrain trains **all assets** but only **promotes** (replaces the live model file + re-sweeps the config) for assets with **negative PnL** over the last 7 days. Profitable assets keep their existing models and configs untouched.
-
-```bash
-python scripts/weekly_retrain.py                  # Train all, promote negatives only
-python scripts/weekly_retrain.py --promote-all    # Force-promote everything
-python scripts/weekly_retrain.py --pnl-days 14    # Use 14-day PnL window instead of 7
-```
-
-Newly trained models are saved with a date-tagged suffix (e.g. `BTC_2026-04-08_xgb.json`). Promoted models get copied to the live path (`BTC_xgb.json`). Un-promoted dated files are kept as snapshots/rollback targets.
-
-### Pipeline steps
-
-1. **Download Coinbase trades** -- 30 days, 7 assets, ~7 GB total
-2. **Generate XGB training data** -- 37-feature CSVs per asset
-3. **Train XGB models (date-tagged)** -- walk-forward validation
-4. **Generate LSTM training data** -- 180s tick sequences
-5. **Train LSTM models (date-tagged, sequential)** -- Conv1D + BiLSTM, GPU-accelerated, run one at a time to avoid memory crashes
-6. **Train weekday variants** (all 4 steps with `--day-filter weekday --model-suffix _weekday_<date>`)
-7. **Train weekend variants** (same with `--day-filter weekend --model-suffix _weekend_<date>`)
-8. **Purge old data** -- aggTrade CSVs and Kalshi polls > 45 days
-9. **Filter by PnL** -- compute negative-PnL asset list from `output/trades.csv`
-10. **Promote** -- copy date-tagged files to live paths for negative-PnL assets only
-11. **Ensemble combo sweep (promoted only)** -- runs `ensemble_combo_sweep.py --kalshi-days 14` for the promoted set, writes new params to `config/trading.json`
-
-The bot picks up new models at the next window boundary via mtime tracking. Both XGB and LSTM hot-reload independently.
-
-### Manual retrain
-
-```bash
-python scripts/weekly_retrain.py                          # Default: all assets, all variants
-python scripts/weekly_retrain.py --skip-download          # Reuse existing data
-python scripts/weekly_retrain.py --assets BTC,ETH         # Subset
-python scripts/weekly_retrain.py --day-type weekday       # Just weekday models (Sunday flow)
-python scripts/weekly_retrain.py --day-type weekend       # Just weekend models (Monday flow)
-```
-
-Retrain logs are streamed to `logs/weekly_retrain.log` and (if a Telegram bot is configured) Telegram notifications are sent on completion.
-
-### Subprocess priority
-
-Weekly retrain spawns training subprocesses with `BELOW_NORMAL_PRIORITY_CLASS` on Windows so the live bot's window loops aren't starved when retrain is running.
+40% drawdown from session peak → pause trading for 1 hour. Resets on deposit or bot restart.
 
 ---
 
@@ -331,52 +277,51 @@ Weekly retrain spawns training subprocesses with `BELOW_NORMAL_PRIORITY_CLASS` o
 
 ### config/trading.json
 
-Per-asset trading parameters. Updated automatically by `ensemble_combo_sweep.py`. Hot-reloaded at each window boundary.
-
 ```json
 {
   "defaults": {
     "initial_balance": 25.0,
     "max_contracts_per_trade": 10,
     "max_price_cents": 80,
-    "min_price_cents": 60,
-    "require_confirm": false,
-    "blocked_dms": []
+    "min_price_cents": 55
   },
   "assets": {
-    "SOL": {
-      "initial_balance": 50.0,
+    "BTC": {
+      "initial_balance": 25.0,
       "max_contracts_per_trade": 10,
       "max_price_cents": 80,
-      "min_price_cents": 60,
-      "dry_run": false,
+      "min_price_cents": 55,
       "ensemble": {
-        "ml_weight": 0.20,
-        "threshold": 0.58,
-        "max_price_cents": 80
-      },
-      "ensemble_weekday": { "ml_weight": 0.30, "threshold": 0.70, "max_price_cents": 75 },
-      "ensemble_weekend": { "ml_weight": 0.20, "threshold": 0.65, "max_price_cents": 75 }
+        "ml_weight": 0.1,
+        "threshold": 0.75,
+        "max_price_cents": 80,
+        "min_dm": 3,
+        "walk_forward_pnl": 247.98,
+        "walk_forward_wr": 83.4
+      }
     }
   }
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `defaults.initial_balance` | Default starting balance for any asset not in `assets` |
-| `defaults.require_confirm` | Require 2 consecutive checkpoint signals to agree before entry (consensus mode) |
-| `defaults.blocked_dms` | List of decision minutes to skip globally (e.g. `[4, 5]`) |
-| `assets.{ASSET}.initial_balance` | Per-asset starting balance |
-| `assets.{ASSET}.max_contracts_per_trade` | Per-asset position size cap (base, before power-0.67 scaling) |
-| `assets.{ASSET}.max_price_cents` | Per-asset YES ceiling (skip if ask > this) |
-| `assets.{ASSET}.min_price_cents` | Per-asset NO floor (skip if ask < this) |
-| `assets.{ASSET}.dry_run` | **Per-asset live/dry override**. `false` enables real Kalshi orders. Set by `go_live.py` / `go_dry.py`. |
-| `assets.{ASSET}.ensemble` | Standard model params (ml_weight, threshold, max_price_cents) |
-| `assets.{ASSET}.ensemble_weekday` | Weekday variant params, used Mon-Fri |
-| `assets.{ASSET}.ensemble_weekend` | Weekend variant params, used Sat-Sun |
+All config values are hot-reloaded at each 15-minute window boundary (no restart needed for config changes).
 
-The **most restrictive `max_price_cents`** across all relevant ensemble blocks is the one applied to execution.
+---
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `output/trades.csv` | Dry-run trade audit trail |
+| `output/trades_live.csv` | Live trade audit trail (richer schema) |
+| `output/balance.csv` / `balance_live.csv` | Balance history |
+| `output/signal_log.csv` | Every ensemble decision |
+| `output/training_reports/` | Timestamped training reports |
+| `data/account_state.json` | Sub-account balances |
+| `data/runtime_state.json` | Bot-published reconciliation stats |
+| `data/deposits.json` | Pending deposit queue |
+| `data/deposits_log.csv` | Applied deposit history |
+| `logs/trading.log` | Bot runtime log (10 MB rotation) |
 
 ---
 
@@ -384,145 +329,104 @@ The **most restrictive `max_price_cents`** across all relevant ensemble blocks i
 
 ```
 .
-|-- main.py                                Entry point (loads config, starts strategy)
-|-- manager.py                             Terminal UI manager (launches bot, schedules retrains)
-|-- config/trading.json                    Per-asset config + ensemble params
-|
-|-- strategies/kalshi_strategy.py          Multi-asset strategy with verification + reconciliation loops
-|-- execution/kalshi_execution.py          TradeRecord, execute_trade, settle_window, verify_settlement
-|
-|-- sdk/kalshi/                            Portable Kalshi SDK
-|   |-- client.py                          API client + rate limiter (get_balance, get_positions, get_orders, etc.)
-|   |-- auth.py                            RSA-PSS request signing
-|   |-- orders.py                          Order helpers + settlement lookup + position helpers
-|   |-- markets.py                         Market lookup + outcome fetch
-|   |-- account.py                         Local virtual sub-account management
-|   +-- ticker.py                          Asset -> series mapping (KXSOL15M etc.)
-|
-|-- core/strategy_brain/
-|   |-- signal_processors/                 ML, spike, velocity, sentiment, kalshi price processors
-|   +-- fusion_engine/                     Multi-signal fusion engine
-|
-|-- data_sources/coinbase/
-|   +-- websocket.py                       Coinbase Exchange WebSocket (live tick stream)
-|
-|-- ml/
-|   |-- features.py                        v9 feature extraction (37 features, shared training + inference)
-|   |-- lstm_features.py                   LSTM 21-feature extraction
-|   +-- training_data/                     Generated feature CSVs and LSTM .npz files
-|
-|-- models/                                Saved XGB / LSTM models per asset (and weekday/weekend variants)
-|
-|-- backtester/                            Window-based backtesting infrastructure
-|
-|-- scripts/
-|   |-- fetch_coinbase_trades.py           Download Coinbase historical trades for training
-|   |-- generate_training_data.py          Replay ticks -> XGB feature CSVs
-|   |-- train_xgb.py                       Train per-asset XGBoost
-|   |-- generate_lstm_training_data.py     Replay ticks -> LSTM .npz sequences
-|   |-- train_lstm.py                      Train per-asset LSTM (sequential to avoid memory crashes)
-|   |-- ensemble_combo_sweep.py            Sweep ml_weight x threshold x max_price, write config
-|   |-- weekly_retrain.py                  Full retrain pipeline (date-tagged + selective promotion)
-|   |
-|   |-- go_live.py                         Cutover script: dry -> live for specified assets
-|   |-- go_dry.py                          Rollback script: live -> dry
-|   |-- reconcile.py                       Read-only ledger check (with optional --kalshi 3-way)
-|   |-- add_balance.py                     Queue a deposit to a sub-account
-|   +-- backtest_ticks.py                  Standalone backtester
-|
-|-- data/
-|   |-- aggtrades/                         Coinbase tick CSVs (training data)
-|   |-- kalshi_polls/                      Kalshi bid/ask + outcome JSONLs (sweep input)
-|   |-- account_state.json                 All sub-account balances (live + dry, single file)
-|   |-- runtime_state.json                 Bot-published reconciliation + verification stats
-|   |-- deposits.json                      Pending deposit queue
-|   +-- deposits_log.csv                   Applied deposit audit trail
-|
-|-- output/
-|   |-- trades.csv                         Dry-run trade log
-|   |-- trades_live.csv                    Live trade log (richer schema)
-|   |-- balance.csv / balance_live.csv     Balance history per mode
-|   |-- signal_log.csv                     Pre-execution signal log
-|   |-- *_archive_YYYY-MM-DD.*             Cutover/rollback snapshots
-|   +-- ensemble_combo_sweep/              Sweep results
-|
-+-- logs/
-    |-- trading.log                        Bot runtime log
-    +-- weekly_retrain.log                 Retrain pipeline log
+├── main.py                              Entry point
+├── manager.py                           Terminal UI + retrain scheduler
+├── config/trading.json                  Per-asset config (hot-reloadable)
+│
+├── strategies/kalshi_strategy.py        Strategy: stacked ensemble + multi-exchange WS
+├── execution/kalshi_execution.py        Trade execution + settlement verification
+│
+├── sdk/kalshi/                          Portable Kalshi SDK
+│   ├── client.py                        API client + rate limiter
+│   ├── auth.py                          RSA-PSS signing
+│   ├── orders.py                        Orders + settlements + positions
+│   ├── markets.py                       Market lookup + outcomes
+│   ├── account.py                       Sub-account management
+│   └── ticker.py                        Asset → series mapping
+│
+├── core/strategy_brain/
+│   └── signal_processors/
+│       ├── ml_processor.py              XGB inference (per-asset trimmed features)
+│       ├── lstm_processor.py            LSTM inference
+│       └── ...                          Tick velocity, spike detection, etc.
+│
+├── data_sources/
+│   ├── coinbase/websocket.py            Coinbase WS (primary ticks)
+│   ├── kraken/websocket.py              Kraken WS (cross-exchange)
+│   └── bitstamp/websocket.py            Bitstamp WS (cross-exchange)
+│
+├── ml/
+│   ├── features.py                      51-feature extraction (v11)
+│   ├── kalshi_features.py               Kalshi poll index + event ticker mapping
+│   ├── multi_exchange.py                Kraken tick index + Bitstamp OHLCV index
+│   ├── lstm_features.py                 LSTM sequence extraction
+│   └── lstm_model.py                    PriceLSTM architecture
+│
+├── scripts/
+│   ├── run_full_pipeline.py             Full pipeline: data gen → OOF → walk-forward
+│   ├── generate_training_data.py        XGB features (multi-exchange + Kalshi labels)
+│   ├── generate_lstm_training_data.py   LSTM sequences
+│   ├── generate_stacked_features.py     OOF LSTM predictions for stacking
+│   ├── walk_forward_full.py             Walk-forward hyperparameter + execution param sweep
+│   ├── walk_forward_select.py           Walk-forward hyperparameter sweep
+│   ├── train_xgb.py                     XGB training (per-asset trimmed features)
+│   ├── train_lstm.py                    LSTM training
+│   ├── weekly_retrain.py                Automated retrain pipeline
+│   ├── feature_ablation.py              Feature group ablation study
+│   ├── feature_trim_perasset.py         Per-asset greedy feature trimming
+│   ├── hyperparam_tune.py               Hyperparameter grid search
+│   ├── fetch_coinbase_trades.py         Download Coinbase historical trades
+│   ├── fetch_kraken_trades.py           Download Kraken historical trades
+│   ├── fetch_bitstamp_ohlcv.py          Download Bitstamp 1-min OHLCV
+│   ├── fetch_kalshi_settlements.py      Download Kalshi settlement outcomes
+│   ├── signal_analysis.py               Signal pattern analysis
+│   ├── reconcile.py                     Ledger reconciliation
+│   ├── generate_training_report.py      Training report generator
+│   ├── go_live.py                       Cutover: dry → live
+│   ├── go_dry.py                        Rollback: live → dry
+│   └── add_balance.py                   Queue mid-session deposits
+│
+├── models/                              XGB + LSTM models per asset
+├── data/                                Tick data, polls, settlements, state
+├── output/                              Trades, balance, signals, reports
+└── logs/                                Runtime logs
 ```
 
 ---
 
-## Quick Start (full pipeline from scratch)
+## Common Operations
 
 ```bash
-# 1. Install
-pip install -r requirements.txt
-
-# 2. Configure Kalshi credentials
-#    - Place .pem private key at the path referenced in sdk/kalshi/client.py load_config()
-#    - Set KALSHI_API_KEY_ID environment variable
-
-# 3. Download 30 days of Coinbase tick data for all assets
-python scripts/fetch_coinbase_trades.py --assets BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --days 30
-
-# 4. Generate training features
-python scripts/generate_training_data.py --asset BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --days 30
-python scripts/generate_lstm_training_data.py --asset BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --days 30
-
-# 5. Train models (XGB + LSTM)
-python scripts/train_xgb.py --asset BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --min-dm 2
-for ASSET in BTC ETH SOL XRP HYPE BNB DOGE; do
-    python scripts/train_lstm.py --asset $ASSET --min-dm 2
-done
-
-# 6. Sweep ensemble params (writes config/trading.json)
-python scripts/ensemble_combo_sweep.py --asset BTC,ETH,SOL,XRP,HYPE,BNB,DOGE --kalshi-days 14
-
-# 7. Run the bot in dry-run mode (default for all assets)
+# Watch the bot
 python manager.py
 
-# 8. (Optional, when ready) Promote specific assets to live
-python scripts/go_live.py SOL XRP --balance 50
-python manager.py     # Restart, will detect live config
-```
-
----
-
-## Common operations cheat-sheet
-
-```bash
-# Watch the bot in the terminal UI
-python manager.py
-
-# Run a one-off ledger check
+# Check ledger reconciliation
 python scripts/reconcile.py
-python scripts/reconcile.py --kalshi    # 3-way (live assets only)
 
-# Add money to a sub-account mid-session
+# Add money to an asset mid-session
 python scripts/add_balance.py SOL 25
 
-# Manual retrain right now
-python scripts/weekly_retrain.py
-python scripts/weekly_retrain.py --skip-download    # If aggTrade data is fresh
-python scripts/weekly_retrain.py --promote-all      # Force-promote all retrained models
+# Run the full training pipeline
+python scripts/run_full_pipeline.py --assets BTC,ETH,SOL,XRP --days 45 --stacked
 
-# Promote SOL+XRP to live with $50 each
-python scripts/go_live.py SOL XRP --balance 50 --dry-run    # Preview
-python scripts/go_live.py SOL XRP --balance 50              # Execute
+# Generate a training report
+python scripts/generate_training_report.py
 
-# Roll SOL back to dry, keeping current live balance
-python scripts/go_dry.py SOL
+# Download all exchange data
+python scripts/fetch_coinbase_trades.py --assets BTC,ETH,SOL,XRP --days 60
+python scripts/fetch_kraken_trades.py --assets BTC,ETH,SOL,XRP --days 60
+python scripts/fetch_bitstamp_ohlcv.py --assets BTC,ETH,SOL,XRP --days 60
+python scripts/fetch_kalshi_settlements.py
 
-# Roll back, resetting to fresh $25
-python scripts/go_dry.py SOL --reset --reset-balance 25
+# Promote to live trading
+python scripts/go_live.py SOL XRP --balance 50
 
-# Inspect runtime state (manager reads this)
-cat data/runtime_state.json
+# Roll back to dry-run
+python scripts/go_dry.py SOL XRP
 ```
 
 ---
 
 ## Disclaimer
 
-This software is for educational and research purposes. Trading binary options carries significant risk. Past backtest performance does not guarantee future results. Always start in dry-run mode and validate the strategy for at least 1-2 weeks before committing real money.
+This software is for educational and research purposes. Trading binary options carries significant risk. Past backtest performance does not guarantee future results. Always start in dry-run mode and validate the strategy thoroughly before committing real money.
