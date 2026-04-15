@@ -1674,22 +1674,12 @@ class KalshiMultiAssetStrategy:
                 )
                 return
 
-        # Circuit breaker: pause asset if balance drops 40% from session peak, auto-reset after 1 hour
-        if state.circuit_open:
-            elapsed_since_trip = (datetime.now(tz=timezone.utc) - state.circuit_tripped_at).total_seconds()
-            if elapsed_since_trip >= 3600:
-                logger.info("[%s] Circuit breaker auto-reset after 1 hour", asset)
-                state.circuit_open = False
-                state.circuit_tripped_at = None
-                # Peak was already reset when breaker tripped
-            else:
-                mins_left = (3600 - elapsed_since_trip) / 60
-                if not hasattr(self, '_last_cb_log') or self._last_cb_log.get(asset) != window_id:
-                    if not hasattr(self, '_last_cb_log'):
-                        self._last_cb_log = {}
-                    self._last_cb_log[asset] = window_id
-                    logger.warning("[%s] Circuit breaker open (40%% drawdown), %.0f min until reset", asset, mins_left)
-                return
+        # Circuit breaker: DISABLED (backtest showed it costs ~$1/day by missing
+        # bounce-back trades after temporary bad streaks. With 80%+ WR, drawdowns
+        # self-correct within a few trades. Kept as dead code for potential re-enable.
+        # if state.circuit_open:
+        #     ...
+        #     return
 
         # Blackout window check: skip trading during configured UTC hours
         if self._in_blackout():
