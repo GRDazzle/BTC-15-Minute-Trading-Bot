@@ -45,30 +45,61 @@ def main():
 
     python = sys.executable
     pipeline_start = time.time()
+    asset_list = [a.strip() for a in args.assets.split(",")]
 
-    # Step 1: Generate XGB training data for each asset sequentially
-    for asset in args.assets.split(","):
-        asset = asset.strip()
-        ok = run_step(
-            f"Generate XGB training data: {asset}",
+    # Step 1: Generate XGB training data — parallel (one process per asset)
+    print(f"\n{'='*70}")
+    print(f"  STEP: Generate XGB training data (parallel, {len(asset_list)} assets)")
+    print(f"{'='*70}")
+    start = time.time()
+    procs = []
+    for asset in asset_list:
+        p = subprocess.Popen(
             [python, "scripts/generate_training_data.py",
              "--asset", asset, "--days", str(args.days)],
+            cwd=str(PROJECT_ROOT),
         )
-        if not ok:
-            print(f"ABORT: XGB data generation failed for {asset}")
-            return 1
+        procs.append((asset, p))
+        print(f"  Started {asset} (PID {p.pid})")
+
+    # Wait for all to complete
+    failed_assets = []
+    for asset, p in procs:
+        rc = p.wait()
+        if rc != 0:
+            print(f"  {asset} FAILED (exit {rc})")
+            failed_assets.append(asset)
+        else:
+            print(f"  {asset} OK")
+    elapsed = time.time() - start
+    print(f"  All XGB data gen done ({elapsed:.0f}s)")
+    if failed_assets:
+        print(f"  ABORT: XGB data gen failed for {failed_assets}")
+        return 1
 
     if args.stacked:
-        # Step 2: Generate LSTM training data
-        for asset in args.assets.split(","):
-            asset = asset.strip()
-            ok = run_step(
-                f"Generate LSTM training data: {asset}",
+        # Step 2: Generate LSTM training data — parallel
+        print(f"\n{'='*70}")
+        print(f"  STEP: Generate LSTM training data (parallel, {len(asset_list)} assets)")
+        print(f"{'='*70}")
+        start = time.time()
+        procs = []
+        for asset in asset_list:
+            p = subprocess.Popen(
                 [python, "scripts/generate_lstm_training_data.py",
                  "--asset", asset, "--days", str(args.days)],
+                cwd=str(PROJECT_ROOT),
             )
-            if not ok:
-                print(f"WARNING: LSTM data gen failed for {asset}, stacking will use defaults")
+            procs.append((asset, p))
+            print(f"  Started {asset} (PID {p.pid})")
+
+        for asset, p in procs:
+            rc = p.wait()
+            if rc != 0:
+                print(f"  WARNING: LSTM data gen failed for {asset}")
+            else:
+                print(f"  {asset} OK")
+        print(f"  All LSTM data gen done ({time.time() - start:.0f}s)")
 
         # Step 3: Generate out-of-fold LSTM predictions -> stacked CSVs
         ok = run_step(
