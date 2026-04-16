@@ -255,7 +255,11 @@ def run_full_sweep(assets, n_folds=4):
                         avg_wr = sum(fold_wrs) / len(fold_wrs)
                         avg_trades = sum(fold_trades) / len(fold_trades)
 
-                        if avg_pnl > best_score and len(fold_pnls) >= len(folds) // 2:
+                        # Require profitable in ALL folds — not just high average
+                        all_positive = all(p > 0 for p in fold_pnls)
+                        if (all_positive
+                                and avg_pnl > best_score
+                                and len(fold_pnls) >= len(folds)):
                             best_score = avg_pnl
                             best_config = {
                                 **{k: xgb_params[k] for k in xgb_keys},
@@ -263,9 +267,11 @@ def run_full_sweep(assets, n_folds=4):
                                 "threshold": threshold,
                                 "max_price": max_price,
                                 "avg_pnl": round(avg_pnl, 2),
+                                "min_fold_pnl": round(min(fold_pnls), 2),
                                 "avg_wr": round(avg_wr, 1),
                                 "avg_trades": round(avg_trades, 1),
                                 "n_valid_folds": len(fold_pnls),
+                                "fold_pnls": [round(p, 2) for p in fold_pnls],
                             }
 
                 n_done += 1
