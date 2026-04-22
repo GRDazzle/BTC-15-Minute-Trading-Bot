@@ -245,13 +245,25 @@ def _build_balance_table(title, account_state, trades, asset_filter, ledger):
     if not rows:
         return None
 
+    # Load allowed hours from config for display
+    try:
+        with open(CONFIG_JSON, "r") as _cf:
+            _cfg = json.load(_cf)
+        _allowed_hours_map = {
+            a: _cfg.get("assets", {}).get(a, {}).get("ensemble", {}).get("allowed_hours", [])
+            for a in _cfg.get("assets", {})
+        }
+    except Exception:
+        _allowed_hours_map = {}
+
     table = Table(title=title, expand=True)
-    table.add_column("Asset", style="cyan", width=8)
-    table.add_column("Balance", justify="right", width=11)
-    table.add_column("PnL", justify="right", width=11)
-    table.add_column("Trades", justify="right", width=7)
-    table.add_column("WR All", justify="right", width=7)
-    table.add_column("WR L15", justify="right", width=7)
+    table.add_column("Asset", style="cyan", width=6)
+    table.add_column("Balance", justify="right", width=10)
+    table.add_column("PnL", justify="right", width=10)
+    table.add_column("Trades", justify="right", width=6)
+    table.add_column("WR", justify="right", width=5)
+    table.add_column("L15", justify="right", width=5)
+    table.add_column("Active Hours (UTC)", width=28)
 
     total_bal = 0.0
     total_pnl = 0.0
@@ -289,6 +301,22 @@ def _build_balance_table(title, account_state, trades, asset_filter, ledger):
             drift_marker = " [yellow]![/]"
 
         pnl_style = "green" if pnl >= 0 else "red"
+
+        # Format allowed hours for display
+        ah = _allowed_hours_map.get(asset, [])
+        current_utc_hour = datetime.now(timezone.utc).hour
+        if ah:
+            # Highlight current hour if active
+            parts = []
+            for h in sorted(ah):
+                if h == current_utc_hour:
+                    parts.append(f"[bold green]{h}[/]")
+                else:
+                    parts.append(str(h))
+            hours_str = ",".join(parts)
+        else:
+            hours_str = "[dim]all[/]"
+
         table.add_row(
             asset,
             f"${bal:.2f}",
@@ -296,6 +324,7 @@ def _build_balance_table(title, account_state, trades, asset_filter, ledger):
             str(count),
             wr,
             wr_l15,
+            hours_str,
         )
 
     total_wr = f"{total_wins/total_count*100:.0f}%" if total_count > 0 else "--"

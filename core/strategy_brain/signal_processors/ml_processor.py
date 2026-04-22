@@ -6,7 +6,9 @@ plus rule-based processor (SpikeDetector, TickVelocity) outputs as inputs.
 
 Trains separately per asset -- each asset loads its own model file.
 """
+import json as _json
 import logging
+import os as _os
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +27,33 @@ from core.strategy_brain.signal_processors.tick_velocity_processor import TickVe
 from ml.features import FEATURE_NAMES, extract_features
 
 logger = logging.getLogger(__name__)
+
+# Diagnostic: dump feature vector + xgb output on every inference call.
+# Set XGB_DUMP_FEATURES=1 to enable.
+_FEATURE_DUMP_ENABLED = _os.environ.get("XGB_DUMP_FEATURES", "") == "1"
+_FEATURE_DUMP_DIR = Path("logs/xgb_feature_dumps")
+
+
+def _dump_xgb_features(asset: str, feats: dict, feature_order: list,
+                       p_bullish: float, eval_ts: datetime, dm: int):
+    """Append one JSONL record: feature vector + xgb output for offline audit."""
+    if not _FEATURE_DUMP_ENABLED:
+        return
+    try:
+        _FEATURE_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        date_str = eval_ts.strftime("%Y-%m-%d")
+        out = _FEATURE_DUMP_DIR / f"{asset.upper()}_{date_str}.jsonl"
+        rec = {
+            "asset": asset.upper(),
+            "eval_ts": eval_ts.isoformat(),
+            "dm": int(dm) if dm is not None else None,
+            "p_bullish": float(p_bullish),
+            "features": {fn: float(feats.get(fn, 0.0)) for fn in feature_order},
+        }
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec) + "\n")
+    except Exception:
+        pass  # never break inference due to dump issues
 
 
 class MLProcessor(BaseSignalProcessor):
@@ -151,14 +180,8 @@ class MLProcessor(BaseSignalProcessor):
             kraken_current_price=metadata.get("kraken_current_price"),
             bitstamp_tick_buffer=metadata.get("bitstamp_tick_buffer"),
             bitstamp_current_price=metadata.get("bitstamp_current_price"),
+            kalshi_poll_history=metadata.get("kalshi_poll_history"),
         )
-
-        # Inject stacked LSTM prediction if available (passed via metadata)
-        lstm_p = metadata.get("lstm_p")
-        if lstm_p is not None:
-            feats["lstm_p"] = float(lstm_p)
-        else:
-            feats["lstm_p"] = 0.5  # neutral default
 
         # Build feature vector in correct order (per-asset trimmed list)
         X = [[feats.get(name, 0.0) for name in self._feature_names]]
@@ -167,6 +190,11 @@ class MLProcessor(BaseSignalProcessor):
         proba = self.model.predict_proba(X)[0]
         # proba[0] = P(BEARISH), proba[1] = P(BULLISH)
         p_bullish = proba[1]
+
+        # Diagnostic dump (gated by XGB_DUMP_FEATURES=1)
+        _dump_xgb_features(self.asset, feats, self._feature_names,
+                           float(p_bullish), datetime.now(timezone.utc),
+                           metadata.get("decision_minute"))
 
         # Decision
         if p_bullish >= self.confidence_threshold:
@@ -276,6 +304,7 @@ class MLProcessor(BaseSignalProcessor):
             kraken_current_price=metadata.get("kraken_current_price"),
             bitstamp_tick_buffer=metadata.get("bitstamp_tick_buffer"),
             bitstamp_current_price=metadata.get("bitstamp_current_price"),
+            kalshi_poll_history=metadata.get("kalshi_poll_history"),
         )
 
         # Inject stacked LSTM prediction if available
@@ -288,4 +317,8 @@ class MLProcessor(BaseSignalProcessor):
         X = [[feats.get(name, 0.0) for name in self._feature_names]]
 
         proba = self.model.predict_proba(X)[0]
-        return float(proba[1])  # P(BULLISH)
+        p_bullish = float(proba[1])
+        _dump_xgb_features(self.asset, feats, self._feature_names,
+                           p_bullish, datetime.now(timezone.utc),
+                           metadata.get("decision_minute"))
+        return p_bullish  # P(BULLISH)

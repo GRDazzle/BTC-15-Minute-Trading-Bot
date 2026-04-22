@@ -164,6 +164,7 @@ class KalshiExecutionAdapter:
         confidence: float,
         score: float,
         market_info: dict[str, Any],
+        contracts_override: Optional[int] = None,
     ) -> Optional[TradeRecord]:
         """Execute a trade based on fused signal output.
 
@@ -173,6 +174,8 @@ class KalshiExecutionAdapter:
             confidence: 0.0-1.0
             score: 0-100 consensus score
             market_info: dict from fetch_current_market()
+            contracts_override: If set (by RL agent), use this exact contract count
+                instead of Kelly/power scaling. Still capped by balance check.
 
         Returns:
             TradeRecord on success, None if trade was skipped.
@@ -188,9 +191,13 @@ class KalshiExecutionAdapter:
         series = series_for_asset(asset)
         account_name = series  # sub-account per series
 
-        count = self._calculate_contracts(
-            account_name, price_cents, confidence, score, asset=asset,
-        )
+        if contracts_override is not None:
+            # RL decided the size — still need to cap by balance
+            count = self._cap_contracts_by_balance(account_name, price_cents, contracts_override)
+        else:
+            count = self._calculate_contracts(
+                account_name, price_cents, confidence, score, asset=asset,
+            )
         if count < 1:
             logger.info("[kalshi-exec] Insufficient funds or score for %s", asset)
             return None
@@ -475,6 +482,20 @@ class KalshiExecutionAdapter:
         scale = min(1.0, confidence * (score / 100.0))
         desired = max(1, int(max_by_balance * scale))
         return min(desired, max_contracts)
+
+    def _cap_contracts_by_balance(
+        self, account_name: str, price_cents: int, desired: int,
+    ) -> int:
+        """Cap contract count by available balance (used for RL override)."""
+        try:
+            available = self.account_manager.available(account_name)
+        except Exception:
+            available = 0.0
+        cost_per_contract = price_cents / 100.0 + KALSHI_FEE_CENTS / 100.0
+        if cost_per_contract <= 0:
+            return 0
+        max_by_balance = int(available / cost_per_contract)
+        return max(0, min(desired, max_by_balance))
 
     def _estimate_cost(
         self, price_cents: int, count: int,

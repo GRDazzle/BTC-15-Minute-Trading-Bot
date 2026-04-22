@@ -4,6 +4,8 @@ LSTM signal processor for live inference (v4).
 Loads Conv1D+LSTM model with StandardScaler normalization.
 Returns P(BULLISH) from a 180-second price sequence.
 """
+import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -18,6 +20,12 @@ from core.strategy_brain.signal_processors.base_processor import (
 )
 from ml.lstm_features import extract_lstm_sequence, LSTM_SEQ_LEN
 from ml.lstm_model import load_model
+
+# Diagnostic: dump raw tick buffer + sequence + prediction to disk on every
+# inference call. Gated by env var so it's off by default.
+# Set LSTM_DUMP_TICKS=1 to enable.
+_TICK_DUMP_ENABLED = os.environ.get("LSTM_DUMP_TICKS", "") == "1"
+_TICK_DUMP_DIR = Path("logs/lstm_tick_dumps")
 
 
 class LSTMProcessor(BaseSignalProcessor):
@@ -91,4 +99,49 @@ class LSTMProcessor(BaseSignalProcessor):
             x = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0)
             p_bullish = self.model(x).item()
 
+        # Optional diagnostic dump (gated by LSTM_DUMP_TICKS=1 env var)
+        if _TICK_DUMP_ENABLED:
+            try:
+                self._dump_ticks(buf, ts, dm, window_open_price, sequence, p_bullish)
+            except Exception as e:
+                from loguru import logger
+                logger.debug("LSTM tick dump failed for {}: {}", self.asset, e)
+
         return p_bullish
+
+    def _dump_ticks(self, buf, ts, dm, window_open_price, sequence, p_bullish):
+        """Write the exact input state the LSTM just saw, for offline verification."""
+        from datetime import timedelta
+        _TICK_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        # Only keep the slice that extract_lstm_sequence uses: last LSTM_SEQ_LEN seconds
+        cutoff = ts - timedelta(seconds=LSTM_SEQ_LEN)
+        sliced = []
+        for tick in buf:
+            t = tick["ts"]
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if t < cutoff or t > ts:
+                continue
+            sliced.append({
+                "ts": t.isoformat(),
+                "price": float(tick["price"]),
+                "qty": float(tick.get("qty", 0)),
+                "is_buyer": bool(tick.get("is_buyer", False)),
+            })
+        rec = {
+            "asset": self.asset,
+            "dump_ts": datetime.now(timezone.utc).isoformat(),
+            "inference_ts": ts.isoformat(),
+            "dm": int(dm) if dm is not None else None,
+            "window_open_price": float(window_open_price) if window_open_price else None,
+            "buffer_len_total": len(buf),
+            "buffer_len_sliced": len(sliced),
+            "sequence_shape": list(sequence.shape),
+            "p_bullish": float(p_bullish),
+            "ticks": sliced,
+        }
+        # One file per asset per day; append JSONL
+        date_str = ts.strftime("%Y-%m-%d")
+        out = _TICK_DUMP_DIR / f"{self.asset}_{date_str}.jsonl"
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")

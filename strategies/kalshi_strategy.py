@@ -35,6 +35,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine, 
 try:
     from core.strategy_brain.signal_processors.ml_processor import MLProcessor
     from core.strategy_brain.signal_processors.lstm_processor import LSTMProcessor
+    from core.strategy_brain.signal_processors.rl_processor import RLProcessor
     from data_sources.coinbase.websocket import CoinbaseWebSocket
     _ML_AVAILABLE = True
 except ImportError:
@@ -198,6 +199,7 @@ class AssetState:
     kalshi_no_bid: int = 0
     kalshi_close_time: Optional[str] = None
     kalshi_last_update: Optional[datetime] = None
+    kalshi_poll_history: list = field(default_factory=list)  # recent polls for RT features
 
     # Per-asset processor instances (no cross-contamination)
     spike: SpikeDetectionProcessor = field(default=None)
@@ -208,6 +210,7 @@ class AssetState:
     kalshi_price: KalshiPriceProcessor = field(default=None)
     ml_processor: Optional[Any] = None  # MLProcessor (optional, per-asset)
     lstm_processor: Optional[Any] = None  # LSTMProcessor (optional, per-asset)
+    rl_processor: Optional[Any] = None  # RLProcessor (optional, per-asset — v3 meta-controller)
     ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) from sweep
     early_ml_processor: Optional[Any] = None  # MLProcessor for dm 2-3 (optional)
     early_ensemble_weights: Optional[tuple] = None  # (ml_weight, threshold) for dm 2-3
@@ -290,7 +293,8 @@ class KalshiMultiAssetStrategy:
     SIGNAL_LOG_PATH = Path("output/signal_log.csv")
     SIGNAL_LOG_FIELDS = [
         "timestamp", "asset", "window_id", "dm",
-        "ml_p", "fusion_p", "ensemble_p", "threshold",
+        "ml_p", "lstm_p", "fusion_p", "ensemble_p", "threshold",
+        "dyn_xgb_w", "dyn_lstm_w", "dyn_fusion_w",
         "direction", "kalshi_yes_ask", "kalshi_no_ask",
         "entry_price", "action", "contracts", "spot_price",
     ]
@@ -333,8 +337,10 @@ class KalshiMultiAssetStrategy:
         self._ml_confidence_threshold = ml_confidence_threshold
         self._csv_lock = threading.Lock()
 
-        # Live aggTrade writer (persists WS data for backtesting/tuning)
-        self._trade_writer = BinanceTradeWriter()
+        # Live aggTrade writers (persists WS data for backtesting/tuning)
+        self._trade_writer = BinanceTradeWriter()  # Coinbase -> data/aggtrades_coinbase/
+        self._kraken_writer = BinanceTradeWriter(data_dir=Path("data/aggtrades_kraken"))
+        self._bitstamp_writer = BinanceTradeWriter(data_dir=Path("data/aggtrades_bitstamp"))
 
         # Runtime stats published to data/runtime_state.json for the manager UI.
         # Updated by the verification and reconciliation loops.
@@ -456,6 +462,22 @@ class KalshiMultiAssetStrategy:
                     logger.info("No LSTM model for %s", asset)
                 except Exception as e:
                     logger.warning("Failed to load LSTM for %s: %s", asset, e)
+
+                # Try loading RL meta-controller (v3 production)
+                try:
+                    state.rl_processor = RLProcessor(
+                        asset=asset,
+                        model_dir=model_dir,
+                        max_contracts=state.max_contracts,
+                    )
+                    self._model_mtimes[f"{asset}_rl"] = self._get_mtime(
+                        self._model_dir / f"{asset}_rl_prod.zip"
+                    )
+                    logger.info("RL meta-controller loaded for %s", asset)
+                except FileNotFoundError:
+                    logger.info("No RL model for %s (falling back to XGB threshold)", asset)
+                except Exception as e:
+                    logger.warning("Failed to load RL for %s: %s", asset, e)
 
             # Load ensemble weights if configured and ML model available
             if asset in ensemble_config and state.ml_processor is not None:
@@ -686,6 +708,15 @@ class KalshiMultiAssetStrategy:
                     if lstm_key not in models_changed:
                         models_changed.append(lstm_key)
 
+            # Check RL meta-controller model
+            rl_key = f"{asset}_rl"
+            rl_path = self._model_dir / f"{asset}_rl_prod.zip"
+            new_rl_mtime = self._get_mtime(rl_path)
+            old_rl_mtime = self._model_mtimes.get(rl_key, 0.0)
+            if new_rl_mtime != old_rl_mtime and new_rl_mtime > 0:
+                if rl_key not in models_changed:
+                    models_changed.append(rl_key)
+
         if not config_changed and not models_changed:
             return
 
@@ -701,7 +732,19 @@ class KalshiMultiAssetStrategy:
 
         # Reload changed ML models
         for key in models_changed:
-            if key.endswith("_lstm"):
+            if key.endswith("_rl"):
+                asset = key[:-3]
+                state = self.states.get(asset)
+                if state and state.rl_processor is not None:
+                    try:
+                        state.rl_processor.reload()
+                        logger.info("[hot-reload] Reloaded RL model for %s", asset)
+                    except Exception as e:
+                        logger.warning("[hot-reload] RL reload failed for %s: %s", asset, e)
+                self._model_mtimes[key] = self._get_mtime(
+                    self._model_dir / f"{asset}_rl_prod.zip"
+                )
+            elif key.endswith("_lstm"):
                 # LSTM model reload
                 self._reload_lstm(key)
                 lstm_path = self._model_dir / f"{key}.pt"
@@ -1042,6 +1085,66 @@ class KalshiMultiAssetStrategy:
 
     # -- lifecycle -------------------------------------------------------------
 
+    def _prewarm_tick_buffers(self, asset: str, state: "AssetState",
+                               lookback_seconds: int = 900) -> None:
+        """Load the last N seconds of ticks from daily aggtrade CSVs into
+        state.raw_tick_buffer (Coinbase) and state.kraken_tick_buffer.
+
+        The on-disk CSV writer stores is_buyer_maker (= NOT is_buyer_taker).
+        We invert it here to match what the live WS appends (is_buyer = taker bought).
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=lookback_seconds)
+
+        def _load(dir_base: Path, sym_suffix: str) -> list[dict]:
+            ticks = []
+            # Span at most 2 days (in case cutoff crosses midnight)
+            for offset_days in (1, 0):
+                d = (now - timedelta(days=offset_days)).strftime("%Y-%m-%d")
+                path = dir_base / asset.upper() / f"{asset.upper()}{sym_suffix}-aggTrades-{d}.csv"
+                if not path.exists():
+                    continue
+                try:
+                    with open(path, newline="") as f:
+                        for row in csv.reader(f):
+                            if len(row) < 7:
+                                continue
+                            try:
+                                ts_us = int(row[5])
+                            except (ValueError, IndexError):
+                                continue
+                            ts = datetime.fromtimestamp(ts_us / 1_000_000, tz=timezone.utc)
+                            if ts < cutoff or ts > now:
+                                continue
+                            ticks.append({
+                                "ts": ts,
+                                "price": float(row[1]),
+                                "qty": float(row[2]),
+                                # Column 6 = is_buyer_maker; invert to get is_buyer (taker side)
+                                "is_buyer": row[6].strip().lower() not in ("true", "1"),
+                            })
+                except Exception:
+                    logger.exception("[prewarm-%s] Failed reading %s", asset, path.name)
+            ticks.sort(key=lambda t: t["ts"])
+            return ticks
+
+        cb = _load(Path("data/aggtrades_coinbase"), "USDT")
+        kr = _load(Path("data/aggtrades_kraken"), "USD")
+        for t in cb:
+            state.raw_tick_buffer.append(t)
+            state.tick_buffer.append({"ts": t["ts"], "price": t["price"]})
+        for t in kr:
+            state.kraken_tick_buffer.append(t)
+        logger.info(
+            "[prewarm-%s] Loaded %d Coinbase + %d Kraken ticks from last %ds",
+            asset, len(cb), len(kr), lookback_seconds,
+        )
+        # Seed current_price/price_history so feature code has something
+        if cb:
+            state.current_price = Decimal(str(cb[-1]["price"]))
+            for t in cb[-500:]:
+                state.price_history.append(float(t["price"]))
+
     async def start(self):
         """Launch all concurrent loops."""
         self._running = True
@@ -1053,6 +1156,14 @@ class KalshiMultiAssetStrategy:
 
         # Log startup balances
         self._log_balance("startup")
+
+        # 0. Pre-warm tick buffers from archived aggtrades so the bot doesn't
+        # start with a cold buffer (closes "backtest vs cold-start live" gap).
+        for asset, state in self.states.items():
+            try:
+                self._prewarm_tick_buffers(asset, state, lookback_seconds=900)
+            except Exception:
+                logger.exception("[prewarm-%s] Failed to warm tick buffers", asset)
 
         # 1. Coinbase WS streams for dense tick data (one per asset)
         for asset, state in self.states.items():
@@ -1103,10 +1214,10 @@ class KalshiMultiAssetStrategy:
             asyncio.create_task(self._kalshi_polling_loop(), name="kalshi-poller"),
         )
 
-        # 6. Rolling parameter tuning -- DISABLED, using weekly retrain only
-        # self._tasks.append(
-        #     asyncio.create_task(self._param_tuning_loop(), name="param-tune"),
-        # )
+        # 7. Order book depth collector (saves L2 snapshots for future features)
+        self._tasks.append(
+            asyncio.create_task(self._orderbook_collector_loop(), name="orderbook-collector"),
+        )
 
         logger.info("All loops launched (%d tasks)", len(self._tasks))
 
@@ -1286,8 +1397,10 @@ class KalshiMultiAssetStrategy:
         logger.info("Stopping Kalshi multi-asset strategy...")
         self._running = False
 
-        # Close aggTrade writer
+        # Close aggTrade writers
         self._trade_writer.close()
+        self._kraken_writer.close()
+        self._bitstamp_writer.close()
 
         # Disconnect all WS sources
         for state in self.states.values():
@@ -1408,19 +1521,48 @@ class KalshiMultiAssetStrategy:
 
         kr_ws = KrakenWebSocket(asset)
 
+        # Diagnostic: count ticks for rate monitoring
+        tick_counter = {"count": 0, "last_log": datetime.now(timezone.utc)}
+
         def on_trade(trade: dict[str, Any]):
+            tick_counter["count"] += 1
+            now = datetime.now(timezone.utc)
+            if (now - tick_counter["last_log"]).total_seconds() >= 60:
+                logger.info("[ws-kraken-%s] %d ticks in last 60s", asset, tick_counter["count"])
+                tick_counter["count"] = 0
+                tick_counter["last_log"] = now
+
             state.kraken_current_price = trade["price"]
+            ts = trade["timestamp"]
             state.kraken_tick_buffer.append({
-                "ts": trade["timestamp"],
+                "ts": ts,
                 "price": float(trade["price"]),
                 "qty": float(trade["quantity"]),
                 "is_buyer": trade["side"] == "buy",
             })
 
+            # Persist to daily CSV for future training
+            ts_ms = int(ts.timestamp() * 1000)
+            from data_sources.kraken.websocket import ASSET_TO_PAIR as _KRAKEN_MAP
+            kraken_symbol = _KRAKEN_MAP.get(asset, asset + "USD").replace("/", "")
+            compat_trade = {
+                "agg_trade_id": 0,
+                "price": float(trade["price"]),
+                "quantity": float(trade["quantity"]),
+                "first_id": 0,
+                "last_id": 0,
+                "timestamp_ms": ts_ms,
+                "is_buyer_maker": trade["side"] != "buy",
+                "best_price_match": True,
+            }
+            self._kraken_writer.write(asset, kraken_symbol, compat_trade)
+
         while self._running:
             try:
-                logger.info("[ws-kraken-%s] Connecting to Kraken stream...", asset)
+                logger.info("[ws-kraken-%s] Connecting to Kraken stream (pair=%s)...",
+                            asset, ASSET_TO_PAIR.get(asset, "UNKNOWN"))
                 await kr_ws.stream_trades(on_trade)
+                logger.warning("[ws-kraken-%s] stream_trades returned cleanly (unusual)", asset)
             except asyncio.CancelledError:
                 kr_ws.stop()
                 break
@@ -1440,12 +1582,28 @@ class KalshiMultiAssetStrategy:
 
         def on_trade(trade: dict[str, Any]):
             state.bitstamp_current_price = trade["price"]
+            ts = trade["timestamp"]
             state.bitstamp_tick_buffer.append({
-                "ts": trade["timestamp"],
+                "ts": ts,
                 "price": float(trade["price"]),
                 "qty": float(trade["quantity"]),
                 "is_buyer": trade["side"] == "buy",
             })
+
+            # Persist to daily CSV for future training
+            ts_ms = int(ts.timestamp() * 1000)
+            bitstamp_symbol = f"{asset}USD"
+            compat_trade = {
+                "agg_trade_id": 0,
+                "price": float(trade["price"]),
+                "quantity": float(trade["quantity"]),
+                "first_id": 0,
+                "last_id": 0,
+                "timestamp_ms": ts_ms,
+                "is_buyer_maker": trade["side"] != "buy",
+                "best_price_match": True,
+            }
+            self._bitstamp_writer.write(asset, bitstamp_symbol, compat_trade)
 
         while self._running:
             try:
@@ -1457,6 +1615,91 @@ class KalshiMultiAssetStrategy:
             except Exception:
                 logger.exception("[ws-bitstamp-%s] Bitstamp stream error, reconnecting in 5s", asset)
                 await asyncio.sleep(5)
+
+    # -- Order book depth collector --------------------------------------------
+
+    async def _orderbook_collector_loop(self):
+        """Collect L2 order book snapshots from Coinbase + Kraken every 10s.
+
+        Saves daily CSVs to data/orderbook/{ASSET}/ for future training.
+        """
+        from scripts.collect_orderbook import (
+            fetch_coinbase_book, fetch_kraken_book, compute_depth_stats,
+            COINBASE_PAIRS, KRAKEN_PAIRS, CSV_FIELDS,
+        )
+        import csv as _csv
+
+        output_dir = Path("data/orderbook")
+        interval = 10
+        open_files: dict[str, tuple] = {}
+        current_date = ""
+
+        logger.info("[orderbook] Starting L2 depth collector (interval=%ds)", interval)
+
+        while self._running:
+            try:
+                now = datetime.now(timezone.utc)
+                date_str = now.strftime("%Y-%m-%d")
+
+                if date_str != current_date:
+                    for fh, _ in open_files.values():
+                        fh.close()
+                    open_files.clear()
+                    current_date = date_str
+
+                ts_iso = now.isoformat()
+
+                for asset in self.states:
+                    for exchange, fetch_fn, pairs in [
+                        ("coinbase", fetch_coinbase_book, COINBASE_PAIRS),
+                        ("kraken", fetch_kraken_book, KRAKEN_PAIRS),
+                    ]:
+                        pair = pairs.get(asset)
+                        if not pair:
+                            continue
+                        try:
+                            book = await asyncio.get_event_loop().run_in_executor(
+                                None, fetch_fn, pair,
+                            )
+                        except Exception:
+                            continue
+                        if not book or not book.get("bids") or not book.get("asks"):
+                            continue
+                        stats = compute_depth_stats(book["bids"], book["asks"])
+                        if not stats:
+                            continue
+
+                        key = f"{asset}/{date_str}"
+                        if key not in open_files:
+                            asset_dir = output_dir / asset
+                            asset_dir.mkdir(parents=True, exist_ok=True)
+                            path = asset_dir / f"orderbook-{date_str}.csv"
+                            is_new = not path.exists()
+                            fh = open(path, "a", newline="", encoding="utf-8")
+                            writer = _csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+                            if is_new:
+                                writer.writeheader()
+                            open_files[key] = (fh, writer)
+
+                        _, writer = open_files[key]
+                        row = {"timestamp": ts_iso, "asset": asset, "exchange": exchange}
+                        for field in CSV_FIELDS:
+                            if field not in row:
+                                row[field] = stats.get(field, "")
+                        writer.writerow(row)
+                        open_files[key][0].flush()
+
+                await asyncio.sleep(interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[orderbook] Collector error, retrying in 30s")
+                await asyncio.sleep(30)
+
+        for fh, _ in open_files.values():
+            fh.close()
+        logger.info("[orderbook] Collector stopped")
 
     # -- Kalshi WebSocket streaming --------------------------------------------
 
@@ -1499,6 +1742,19 @@ class KalshiMultiAssetStrategy:
                         # no_ask = 100 - yes_bid
                         state.kalshi_no_ask = 100 - yes_bid
                     state.kalshi_last_update = datetime.now(timezone.utc)
+                    # Track poll history for Kalshi RT features
+                    state.kalshi_poll_history.append({
+                        "ts": state.kalshi_last_update,
+                        "yes_ask": state.kalshi_yes_ask,
+                        "yes_bid": state.kalshi_yes_bid,
+                        "no_ask": state.kalshi_no_ask,
+                        "no_bid": state.kalshi_no_bid,
+                        "volume": 0,  # WS doesn't provide volume
+                        "oi": 0,
+                    })
+                    # Keep last 60 polls (~2 min at 2s interval)
+                    if len(state.kalshi_poll_history) > 60:
+                        state.kalshi_poll_history = state.kalshi_poll_history[-60:]
                     break
 
         def on_error(msg: dict):
@@ -1610,6 +1866,10 @@ class KalshiMultiAssetStrategy:
                         state.kalshi_no_ask = 0
                         state.kalshi_yes_bid = 0
                         state.kalshi_no_bid = 0
+                        state.kalshi_poll_history.clear()
+                        # Reset RL per-window state
+                        if state.rl_processor is not None:
+                            state.rl_processor.reset_window()
 
                 # Capture window open price at minute 0 (for price_vs_open feature)
                 if elapsed < self.ENTRY_GATE_START_S:
@@ -1737,7 +1997,18 @@ class KalshiMultiAssetStrategy:
             (datetime.fromisoformat(state.kalshi_close_time) - datetime.now(timezone.utc)).total_seconds() / 60.0
             if state.kalshi_close_time else None
         )
-        # v11 cross-exchange features for ML processor
+        # v13: Kalshi poll history for RT microstructure features
+        metadata["kalshi_poll_history"] = list(state.kalshi_poll_history) if state.kalshi_poll_history else None
+
+        # v12: Merge Kraken ticks into the main tick buffer for aggregated features
+        # (volume, velocity, tick_intensity computed from combined Coinbase+Kraken stream)
+        if state.kraken_tick_buffer:
+            merged_buffer = list(state.raw_tick_buffer)
+            merged_buffer.extend(state.kraken_tick_buffer)
+            merged_buffer.sort(key=lambda t: t["ts"])
+            metadata["raw_tick_buffer"] = merged_buffer
+
+        # Cross-exchange divergence feature (kraken_coinbase_price_diff)
         metadata["kraken_current_price"] = state.kraken_current_price
         metadata["kraken_tick_buffer"] = list(state.kraken_tick_buffer) if state.kraken_tick_buffer else None
         metadata["bitstamp_current_price"] = state.bitstamp_current_price
@@ -1763,14 +2034,11 @@ class KalshiMultiAssetStrategy:
             active_lstm = state.lstm_processor
             model_label = "standard"
 
-        # Dynamic blend ensemble: XGB + LSTM + Fusion (v9-style)
-        # LSTM and XGB vote independently, blended by dynamic weights.
-        # Stacking (lstm_p as XGB feature) was tested but degraded live
-        # performance due to OOF/live LSTM distribution mismatch.
+        # v9 dynamic blend: XGB + LSTM + Fusion weighted by confidence^4.5
         if active_weights is not None and active_ml is not None:
-            ml_w, ens_threshold = active_weights
+            xgb_min_w, ens_threshold = active_weights
 
-            # Get XGB probability
+            # XGB standalone prediction (no stacking — lstm_p is NOT a feature)
             ml_p = active_ml.predict_proba(
                 state.current_price, list(state.price_history), metadata,
             )
@@ -1778,32 +2046,36 @@ class KalshiMultiAssetStrategy:
                 logger.debug("[%s] Ensemble (%s): XGB returned None for window %s", asset, model_label, window_id)
                 return
 
-            # Get fusion probability
-            fusion_p = self._get_fusion_probability(state, metadata)
-
-            # Get LSTM probability (if available)
+            # LSTM standalone prediction
             lstm_p = None
             if active_lstm is not None:
                 lstm_p = active_lstm.predict_proba(
                     state.current_price, list(state.price_history), metadata,
                 )
 
-            # Dynamic weight: scales exponentially with each model's confidence
-            dynamic_k = 4.5
+            # Fusion probability (SpikeDetection + TickVelocity + ...)
+            fusion_p = self._get_fusion_probability(state, metadata)
+
+            # Dynamic weights: w = min + (max - min) * confidence^k
+            # k_xgb and k_lstm can be tuned independently (fallback to shared
+            # dynamic_k, then 4.5 default).
+            shared_k = self._get_ensemble_param(asset, model_label, "dynamic_k", 4.5)
+            k_xgb = self._get_ensemble_param(asset, model_label, "dynamic_k_xgb", shared_k)
+            k_lstm = self._get_ensemble_param(asset, model_label, "dynamic_k_lstm", shared_k)
             xgb_conf = abs(ml_p - 0.5) * 2.0
-            xgb_min_w = ml_w
             xgb_max_w = self._get_ensemble_param(asset, model_label, "xgb_max_w", 0.60)
-            dyn_xgb_w = xgb_min_w + (xgb_max_w - xgb_min_w) * (xgb_conf ** dynamic_k)
+            dyn_xgb_w = xgb_min_w + (xgb_max_w - xgb_min_w) * (xgb_conf ** k_xgb)
 
             if lstm_p is not None:
                 lstm_conf = abs(lstm_p - 0.5) * 2.0
                 lstm_min_w = self._get_ensemble_param(asset, model_label, "lstm_min_w", 0.10)
                 lstm_max_w = self._get_ensemble_param(asset, model_label, "lstm_max_w", 0.40)
-                dyn_lstm_w = lstm_min_w + (lstm_max_w - lstm_min_w) * (lstm_conf ** dynamic_k)
+                dyn_lstm_w = lstm_min_w + (lstm_max_w - lstm_min_w) * (lstm_conf ** k_lstm)
                 dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w - dyn_lstm_w)
                 ensemble_p = dyn_xgb_w * ml_p + dyn_lstm_w * lstm_p + dyn_fusion_w * fusion_p
             else:
-                dyn_fusion_w = 1.0 - dyn_xgb_w
+                dyn_lstm_w = 0.0
+                dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w)
                 ensemble_p = dyn_xgb_w * ml_p + dyn_fusion_w * fusion_p
 
             # Decision
@@ -1825,6 +2097,8 @@ class KalshiMultiAssetStrategy:
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,
                     ens_threshold, "NONE", kalshi_yes_ask, kalshi_no_ask,
                     0, "skip_threshold", 0, spot_price,
+                    lstm_p=lstm_p, dyn_xgb_w=dyn_xgb_w,
+                    dyn_lstm_w=dyn_lstm_w, dyn_fusion_w=dyn_fusion_w,
                 )
                 return
 
@@ -1856,8 +2130,81 @@ class KalshiMultiAssetStrategy:
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,
                     ens_threshold, direction, kalshi_yes_ask, kalshi_no_ask,
                     entry_price, "skip_blocked", 0, spot_price,
+                    lstm_p=lstm_p, dyn_xgb_w=dyn_xgb_w,
+                    dyn_lstm_w=dyn_lstm_w, dyn_fusion_w=dyn_fusion_w,
                 )
                 return
+
+            # Hour gate: only trade during allowed hours (hot-reloadable from config)
+            # Empty list = all hours allowed. Signal is already logged above.
+            try:
+                with open(self.CONFIG_PATH, "r") as _cf:
+                    _cfg = json.load(_cf)
+                allowed_hours = _cfg.get("assets", {}).get(asset, {}).get("ensemble", {}).get("allowed_hours", [])
+            except Exception:
+                allowed_hours = []
+            if allowed_hours:
+                current_hour = datetime.now(timezone.utc).hour
+                if current_hour not in allowed_hours:
+                    logger.info(
+                        "[%s] Ensemble %s (%s): p=%.3f price=%dc [HOUR %d NOT IN ALLOWED]",
+                        asset, direction, model_label, ensemble_p, entry_price, current_hour,
+                    )
+                    self._log_signal(
+                        asset, window_id, dm, ml_p, fusion_p, ensemble_p,
+                        ens_threshold, direction, kalshi_yes_ask, kalshi_no_ask,
+                        entry_price, "skip_hour", 0, spot_price,
+                        lstm_p=lstm_p, dyn_xgb_w=dyn_xgb_w,
+                        dyn_lstm_w=dyn_lstm_w, dyn_fusion_w=dyn_fusion_w,
+                    )
+                    return
+
+            # RL meta-controller: decides WHEN to enter and WITH HOW MUCH size
+            # Gated by config: ensemble.rl_enabled (default False — RL is optional)
+            rl_contracts_override = None
+            rl_enabled = self._get_ensemble_param(asset, model_label, "rl_enabled", 0.0) > 0.5
+            if rl_enabled and state.rl_processor is not None:
+                try:
+                    # Features needed by RL state (same as training)
+                    price_vs_open = 0.0
+                    if state.window_open_price and state.current_price:
+                        price_vs_open = (float(state.current_price) - state.window_open_price) / state.window_open_price
+                    # Velocity_900s and z_score_900s from XGB feats if we have them
+                    # (metadata already passed to ML processor; reusing spot_price is a fallback)
+                    spread_cents = kalshi_yes_ask - state.kalshi_yes_bid if state.kalshi_yes_bid else 2
+                    mtc = metadata.get("kalshi_mins_to_close") or 7.5
+                    rl_enter, rl_contracts = state.rl_processor.decide(
+                        xgb_p=float(ml_p),
+                        yes_ask=kalshi_yes_ask,
+                        no_ask=kalshi_no_ask,
+                        spread=spread_cents,
+                        mins_to_close=float(mtc),
+                        dm=dm,
+                        price_vs_open=price_vs_open,
+                        velocity_900s=0.0,  # simplified — RL learned to handle zero
+                        z_score_900s=0.0,
+                        hour_utc=datetime.now(timezone.utc).hour,
+                    )
+                    if not rl_enter:
+                        logger.info(
+                            "[%s] RL says WAIT at dm=%d price=%dc (p=%.3f)",
+                            asset, dm, entry_price, ml_p,
+                        )
+                        self._log_signal(
+                            asset, window_id, dm, ml_p, fusion_p, ensemble_p,
+                            ens_threshold, direction, kalshi_yes_ask, kalshi_no_ask,
+                            entry_price, "skip_rl", 0, spot_price,
+                            lstm_p=lstm_p, dyn_xgb_w=dyn_xgb_w,
+                            dyn_lstm_w=dyn_lstm_w, dyn_fusion_w=dyn_fusion_w,
+                        )
+                        return
+                    logger.info(
+                        "[%s] RL says ENTER %d contracts at dm=%d price=%dc (p=%.3f)",
+                        asset, rl_contracts, dm, entry_price, ml_p,
+                    )
+                    rl_contracts_override = rl_contracts
+                except Exception as e:
+                    logger.warning("[%s] RL decision failed (%s), falling back to XGB threshold", asset, e)
 
             trade = self.execution.execute_trade(
                 asset=asset,
@@ -1865,6 +2212,7 @@ class KalshiMultiAssetStrategy:
                 confidence=confidence,
                 score=score,
                 market_info=market_info,
+                contracts_override=rl_contracts_override,
             )
 
             # Log signal with outcome of execute_trade
@@ -1873,6 +2221,8 @@ class KalshiMultiAssetStrategy:
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,
                     ens_threshold, direction, kalshi_yes_ask, kalshi_no_ask,
                     entry_price, "trade", trade.count, spot_price,
+                    lstm_p=lstm_p, dyn_xgb_w=dyn_xgb_w,
+                    dyn_lstm_w=dyn_lstm_w, dyn_fusion_w=dyn_fusion_w,
                 )
             else:
                 # Determine skip reason from price vs Kelly bands
@@ -1888,6 +2238,8 @@ class KalshiMultiAssetStrategy:
                     asset, window_id, dm, ml_p, fusion_p, ensemble_p,
                     ens_threshold, direction, kalshi_yes_ask, kalshi_no_ask,
                     entry_price, skip_action, 0, spot_price,
+                    lstm_p=lstm_p, dyn_xgb_w=dyn_xgb_w,
+                    dyn_lstm_w=dyn_lstm_w, dyn_fusion_w=dyn_fusion_w,
                 )
 
         # ML-only path: use ML processor as sole decision maker
@@ -2357,10 +2709,26 @@ class KalshiMultiAssetStrategy:
     # -- signal CSV logging ----------------------------------------------------
 
     def _ensure_signal_log(self):
-        """Create the signal log CSV with headers if it doesn't exist."""
-        if self.SIGNAL_LOG_PATH.exists():
-            return
+        """Create the signal log CSV with headers if it doesn't exist.
+
+        If an existing file has an outdated header (different field count or order),
+        rename it to a .bak and start fresh so schema stays consistent within a file.
+        """
         self.SIGNAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if self.SIGNAL_LOG_PATH.exists():
+            try:
+                with open(self.SIGNAL_LOG_PATH, "r", newline="") as f:
+                    existing_header = next(csv.reader(f), [])
+                if existing_header == self.SIGNAL_LOG_FIELDS:
+                    return
+                # Schema mismatch — archive and recreate
+                from datetime import datetime, timezone
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                bak = self.SIGNAL_LOG_PATH.with_suffix(f".bak_{ts}.csv")
+                self.SIGNAL_LOG_PATH.rename(bak)
+                logger.info("[signal_log] Schema changed; archived old log to %s", bak.name)
+            except Exception:
+                pass  # fall through to recreate
         with open(self.SIGNAL_LOG_PATH, "w", newline="") as f:
             csv.writer(f).writerow(self.SIGNAL_LOG_FIELDS)
 
@@ -2380,6 +2748,10 @@ class KalshiMultiAssetStrategy:
         action: str,
         contracts: int,
         spot_price: float,
+        lstm_p: float | None = None,
+        dyn_xgb_w: float | None = None,
+        dyn_lstm_w: float | None = None,
+        dyn_fusion_w: float | None = None,
     ):
         """Append one row to the signal log CSV."""
         self._ensure_signal_log()
@@ -2391,9 +2763,13 @@ class KalshiMultiAssetStrategy:
                 window_id,
                 dm,
                 f"{ml_p:.4f}",
+                "" if lstm_p is None else f"{lstm_p:.4f}",
                 f"{fusion_p:.4f}",
                 f"{ensemble_p:.4f}",
                 f"{threshold:.2f}",
+                "" if dyn_xgb_w is None else f"{dyn_xgb_w:.4f}",
+                "" if dyn_lstm_w is None else f"{dyn_lstm_w:.4f}",
+                "" if dyn_fusion_w is None else f"{dyn_fusion_w:.4f}",
                 direction,
                 kalshi_yes_ask,
                 kalshi_no_ask,
