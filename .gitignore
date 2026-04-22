@@ -72,7 +72,11 @@ htmlcov/
 data/historical/
 data/aggtrades/
 data/aggtrades_coinbase/
+data/aggtrades_kraken/
+data/aggtrades_bitstamp/
+data/orderbook/
 data/kalshi_polls/
+data/kalshi_settlements/
 data/account_state.json
 data/retrain_state.json
 data/*.json
