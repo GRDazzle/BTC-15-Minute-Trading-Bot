@@ -103,6 +103,12 @@ def main():
                     help="Window start ISO (e.g. 2026-04-21T20:00:00+00:00). "
                          "Defaults to the most recent window in training CSV.")
     ap.add_argument("--dm", type=int, default=7)
+    ap.add_argument("--offset-seconds", type=int, default=0,
+                    help="Seconds past the top of dm minute to evaluate at "
+                         "(0..59). Use this to match live's actual fire time.")
+    ap.add_argument("--model-suffix", default="",
+                    help="Optional model suffix (e.g. _align2s) to audit a "
+                         "staging model instead of the primary one.")
     args = ap.parse_args()
 
     asset = args.asset.upper()
@@ -142,7 +148,9 @@ def main():
         return
 
     window_dt = datetime.fromisoformat(ws_iso)
-    eval_ts = window_dt + timedelta(minutes=5 + args.dm)  # decision point timestamp
+    eval_ts = window_dt + timedelta(minutes=5 + args.dm, seconds=args.offset_seconds)
+    if args.offset_seconds:
+        print(f"  eval_ts offset +{args.offset_seconds}s -> {eval_ts.isoformat()}")
 
     # Load tick buffer from aggtrades (matches training-time reconstruction)
     print(f"Loading ticks covering last 900s ending at {eval_ts.isoformat()}")
@@ -222,8 +230,9 @@ def main():
     # Also run XGB on both and compare ml_p
     import xgboost as xgb
     booster = xgb.Booster()
-    booster.load_model(str(PROJECT_ROOT / "models" / f"{asset}_xgb.json"))
-    fn_path = PROJECT_ROOT / "models" / f"{asset}_xgb_features.json"
+    model_suffix = args.model_suffix
+    booster.load_model(str(PROJECT_ROOT / "models" / f"{asset}{model_suffix}_xgb.json"))
+    fn_path = PROJECT_ROOT / "models" / f"{asset}{model_suffix}_xgb_features.json"
     if fn_path.exists():
         with open(fn_path) as f:
             xgb_feats = [x for x in json.load(f).get("features", list(FEATURE_NAMES)) if x != "lstm_p"]

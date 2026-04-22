@@ -178,9 +178,19 @@ def _market_ticker_from_event(event_ticker: str, strike: str = "00") -> str:
 
 
 def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
-                 cfg: dict, writer: csv.writer, balance: float = 25.0) -> dict:
-    """Replay [from_date, to_date] inclusive for one asset. Returns summary dict."""
-    print(f"\n=== {asset} | {from_date} -> {to_date} ===")
+                 cfg: dict, writer: csv.writer, balance: float = 25.0,
+                 after_ts: datetime | None = None,
+                 before_ts: datetime | None = None) -> dict:
+    """Replay [from_date, to_date] inclusive for one asset. Returns summary dict.
+
+    If after_ts / before_ts are given, only checks with that timestamp range are
+    evaluated (useful for matching a specific live-bot run)."""
+    ts_label = ""
+    if after_ts or before_ts:
+        lo = after_ts.isoformat() if after_ts else "-inf"
+        hi = before_ts.isoformat() if before_ts else "+inf"
+        ts_label = f"  [filter {lo} .. {hi}]"
+    print(f"\n=== {asset} | {from_date} -> {to_date}{ts_label} ===")
 
     # Load processors (same as live)
     ml_proc = MLProcessor(asset=asset, model_dir=MODEL_DIR)
@@ -222,6 +232,12 @@ def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
         day_end = day_start + timedelta(days=1)
 
         for window_start, window_end in _iter_windows(day_start, day_end):
+            # Time-window filter: skip windows entirely outside the requested range
+            if before_ts is not None and window_start >= before_ts:
+                continue
+            if after_ts is not None and window_end <= after_ts:
+                continue
+
             n_windows += 1
 
             # Skip windows that have no ticks around them
@@ -245,6 +261,13 @@ def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
             check_ts = decision_start
             fired = False
             while check_ts < window_end and not fired:
+                # Time-window filter for individual checks
+                if after_ts is not None and check_ts < after_ts:
+                    check_ts += timedelta(seconds=2)
+                    continue
+                if before_ts is not None and check_ts > before_ts:
+                    break
+
                 dm = int((check_ts - decision_start).total_seconds() // 60)
                 if dm < cfg["min_dm"] or dm > cfg["max_dm"]:
                     check_ts += timedelta(seconds=2)
@@ -423,14 +446,33 @@ def main():
     ap.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD (inclusive)")
     ap.add_argument("--balance", type=float, default=25.0, help="Starting balance per asset")
     ap.add_argument("--out", default=str(OUTPUT_CSV), help="Output CSV path")
+    ap.add_argument("--hours-ago", type=float, default=None,
+                    help="Replay only from N hours ago to now. Overrides --date/--from/--to.")
+    ap.add_argument("--after-ts", default=None,
+                    help="Only include checks at/after this ISO timestamp (UTC).")
+    ap.add_argument("--before-ts", default=None,
+                    help="Only include checks at/before this ISO timestamp (UTC).")
     args = ap.parse_args()
 
-    if args.date:
+    after_ts = before_ts = None
+    if args.hours_ago is not None:
+        now = datetime.now(timezone.utc)
+        after_ts = now - timedelta(hours=args.hours_ago)
+        before_ts = now
+        from_date = after_ts.date()
+        to_date = before_ts.date()
+    elif args.date:
         d = datetime.strptime(args.date, "%Y-%m-%d").date()
         from_date = to_date = d
+        if args.after_ts:
+            after_ts = datetime.fromisoformat(args.after_ts).replace(tzinfo=timezone.utc) \
+                if "+" not in args.after_ts else datetime.fromisoformat(args.after_ts)
+        if args.before_ts:
+            before_ts = datetime.fromisoformat(args.before_ts).replace(tzinfo=timezone.utc) \
+                if "+" not in args.before_ts else datetime.fromisoformat(args.before_ts)
     else:
         if not args.from_date or not args.to_date:
-            ap.error("Specify --date or both --from and --to")
+            ap.error("Specify --hours-ago, --date, or both --from and --to")
         from_date = datetime.strptime(args.from_date, "%Y-%m-%d").date()
         to_date = datetime.strptime(args.to_date, "%Y-%m-%d").date()
 
@@ -456,7 +498,9 @@ def main():
             except KeyError:
                 print(f"No config for {asset}, skipping")
                 continue
-            s = replay_asset(asset, from_date, to_date, cfg, writer, balance=args.balance)
+            s = replay_asset(asset, from_date, to_date, cfg, writer,
+                             balance=args.balance,
+                             after_ts=after_ts, before_ts=before_ts)
             summaries.append(s)
 
     print("\n=== SUMMARY ===")
