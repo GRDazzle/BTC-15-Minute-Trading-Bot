@@ -39,10 +39,16 @@ class KrakenTickIndex:
                     try:
                         price = float(row[1])
                         qty = float(row[2])
-                        ts_ms = int(row[5])
+                        ts_raw = int(row[5])
                         is_buyer = row[6].strip().lower() in ("true", "1")
-                        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-                    except (ValueError, IndexError):
+                        # Auto-detect timestamp unit: ms (13 digits) vs us (16 digits)
+                        # Binance Data Vision and recent Kraken writer use us.
+                        # Older Kraken REST fetches use ms.
+                        if ts_raw > 10**14:  # microseconds
+                            ts = datetime.fromtimestamp(ts_raw / 1_000_000, tz=timezone.utc)
+                        else:  # milliseconds
+                            ts = datetime.fromtimestamp(ts_raw / 1000, tz=timezone.utc)
+                    except (ValueError, IndexError, OSError, OverflowError):
                         continue
 
                     self._timestamps.append(ts)

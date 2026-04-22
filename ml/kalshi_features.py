@@ -82,11 +82,14 @@ class KalshiPollIndex:
                             continue
 
                         poll = {
+                            "ts": ts,
                             "yes_ask": int(entry.get("yes_ask", 50)),
                             "yes_bid": int(entry.get("yes_bid", 50)),
                             "no_ask": int(entry.get("no_ask", 50)),
                             "no_bid": int(entry.get("no_bid", 50)),
                             "mins_to_close": float(entry.get("mins_to_close", 7.5)),
+                            "volume": float(entry.get("volume", 0)),
+                            "oi": float(entry.get("oi", 0)),
                         }
 
                         if et not in self._polls:
@@ -129,6 +132,27 @@ class KalshiPollIndex:
             return None
 
         return polls[idx][1]
+
+    def get_poll_history(
+        self, event_ticker: str, timestamp: datetime, lookback_seconds: float = 60,
+    ) -> list[dict]:
+        """Return all polls for event_ticker within [timestamp - lookback, timestamp].
+
+        Returns list of poll dicts (with ts field) sorted by time ascending.
+        """
+        polls = self._polls.get(event_ticker)
+        if not polls:
+            return []
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        cutoff = timestamp - timedelta(seconds=lookback_seconds)
+        timestamps = [p[0] for p in polls]
+
+        lo = bisect.bisect_left(timestamps, cutoff)
+        hi = bisect.bisect_right(timestamps, timestamp)
+
+        return [polls[i][1] for i in range(lo, hi)]
 
     def get_outcome(self, event_ticker: str) -> Optional[str]:
         return self._outcomes.get(event_ticker)

@@ -1,13 +1,14 @@
 """
-Feature extraction for XGBoost meta-model (v6 - trimmed).
+Feature extraction for XGBoost meta-model (v12 — trimmed + aggregated).
 
-Extracts 22 features from tick_buffer, price_history, timestamp, and
-rule-based processor outputs. Used by both training data generation and
-live/backtest ML inference.
-
-v6: Trimmed from 42 to 22 features. Removed 20 features with <1% mean
-importance across all 4 assets (BTC, ETH, SOL, XRP).
-v6.1: Bisect-based lookups for O(log n) price and tick window queries.
+v6: Trimmed from 42 to 22 features.
+v10: +8 stability + Kalshi features (-> 45).
+v11: +6 cross-exchange (-> 51).
+v11.1: Dropped Bitstamp (-> 48).
+v12: Dropped 11 features with <0.3% avg importance across BTC/ETH/SOL/XRP.
+     Remaining 37 features. Kraken velocity/volume_ratio dropped because
+     tick aggregation makes them redundant (Kraken ticks merged into main
+     tick stream). kraken_coinbase_price_diff kept (divergence signal).
 """
 import bisect
 import math
@@ -16,70 +17,61 @@ from typing import Optional
 
 from core.strategy_brain.signal_processors.base_processor import TradingSignal
 
-# Ordered feature names (must match training and inference)
+# Ordered feature names — v12 (37 features)
+# Dropped (avg <0.3% importance): range_vs_trend_60s, return_skew_60s,
+#   obv_slope_60s, vol_acceleration, buy_volume_ratio_60s, momentum_strength_180s,
+#   momentum_trend, volume_30s, price_range_20, kraken_velocity_60s,
+#   kraken_volume_ratio_60s
 FEATURE_NAMES = [
-    # Tick-derived (10)
+    # Tick-derived (7)
     "velocity_30s",
     "velocity_60s",
     "volatility_30s",
     "volatility_60s",
-    "volume_30s",
     "volume_60s",
-    "buy_volume_ratio_60s",
     "aggressor_ratio_60s",
     "tick_intensity_30s",
     "large_trade_count",
-    # Price structure (2)
+    # Price structure (1)
     "vwap_deviation",
-    "price_range_20",
     # Time (3)
     "hour_sin",
     "hour_cos",
     "minute_in_window",
-    # Signal features (2)
-    "return_skew_60s",
+    # Signal features (1)
     "price_vs_open",
-    # Longer lookback (5)
+    # Longer lookback (3)
     "velocity_300s",
     "velocity_900s",
     "volatility_300s",
     "buy_volume_ratio_300s",
-    "momentum_trend",
-    # Market condition (4)
+    # Market condition (3)
     "volume_180s",
     "choppiness_60s",
     "range_pct_180s",
-    "vol_acceleration",
-    # Crash detection (5)
+    # Crash detection (4)
     "flips_per_tick_180s",
-    "momentum_strength_180s",
     "price_vs_sma5",
     "price_vs_sma15",
     "price_vs_sma_1h",
-    # Quant indicators (6)
+    # Quant indicators (4)
     "z_score_300s",
     "z_score_900s",
-    "obv_slope_60s",
     "obv_slope_300s",
     "cvd_60s",
     "cvd_300s",
-    # Stability features (4) — v10
+    # Stability features (3) — v10
     "price_stability_60s",
     "velocity_stability_60s",
     "direction_changes_60s",
-    "range_vs_trend_60s",
     # Kalshi market features (4) — v10
     "kalshi_yes_ask",
     "kalshi_spread",
     "kalshi_mid",
     "kalshi_mins_to_close",
-    # Cross-exchange features (6) — v11
-    "kraken_coinbase_price_diff",   # (kraken - coinbase) / coinbase — lead/lag signal
-    "bitstamp_coinbase_price_diff", # (bitstamp - coinbase) / coinbase
-    "kraken_velocity_60s",          # Kraken's price velocity (independent signal)
-    "kraken_volume_ratio_60s",      # kraken_vol / (coinbase_vol + kraken_vol)
-    "bitstamp_volume_60s",          # Bitstamp volume (from OHLCV in training, WS live)
-    "exchange_price_std",           # stdev of prices across exchanges — disagreement signal
+    # Cross-exchange (1) — v12 (divergence signal only; volume/velocity
+    # are aggregated into base features via merged tick stream)
+    "kraken_coinbase_price_diff",
 ]
 
 
@@ -276,6 +268,7 @@ def extract_features(
     kalshi_yes_bid: Optional[int] = None,
     kalshi_no_ask: Optional[int] = None,
     kalshi_mins_to_close: Optional[float] = None,
+    kalshi_poll_history: Optional[list[dict]] = None,
     kraken_tick_buffer: Optional[list[dict]] = None,
     kraken_current_price: Optional[float] = None,
     bitstamp_tick_buffer: Optional[list[dict]] = None,
@@ -314,12 +307,7 @@ def extract_features(
 
     # Volume
     vol_60 = sum(t.get("qty", 0) for t in ticks_60)
-    features["volume_30s"] = sum(t.get("qty", 0) for t in ticks_30)
     features["volume_60s"] = vol_60
-
-    # Buy volume ratio
-    buy_60 = sum(t.get("qty", 0) for t in ticks_60 if t.get("is_buyer", False))
-    features["buy_volume_ratio_60s"] = buy_60 / vol_60 if vol_60 > 0 else 0.5
 
     # Aggressor ratio
     buy_count_60 = sum(1 for t in ticks_60 if t.get("is_buyer", False))
@@ -350,14 +338,6 @@ def extract_features(
     # ---- Price-history features ----
     hist = [float(p) for p in price_history]
 
-    if len(hist) >= 20:
-        window = hist[-20:]
-        rng = max(window) - min(window)
-        mean = sum(window) / len(window)
-        features["price_range_20"] = rng / mean if mean != 0 else 0.0
-    else:
-        features["price_range_20"] = 0.0
-
     # ---- Time features ----
     hour = timestamp.hour
     features["hour_sin"] = math.sin(2 * math.pi * hour / 24.0)
@@ -365,8 +345,6 @@ def extract_features(
     features["minute_in_window"] = float(decision_minute)
 
     # ---- Signal features ----
-    features["return_skew_60s"] = _compute_return_skewness(ticks_60)
-
     if window_open_price is not None and window_open_price != 0:
         features["price_vs_open"] = (current_price - window_open_price) / window_open_price
     else:
@@ -386,8 +364,6 @@ def extract_features(
     vol_300 = sum(t.get("qty", 0) for t in ticks_300)
     buy_300 = sum(t.get("qty", 0) for t in ticks_300 if t.get("is_buyer", False))
     features["buy_volume_ratio_300s"] = buy_300 / vol_300 if vol_300 > 0 else 0.5
-
-    features["momentum_trend"] = features["velocity_60s"] - features["velocity_300s"]
 
     # ---- Market condition features ----
     ticks_180 = _ticks_in_window(tick_buffer, 180, timestamp, ts_index, sorted_ticks)
@@ -419,12 +395,6 @@ def extract_features(
     else:
         features["range_pct_180s"] = 0.0
 
-    # Volatility acceleration: recent vol / longer-term vol
-    # >1 = volatility increasing, <1 = calming down
-    vol_30 = features["volatility_30s"]
-    vol_300 = features["volatility_300s"]
-    features["vol_acceleration"] = vol_30 / vol_300 if vol_300 > 0 else 1.0
-
     # ---- Crash detection features ----
 
     # Direction flips per tick over 3 minutes (longer-term choppiness)
@@ -439,16 +409,6 @@ def extract_features(
         features["flips_per_tick_180s"] = flips_180 / (len(prices_180_list) - 2)
     else:
         features["flips_per_tick_180s"] = 0.0
-
-    # Momentum strength: |net move| / range over 3 minutes
-    # High = strong trend, Low = choppy (moved a lot but ended near start)
-    if ticks_180 and len(ticks_180) >= 2:
-        p_180 = [t["price"] for t in ticks_180]
-        net_move = p_180[-1] - p_180[0]
-        price_range = max(p_180) - min(p_180)
-        features["momentum_strength_180s"] = abs(net_move) / price_range if price_range > 0 else 0.0
-    else:
-        features["momentum_strength_180s"] = 0.0
 
     # SMA features: current price relative to moving averages
     # Negative = price below SMA = bearish trend
@@ -516,7 +476,6 @@ def extract_features(
         mean_abs = sum(abs(v) for v in obv_values) / n if n > 0 else 1.0
         return slope / mean_abs if mean_abs > 0 else 0.0
 
-    features["obv_slope_60s"] = _obv_slope(ticks_60)
     features["obv_slope_300s"] = _obv_slope(ticks_300)
 
     # CVD: cumulative volume delta (net buy - sell pressure), normalized
@@ -582,72 +541,18 @@ def extract_features(
     else:
         features["direction_changes_60s"] = 0.0
 
-    # Range vs trend: (high-low) / abs(close-open). High = chop, low = clean trend.
-    if ticks_60 and len(ticks_60) >= 2:
-        t60_prices = [t.get("price", 0) for t in ticks_60 if t.get("price", 0) > 0]
-        if len(t60_prices) >= 2:
-            hi = max(t60_prices)
-            lo = min(t60_prices)
-            rng = hi - lo
-            trend = abs(t60_prices[-1] - t60_prices[0])
-            features["range_vs_trend_60s"] = rng / trend if trend > 0 else 10.0  # cap at 10
-        else:
-            features["range_vs_trend_60s"] = 0.0
-    else:
-        features["range_vs_trend_60s"] = 0.0
-
     # ---- Kalshi market features (v10) ----
-    # These are passed in from the caller (training: from JSONL, live: from AssetState)
     features["kalshi_yes_ask"] = float(kalshi_yes_ask) if kalshi_yes_ask is not None else 50.0
     yes_bid = float(kalshi_yes_bid) if kalshi_yes_bid is not None else 50.0
     features["kalshi_spread"] = features["kalshi_yes_ask"] - yes_bid
     features["kalshi_mid"] = (features["kalshi_yes_ask"] + yes_bid) / 2.0
     features["kalshi_mins_to_close"] = float(kalshi_mins_to_close) if kalshi_mins_to_close is not None else 7.5
 
-    # ---- Cross-exchange features (v11) ----
-    # Price divergence: (other_exchange - coinbase) / coinbase
-    # Positive = other exchange has higher price (leading indicator of upward move)
+    # ---- Cross-exchange features (v12) ----
     kr_price = float(kraken_current_price) if kraken_current_price is not None else current_price
-    bs_price = float(bitstamp_current_price) if bitstamp_current_price is not None else current_price
-
     if current_price > 0:
         features["kraken_coinbase_price_diff"] = (kr_price - current_price) / current_price
-        features["bitstamp_coinbase_price_diff"] = (bs_price - current_price) / current_price
     else:
         features["kraken_coinbase_price_diff"] = 0.0
-        features["bitstamp_coinbase_price_diff"] = 0.0
-
-    # Kraken velocity 60s (independent directional signal)
-    kr_ticks = kraken_tick_buffer or []
-    if kr_ticks and len(kr_ticks) >= 2:
-        # Get ticks in last 60s
-        kr_ticks_60 = [t for t in kr_ticks if (timestamp - t.get("ts", timestamp)).total_seconds() <= 60] if hasattr(kr_ticks[0].get("ts", 0), "timestamp") else kr_ticks[-20:]
-        if len(kr_ticks_60) >= 2:
-            kr_first = kr_ticks_60[0].get("price", 0)
-            kr_last = kr_ticks_60[-1].get("price", 0)
-            features["kraken_velocity_60s"] = (kr_last - kr_first) / kr_first if kr_first > 0 else 0.0
-        else:
-            features["kraken_velocity_60s"] = 0.0
-    else:
-        features["kraken_velocity_60s"] = 0.0
-
-    # Kraken volume ratio: kraken / (coinbase + kraken)
-    kr_vol = sum(t.get("qty", 0) for t in kr_ticks[-50:]) if kr_ticks else 0
-    cb_vol = features.get("volume_60s", 0)
-    total_vol = kr_vol + cb_vol
-    features["kraken_volume_ratio_60s"] = kr_vol / total_vol if total_vol > 0 else 0.5
-
-    # Bitstamp volume (from tick buffer in live, from OHLCV in training)
-    bs_ticks = bitstamp_tick_buffer or []
-    features["bitstamp_volume_60s"] = sum(t.get("qty", 0) for t in bs_ticks[-50:]) if bs_ticks else 0.0
-
-    # Exchange price standard deviation — disagreement signal
-    prices = [p for p in [current_price, kr_price, bs_price] if p and p > 0]
-    if len(prices) >= 2:
-        mean_p = sum(prices) / len(prices)
-        std_p = (sum((p - mean_p) ** 2 for p in prices) / len(prices)) ** 0.5
-        features["exchange_price_std"] = std_p / mean_p if mean_p > 0 else 0.0
-    else:
-        features["exchange_price_std"] = 0.0
 
     return features
