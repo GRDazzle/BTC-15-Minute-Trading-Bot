@@ -95,41 +95,66 @@ def run_step(name: str, cmd: list[str], max_retries: int = 2) -> bool:
 
 KALSHI_POLLS_DIR = PROJECT_ROOT / "data" / "kalshi_polls"
 AGGTRADES_DIR = PROJECT_ROOT / "data" / "aggtrades"
+AGGTRADES_COINBASE_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
+AGGTRADES_KRAKEN_DIR = PROJECT_ROOT / "data" / "aggtrades_kraken"
+ORDERBOOK_DIR = PROJECT_ROOT / "data" / "orderbook"
 
 
-def purge_old_aggtrades(max_age_days: int = 14) -> None:
-    """Delete aggTrades CSV files older than max_age_days.
+def _purge_dir_by_date(base_dir: Path, glob_pattern: str, label: str,
+                       max_age_days: int, date_from_stem) -> None:
+    """Walk base_dir's asset subfolders and delete files older than cutoff.
 
-    File names encode the date: {SYMBOL}-aggTrades-YYYY-MM-DD.csv
+    date_from_stem(stem: str) -> date | None  extracts the file date from the stem.
     """
-    if not AGGTRADES_DIR.exists():
+    if not base_dir.exists():
         return
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     cutoff_date = cutoff.date()
     removed = 0
-
-    for asset_dir in AGGTRADES_DIR.iterdir():
+    for asset_dir in base_dir.iterdir():
         if not asset_dir.is_dir():
             continue
-        for csv_file in asset_dir.glob("*-aggTrades-*.csv"):
-            # Parse date from filename: "BTCUSDT-aggTrades-2026-03-13.csv"
+        for f in asset_dir.glob(glob_pattern):
             try:
-                # Date is always the last 10 chars before ".csv"
-                stem = csv_file.stem  # "BTCUSDT-aggTrades-2026-03-13"
-                file_date_str = stem[-10:]  # "2026-03-13"
-                file_date = datetime.strptime(file_date_str, "%Y-%m-%d").date()
-            except ValueError:
+                file_date = date_from_stem(f.stem)
+            except Exception:
                 continue
-
+            if file_date is None:
+                continue
             if file_date < cutoff_date:
-                os.remove(csv_file)
+                os.remove(f)
                 removed += 1
+    log(f"Purged {removed} {label} files older than {max_age_days} days"
+        if removed else f"No {label} files older than {max_age_days} days to purge")
 
-    if removed:
-        log(f"Purged {removed} aggTrades files older than {max_age_days} days")
-    else:
-        log(f"No aggTrades files older than {max_age_days} days to purge")
+
+def _date_from_trailing_ymd(stem: str):
+    # "BTCUSDT-aggTrades-2026-03-13" or "orderbook-2026-03-13"
+    return datetime.strptime(stem[-10:], "%Y-%m-%d").date()
+
+
+def purge_old_aggtrades(max_age_days: int = 14) -> None:
+    """Delete aggTrades CSVs across all exchange dirs older than max_age_days.
+
+    Covers: data/aggtrades (Binance), data/aggtrades_coinbase, data/aggtrades_kraken.
+    File naming: {SYMBOL}-aggTrades-YYYY-MM-DD.csv
+    """
+    for base, label in [
+        (AGGTRADES_DIR, "Binance aggTrades"),
+        (AGGTRADES_COINBASE_DIR, "Coinbase aggTrades"),
+        (AGGTRADES_KRAKEN_DIR, "Kraken aggTrades"),
+    ]:
+        _purge_dir_by_date(base, "*-aggTrades-*.csv", label,
+                           max_age_days, _date_from_trailing_ymd)
+
+
+def purge_orderbook(max_age_days: int = 14) -> None:
+    """Delete orderbook snapshot CSVs older than max_age_days.
+
+    File naming: orderbook-YYYY-MM-DD.csv
+    """
+    _purge_dir_by_date(ORDERBOOK_DIR, "orderbook-*.csv", "orderbook",
+                       max_age_days, _date_from_trailing_ymd)
 
 
 def purge_kalshi_polls(max_age_days: int = 14) -> None:
@@ -575,9 +600,10 @@ def main():
     else:
         log("WARNING: weekend XGB data gen failed -- skipping weekend models")
 
-    # ---- Purge old data ----
-    purge_kalshi_polls(max_age_days=75)
-    purge_old_aggtrades(max_age_days=75)
+    # ---- Purge old data (retain 1 year) ----
+    purge_kalshi_polls(max_age_days=365)
+    purge_old_aggtrades(max_age_days=365)
+    purge_orderbook(max_age_days=365)
 
     # ---- Decide which assets to PROMOTE (based on recent live PnL) ----
     if args.promote_all:
