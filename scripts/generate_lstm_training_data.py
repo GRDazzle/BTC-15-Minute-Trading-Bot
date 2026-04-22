@@ -40,8 +40,12 @@ def extract_window_sequences(
     kalshi_settlements: dict | None = None,
     asset: str = "",
     kraken_index=None,
+    check_interval_seconds: int = 10,
 ) -> list[dict]:
-    """Replay one tick window, extracting LSTM sequences at every 10s checkpoint.
+    """Replay one tick window, extracting LSTM sequences at every checkpoint.
+
+    check_interval_seconds controls sampling density. Default 10s; use 2s to
+    match live bot's ~2s cadence — yields 5x more sequences per window.
 
     Returns list of dicts with 'sequence' (ndarray), 'label', 'window_start', 'dm'.
     """
@@ -86,7 +90,7 @@ def extract_window_sequences(
     rows = []
 
     decision_start = window.window_start + timedelta(minutes=5)
-    check_interval = timedelta(seconds=10)
+    check_interval = timedelta(seconds=check_interval_seconds)
     current_check = decision_start + check_interval
 
     # Build sorted tick list once from warmup, append incrementally (ticks arrive in order)
@@ -147,7 +151,9 @@ def extract_window_sequences(
     return rows
 
 
-def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_filter: str = "all") -> None:
+def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0,
+                       day_filter: str = "all",
+                       check_interval_seconds: int = 10) -> None:
     """Generate LSTM training data for one asset."""
     ticks = load_aggtrades_multi(DATA_DIR, asset, days=days)
     if not ticks:
@@ -216,6 +222,7 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
         rows = extract_window_sequences(
             window, kalshi_settlements=kalshi_settlements, asset=asset,
             kraken_index=kraken_index,
+            check_interval_seconds=check_interval_seconds,
         )
         for row in rows:
             all_sequences.append(row["sequence"])
@@ -276,11 +283,23 @@ def main():
         "--day-filter", choices=["all", "weekday", "weekend"], default="all",
         help="Filter windows by day of week (default: all)",
     )
+    parser.add_argument(
+        "--check-interval-seconds", type=int, default=10,
+        help="Seconds between decision-zone samples (default: 10). "
+             "Use 2 to match live bot's ~2s WS cadence — 5x more sequences.",
+    )
     args = parser.parse_args()
+
+    if args.check_interval_seconds < 1:
+        parser.error("--check-interval-seconds must be >= 1")
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     for asset in assets:
-        generate_for_asset(asset, args.days, min_move=args.min_move, day_filter=args.day_filter)
+        generate_for_asset(
+            asset, args.days, min_move=args.min_move,
+            day_filter=args.day_filter,
+            check_interval_seconds=args.check_interval_seconds,
+        )
 
 
 if __name__ == "__main__":
