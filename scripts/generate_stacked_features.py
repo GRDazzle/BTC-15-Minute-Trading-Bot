@@ -114,7 +114,7 @@ def train_lstm_fold(X_train, y_train, X_val, y_val, n_features, epochs=30, batch
             xb = X_t[batch_idx].to(device)
             yb = y_t[batch_idx].to(device)
 
-            pred = model(xb).squeeze()
+            pred = model(xb).view(-1)
             loss = criterion(pred, yb)
 
             optimizer.zero_grad()
@@ -131,7 +131,7 @@ def train_lstm_fold(X_train, y_train, X_val, y_val, n_features, epochs=30, batch
         with torch.no_grad():
             for vstart in range(0, len(X_v_cpu), batch_size):
                 vb = X_v_cpu[vstart:vstart + batch_size].to(device)
-                vp = model(vb).squeeze()
+                vp = model(vb).view(-1)
                 val_preds.append(vp.cpu())
         val_pred = torch.cat(val_preds)
         val_loss = criterion(val_pred, y_v_cpu).item()
@@ -168,7 +168,7 @@ def predict_lstm(model, X, mean, std, n_features, batch_size=256):
     with torch.no_grad():
         for start in range(0, len(X_t), batch_size):
             xb = X_t[start:start + batch_size].to(device)
-            pred = model(xb).squeeze()
+            pred = model(xb).view(-1)
             predictions.extend(pred.cpu().numpy().tolist())
 
     return np.array(predictions)

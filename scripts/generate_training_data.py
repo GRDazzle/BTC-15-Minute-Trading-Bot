@@ -86,6 +86,21 @@ def extract_window_features(
             "is_buyer": tick.is_buyer,
         })
 
+    # Merge Kraken warmup ticks into raw_tick_buffer (aggregated tick stream)
+    if kraken_index:
+        warmup_start = window.window_start - timedelta(minutes=10)
+        warmup_end = window.window_start + timedelta(minutes=5)
+        for tick in kraken_index.get_ticks_in_window(warmup_start, warmup_end):
+            raw_tick_buffer.append(tick)
+
+    # Pre-load all Kraken ticks for the decision zone (fed incrementally below)
+    kr_all_ticks = []
+    if kraken_index:
+        kr_all_ticks = kraken_index.get_ticks_in_window(
+            window.window_start + timedelta(minutes=5), window.window_end,
+        )
+    kr_tick_idx = 0
+
     # Pre-resample decision zone
     if window.ticks_during:
         decision_bars = resample_ticks(
@@ -157,6 +172,17 @@ def extract_window_features(
             sorted_raw.insert(idx, tick_dict)
             raw_tick_idx += 1
 
+        # Feed Kraken ticks up to current_check — merged into same sorted index
+        # This aggregates volume, tick intensity, and order flow from both exchanges
+        while kr_tick_idx < len(kr_all_ticks) and kr_all_ticks[kr_tick_idx]["ts"] < current_check:
+            tick = kr_all_ticks[kr_tick_idx]
+            raw_tick_buffer.append(tick)
+            ts = _ensure_utc(tick["ts"])
+            idx = bisect.bisect_left(ts_idx, ts)
+            ts_idx.insert(idx, ts)
+            sorted_raw.insert(idx, tick)
+            kr_tick_idx += 1
+
         if len(price_history) < 20:
             current_check = next_check
             continue
@@ -172,6 +198,7 @@ def extract_window_features(
         k_yes_bid = None
         k_no_ask = None
         k_mtc = None
+        k_poll_history = None
         if kalshi_index and asset:
             event_ticker = window_start_to_event_ticker(asset, window.window_end)
             poll = kalshi_index.find_poll(event_ticker, current_check)
@@ -180,6 +207,8 @@ def extract_window_features(
                 k_yes_bid = poll["yes_bid"]
                 k_no_ask = poll["no_ask"]
                 k_mtc = poll["mins_to_close"]
+            # Get poll history for Kalshi RT features (last 60s of polls)
+            k_poll_history = kalshi_index.get_poll_history(event_ticker, current_check, lookback_seconds=60)
 
         # Cross-exchange data lookup
         kr_price = None
@@ -221,6 +250,7 @@ def extract_window_features(
             kraken_current_price=kr_price,
             bitstamp_tick_buffer=bs_ticks,
             bitstamp_current_price=bs_price,
+            kalshi_poll_history=k_poll_history,
         )
         feats["label"] = label
         feats["window_start"] = window.window_start.isoformat()

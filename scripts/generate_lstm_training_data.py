@@ -27,8 +27,10 @@ from backtester.data_loader_ticks import (
     generate_tick_windows,
 )
 from ml.lstm_features import LSTM_SEQ_LEN, LSTM_NUM_FEATURES, extract_lstm_sequence
+from ml.multi_exchange import KrakenTickIndex
 
 DATA_DIR = PROJECT_ROOT / "data" / "aggtrades_coinbase"
+KRAKEN_DIR = PROJECT_ROOT / "data" / "aggtrades_kraken"
 OUTPUT_DIR = PROJECT_ROOT / "ml" / "training_data"
 
 
@@ -37,6 +39,7 @@ def extract_window_sequences(
     seq_len: int = LSTM_SEQ_LEN,
     kalshi_settlements: dict | None = None,
     asset: str = "",
+    kraken_index=None,
 ) -> list[dict]:
     """Replay one tick window, extracting LSTM sequences at every 10s checkpoint.
 
@@ -52,6 +55,21 @@ def extract_window_sequences(
             "qty": tick.qty,
             "is_buyer": tick.is_buyer,
         })
+
+    # Merge Kraken warmup ticks into tick buffer (aggregated stream)
+    if kraken_index is not None:
+        warmup_start = window.window_start - timedelta(minutes=10)
+        warmup_end = window.window_start + timedelta(minutes=5)
+        for tick in kraken_index.get_ticks_in_window(warmup_start, warmup_end):
+            raw_tick_buffer.append(tick)
+
+    # Pre-load Kraken decision-zone ticks (fed incrementally below)
+    kr_all_ticks = []
+    if kraken_index is not None:
+        kr_all_ticks = kraken_index.get_ticks_in_window(
+            window.window_start + timedelta(minutes=5), window.window_end,
+        )
+    kr_tick_idx = 0
 
     # Use Kalshi settlement as ground truth if available
     label = None
@@ -79,7 +97,7 @@ def extract_window_sequences(
     while current_check < window.window_end:
         next_check = current_check + check_interval
 
-        # Feed ticks up to current_check — append to sorted list (already chronological)
+        # Feed Coinbase ticks up to current_check
         while tick_idx < len(window.ticks_during) and window.ticks_during[tick_idx].ts < current_check:
             tick = window.ticks_during[tick_idx]
             tick_dict = {
@@ -91,9 +109,20 @@ def extract_window_sequences(
             sorted_ticks.append(tick_dict)
             tick_idx += 1
 
+        # Feed Kraken ticks up to current_check (aggregated stream)
+        while kr_tick_idx < len(kr_all_ticks) and kr_all_ticks[kr_tick_idx]["ts"] < current_check:
+            sorted_ticks.append(kr_all_ticks[kr_tick_idx])
+            kr_tick_idx += 1
+
         # Compute decision minute
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
+
+        # Re-sort so Coinbase and Kraken ticks interleave by timestamp, matching
+        # live behavior (live merges then sorts before passing to LSTM).
+        # Without this, bisect inside extract_lstm_sequence gives wrong indices
+        # when kraken ticks are appended after coinbase ticks with earlier ts.
+        sorted_ticks.sort(key=lambda t: t["ts"])
 
         # Extract LSTM sequence — pass list directly (no copy needed)
         seq = extract_lstm_sequence(
@@ -150,6 +179,14 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
         windows = [w for w in windows if w.window_start.weekday() >= 5]
         logger.info("Day filter weekend: {} -> {} windows", before, len(windows))
 
+    # Load Kraken tick index for aggregated tick stream
+    kraken_index = None
+    if (KRAKEN_DIR / asset.upper()).exists():
+        kraken_index = KrakenTickIndex(KRAKEN_DIR, asset.upper())
+        logger.info("Kraken ticks loaded for {}: {} (will merge into tick stream)", asset, kraken_index.n_ticks())
+    else:
+        logger.info("No Kraken data for {} -- Coinbase ticks only", asset)
+
     logger.info("Generating LSTM training data for {} ({} windows)", asset, len(windows))
 
     # Load Kalshi settlement results for accurate labels
@@ -176,7 +213,10 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0, day_
         if i % log_interval == 0:
             logger.info("Processing window {}/{}", i + 1, len(windows))
 
-        rows = extract_window_sequences(window, kalshi_settlements=kalshi_settlements, asset=asset)
+        rows = extract_window_sequences(
+            window, kalshi_settlements=kalshi_settlements, asset=asset,
+            kraken_index=kraken_index,
+        )
         for row in rows:
             all_sequences.append(row["sequence"])
             all_labels.append(row["label"])
