@@ -10,13 +10,13 @@
   "assets": {
     "BTC": {
       "initial_balance": 25.0,
-      "max_contracts_per_trade": 10,
+      "max_contracts_per_trade": 500,
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.1,
         "threshold": 0.75,
-        "min_dm": 2,
+        "min_dm": 7,
         "max_dm": 8,
         "max_price_cents": 80,
         "pnl_sweep_total_pnl": 2047.4,
@@ -27,8 +27,38 @@
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.2,
         "lstm_max_w": 0.4,
-        "walk_forward_pnl": 281.15,
-        "walk_forward_wr": 83.7
+        "walk_forward_pnl": 133.33,
+        "walk_forward_wr": 86.4,
+        "walk_forward_min_fold_pnl": 127.6,
+        "walk_forward_min_fold_wr": 84.7,
+        "walk_forward_fold_pnls": [
+          127.6,
+          129.7,
+          130.0,
+          146.0
+        ],
+        "walk_forward_fold_wrs": [
+          84.9,
+          87.0,
+          84.7,
+          88.8
+        ],
+        "walk_forward_consistent_good_hours": [
+          14,
+          23,
+          16,
+          3,
+          10,
+          6,
+          0,
+          13,
+          11,
+          7,
+          19
+        ],
+        "walk_forward_consistent_bad_hours": [],
+        "dynamic_k_xgb": 8.0,
+        "dynamic_k_lstm": 3.0
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
@@ -51,13 +81,13 @@
     },
     "ETH": {
       "initial_balance": 25.0,
-      "max_contracts_per_trade": 10,
+      "max_contracts_per_trade": 500,
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.1,
         "threshold": 0.75,
-        "min_dm": 3,
+        "min_dm": 4,
         "max_dm": 8,
         "max_price_cents": 80,
         "pnl_sweep_total_pnl": 1138.4,
@@ -68,8 +98,36 @@
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.2,
         "lstm_max_w": 0.4,
-        "walk_forward_pnl": 207.27,
-        "walk_forward_wr": 81.9
+        "walk_forward_pnl": 112.25,
+        "walk_forward_wr": 83.5,
+        "walk_forward_min_fold_pnl": 94.3,
+        "walk_forward_min_fold_wr": 80.0,
+        "walk_forward_fold_pnls": [
+          94.3,
+          151.7,
+          106.2,
+          96.8
+        ],
+        "walk_forward_fold_wrs": [
+          83.6,
+          87.6,
+          82.8,
+          80.0
+        ],
+        "walk_forward_consistent_good_hours": [
+          11,
+          4,
+          12,
+          0,
+          14,
+          20,
+          10,
+          5,
+          6
+        ],
+        "walk_forward_consistent_bad_hours": [],
+        "dynamic_k_xgb": 8.0,
+        "dynamic_k_lstm": 6.0
       },
       "ensemble_weekend": {
         "ml_weight": 0.2,
@@ -92,15 +150,15 @@
     },
     "SOL": {
       "initial_balance": 25.0,
-      "max_contracts_per_trade": 10,
-      "max_price_cents": 75,
+      "max_contracts_per_trade": 500,
+      "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.2,
         "threshold": 0.75,
-        "min_dm": 2,
+        "min_dm": 4,
         "max_dm": 8,
-        "max_price_cents": 75,
+        "max_price_cents": 80,
         "pnl_sweep_total_pnl": 1028.6,
         "pnl_sweep_source": "ensemble_combo_sweep",
         "win_rate": 83.2,
@@ -109,8 +167,43 @@
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.1,
         "lstm_max_w": 0.4,
-        "walk_forward_pnl": 238.85,
-        "walk_forward_wr": 81.9
+        "walk_forward_pnl": 142.07,
+        "walk_forward_wr": 85.6,
+        "walk_forward_min_fold_pnl": 134.8,
+        "walk_forward_min_fold_wr": 83.6,
+        "walk_forward_fold_pnls": [
+          134.8,
+          143.2,
+          148.6,
+          141.7
+        ],
+        "walk_forward_fold_wrs": [
+          86.5,
+          86.3,
+          83.6,
+          86.1
+        ],
+        "walk_forward_consistent_good_hours": [
+          20,
+          11,
+          4,
+          10,
+          9,
+          1,
+          3,
+          8,
+          15,
+          18,
+          14,
+          17,
+          5,
+          7
+        ],
+        "walk_forward_consistent_bad_hours": [
+          13
+        ],
+        "dynamic_k_xgb": 6.0,
+        "dynamic_k_lstm": 6.0
       },
       "ensemble_weekend": {
         "ml_weight": 0.2,
@@ -133,13 +226,13 @@
     },
     "XRP": {
       "initial_balance": 25.0,
-      "max_contracts_per_trade": 10,
+      "max_contracts_per_trade": 500,
       "max_price_cents": 80,
       "min_price_cents": 60,
       "ensemble": {
         "ml_weight": 0.1,
         "threshold": 0.75,
-        "min_dm": 2,
+        "min_dm": 4,
         "max_dm": 8,
         "max_price_cents": 80,
         "pnl_sweep_total_pnl": 1283.8,
@@ -150,8 +243,38 @@
         "xgb_max_w": 0.8,
         "lstm_min_w": 0.2,
         "lstm_max_w": 0.4,
-        "walk_forward_pnl": 241.93,
-        "walk_forward_wr": 82.7
+        "walk_forward_pnl": 110.82,
+        "walk_forward_wr": 84.5,
+        "walk_forward_min_fold_pnl": 70.8,
+        "walk_forward_min_fold_wr": 78.8,
+        "walk_forward_fold_pnls": [
+          132.3,
+          131.4,
+          70.8,
+          108.8
+        ],
+        "walk_forward_fold_wrs": [
+          86.0,
+          90.3,
+          78.8,
+          83.2
+        ],
+        "walk_forward_consistent_good_hours": [
+          9,
+          14,
+          18,
+          16,
+          1,
+          6,
+          20,
+          12,
+          0
+        ],
+        "walk_forward_consistent_bad_hours": [
+          8
+        ],
+        "dynamic_k_xgb": 8.0,
+        "dynamic_k_lstm": 3.0
       },
       "ensemble_weekend": {
         "ml_weight": 0.1,
@@ -180,6 +303,7 @@
       "ensemble": {
         "ml_weight": 0.2,
         "threshold": 0.7,
+        "min_dm": 7,
         "max_price_cents": 70,
         "pnl_sweep_total_pnl": 119.3,
         "pnl_sweep_source": "ensemble_combo_sweep",
@@ -213,6 +337,7 @@
       "ensemble": {
         "ml_weight": 0.3,
         "threshold": 0.7,
+        "min_dm": 7,
         "max_price_cents": 80,
         "pnl_sweep_total_pnl": 42.5,
         "pnl_sweep_source": "ensemble_combo_sweep",
@@ -237,6 +362,7 @@
       "ensemble": {
         "ml_weight": 0.1,
         "threshold": 0.62,
+        "min_dm": 7,
         "max_price_cents": 80,
         "pnl_sweep_total_pnl": 250.3,
         "pnl_sweep_source": "ensemble_combo_sweep",
