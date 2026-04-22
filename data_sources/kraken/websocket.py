@@ -14,7 +14,9 @@ from typing import Any, Callable, Optional
 import websockets
 
 ASSET_TO_PAIR = {
-    "BTC": "XBT/USD",
+    # Kraken v2 WS uses "BTC/USD" (not "XBT/USD" which was the v1 name).
+    # The v2 API explicitly rejects XBT/USD: {'error': 'Currency pair not supported XBT/USD'}.
+    "BTC": "BTC/USD",
     "ETH": "ETH/USD",
     "SOL": "SOL/USD",
     "XRP": "XRP/USD",
@@ -69,6 +71,19 @@ class KrakenWebSocket:
                             break
                         try:
                             msg = json.loads(raw_msg)
+                            # Surface subscribe/error responses so silent
+                            # subscription failures don't go unnoticed.
+                            if msg.get("method") == "subscribe" and not msg.get("success", True):
+                                from loguru import logger
+                                logger.error(
+                                    "[kraken-%s] Subscribe FAILED for %s: %s",
+                                    self.asset, self.pair, msg.get("error", msg),
+                                )
+                            elif msg.get("error"):
+                                from loguru import logger
+                                logger.warning(
+                                    "[kraken-%s] WS error: %s", self.asset, msg
+                                )
                             if msg.get("channel") == "trade" and "data" in msg:
                                 for t in msg["data"]:
                                     trade = {
