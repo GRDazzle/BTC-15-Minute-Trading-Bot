@@ -268,8 +268,10 @@ def generate_for_asset(asset: str, days: int | None, min_move: float = 0.0,
 
 
 def main():
+    import os as _os
     logger.remove()
-    log_path = PROJECT_ROOT / "logs" / "generate_lstm_data.log"
+    # Per-process log path so parallel regens don't truncate each other's logs.
+    log_path = PROJECT_ROOT / "logs" / f"generate_lstm_data_{_os.getpid()}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger.add(str(log_path), mode="w", level="INFO",
                format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}")

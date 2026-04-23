@@ -236,12 +236,15 @@ def train_asset(
     model.load_state_dict(best_state)
     model.eval()
 
-    # Test evaluation
-    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    # Test evaluation — batched to avoid GPU OOM on large datasets
     y_test_t = torch.tensor(y_test, dtype=torch.float32).to(device)
-
+    eval_batch = 2048
+    test_pred_parts = []
     with torch.no_grad():
-        test_pred = model(X_test_t)
+        for i in range(0, len(X_test), eval_batch):
+            xb = torch.tensor(X_test[i:i + eval_batch], dtype=torch.float32).to(device)
+            test_pred_parts.append(model(xb))
+        test_pred = torch.cat(test_pred_parts)
         test_labels = (test_pred > 0.5).float()
         test_acc = (test_labels == y_test_t).float().mean().item()
         test_correct = int((test_labels == y_test_t).sum().item())

@@ -648,8 +648,9 @@ def main():
                         help="Run assets sequentially instead of in parallel")
     args = parser.parse_args()
 
-    # Determine config key: 'ensemble_early' for early models, 'ensemble' for standard
-    config_key = "ensemble_early" if args.model_suffix == "_early" else "ensemble"
+    # Determine config key: suffix maps to "ensemble{suffix}" so staging runs
+    # like --model-suffix _align2s write to "ensemble_align2s" not "ensemble".
+    config_key = f"ensemble{args.model_suffix}" if args.model_suffix else "ensemble"
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
     best_per_asset: dict[str, dict] = {}

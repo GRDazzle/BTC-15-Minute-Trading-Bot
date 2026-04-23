@@ -180,7 +180,9 @@ def _market_ticker_from_event(event_ticker: str, strike: str = "00") -> str:
 def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
                  cfg: dict, writer: csv.writer, balance: float = 25.0,
                  after_ts: datetime | None = None,
-                 before_ts: datetime | None = None) -> dict:
+                 before_ts: datetime | None = None,
+                 xgb_suffix: str = "",
+                 lstm_suffix: str = "") -> dict:
     """Replay [from_date, to_date] inclusive for one asset. Returns summary dict.
 
     If after_ts / before_ts are given, only checks with that timestamp range are
@@ -192,13 +194,15 @@ def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
         ts_label = f"  [filter {lo} .. {hi}]"
     print(f"\n=== {asset} | {from_date} -> {to_date}{ts_label} ===")
 
-    # Load processors (same as live)
-    ml_proc = MLProcessor(asset=asset, model_dir=MODEL_DIR)
+    # Load processors (same as live). Optional suffix lets us audit staging models.
+    ml_proc = MLProcessor(asset=asset, model_dir=MODEL_DIR, model_suffix=xgb_suffix)
     try:
-        lstm_proc = LSTMProcessor(asset=asset, model_dir=MODEL_DIR)
+        lstm_proc = LSTMProcessor(asset=asset, model_dir=MODEL_DIR, model_suffix=lstm_suffix)
     except FileNotFoundError:
-        print(f"  [warn] No LSTM model for {asset}; running XGB+fusion only")
+        print(f"  [warn] No LSTM model for {asset}{lstm_suffix}; running XGB+fusion only")
         lstm_proc = None
+    if xgb_suffix or lstm_suffix:
+        print(f"  using models: XGB={asset}{xgb_suffix}_xgb, LSTM={asset}{lstm_suffix}_lstm")
 
     # Load Kalshi poll index for all dates covered (+1 day overlap)
     poll_idx = KalshiPollIndex(KALSHI_DIR, asset)
@@ -452,6 +456,10 @@ def main():
                     help="Only include checks at/after this ISO timestamp (UTC).")
     ap.add_argument("--before-ts", default=None,
                     help="Only include checks at/before this ISO timestamp (UTC).")
+    ap.add_argument("--xgb-suffix", default="",
+                    help="Load a staging XGB model (e.g. _align2s -> BTC_align2s_xgb.json)")
+    ap.add_argument("--lstm-suffix", default="",
+                    help="Load a staging LSTM model (same pattern)")
     args = ap.parse_args()
 
     after_ts = before_ts = None
@@ -500,7 +508,9 @@ def main():
                 continue
             s = replay_asset(asset, from_date, to_date, cfg, writer,
                              balance=args.balance,
-                             after_ts=after_ts, before_ts=before_ts)
+                             after_ts=after_ts, before_ts=before_ts,
+                             xgb_suffix=args.xgb_suffix,
+                             lstm_suffix=args.lstm_suffix)
             summaries.append(s)
 
     print("\n=== SUMMARY ===")
