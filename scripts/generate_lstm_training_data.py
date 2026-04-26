@@ -26,6 +26,7 @@ from backtester.data_loader_ticks import (
     load_aggtrades_multi,
     generate_tick_windows,
 )
+from core.tick_window_slicer import TickWindowSlicer
 from ml.lstm_features import LSTM_SEQ_LEN, LSTM_NUM_FEATURES, extract_lstm_sequence
 from ml.multi_exchange import KrakenTickIndex
 
@@ -49,31 +50,30 @@ def extract_window_sequences(
 
     Returns list of dicts with 'sequence' (ndarray), 'label', 'window_start', 'dm'.
     """
-    # Build raw tick buffer from warmup + during ticks
-    raw_tick_buffer: deque = deque(maxlen=max(5000, seq_len * 10))
+    # Authoritative tick primitive — same semantics as live/replay/sweep.
+    # One slicer per window, populated with all CB + KR ticks in range. Per-
+    # checkpoint queries pull the exact 180s window live's LSTM would see.
+    slicer = TickWindowSlicer()
+    cb_warmup = [
+        {"ts": t.ts, "price": t.price, "qty": t.qty, "is_buyer": t.is_buyer}
+        for t in window.ticks_before
+    ]
+    cb_during = [
+        {"ts": t.ts, "price": t.price, "qty": t.qty, "is_buyer": t.is_buyer}
+        for t in window.ticks_during
+    ]
+    if cb_warmup:
+        slicer.extend("coinbase", cb_warmup)
+    if cb_during:
+        slicer.extend("coinbase", cb_during)
 
-    for tick in window.ticks_before:
-        raw_tick_buffer.append({
-            "ts": tick.ts,
-            "price": tick.price,
-            "qty": tick.qty,
-            "is_buyer": tick.is_buyer,
-        })
-
-    # Merge Kraken warmup ticks into tick buffer (aggregated stream)
     if kraken_index is not None:
-        warmup_start = window.window_start - timedelta(minutes=10)
-        warmup_end = window.window_start + timedelta(minutes=5)
-        for tick in kraken_index.get_ticks_in_window(warmup_start, warmup_end):
-            raw_tick_buffer.append(tick)
-
-    # Pre-load Kraken decision-zone ticks (fed incrementally below)
-    kr_all_ticks = []
-    if kraken_index is not None:
-        kr_all_ticks = kraken_index.get_ticks_in_window(
-            window.window_start + timedelta(minutes=5), window.window_end,
+        kr_ticks = kraken_index.get_ticks_in_window(
+            window.window_start - timedelta(minutes=10),
+            window.window_end,
         )
-    kr_tick_idx = 0
+        if kr_ticks:
+            slicer.extend("kraken", list(kr_ticks))
 
     # Use Kalshi settlement as ground truth if available
     label = None
@@ -93,44 +93,19 @@ def extract_window_sequences(
     check_interval = timedelta(seconds=check_interval_seconds)
     current_check = decision_start + check_interval
 
-    # Build sorted tick list once from warmup, append incrementally (ticks arrive in order)
-    sorted_ticks = list(raw_tick_buffer)
-
-    tick_idx = 0
-
     while current_check < window.window_end:
-        next_check = current_check + check_interval
-
-        # Feed Coinbase ticks up to current_check
-        while tick_idx < len(window.ticks_during) and window.ticks_during[tick_idx].ts < current_check:
-            tick = window.ticks_during[tick_idx]
-            tick_dict = {
-                "ts": tick.ts,
-                "price": tick.price,
-                "qty": tick.qty,
-                "is_buyer": tick.is_buyer,
-            }
-            sorted_ticks.append(tick_dict)
-            tick_idx += 1
-
-        # Feed Kraken ticks up to current_check (aggregated stream)
-        while kr_tick_idx < len(kr_all_ticks) and kr_all_ticks[kr_tick_idx]["ts"] < current_check:
-            sorted_ticks.append(kr_all_ticks[kr_tick_idx])
-            kr_tick_idx += 1
-
         # Compute decision minute
         elapsed_s = (current_check - window.window_start).total_seconds()
         dm = int((elapsed_s - 300) / 60)
 
-        # Re-sort so Coinbase and Kraken ticks interleave by timestamp, matching
-        # live behavior (live merges then sorts before passing to LSTM).
-        # Without this, bisect inside extract_lstm_sequence gives wrong indices
-        # when kraken ticks are appended after coinbase ticks with earlier ts.
-        sorted_ticks.sort(key=lambda t: t["ts"])
+        # Merged CB+KR window sized for LSTM lookback. Same `sources` order as
+        # live (kalshi_strategy.py:2005-2009) — CB first, then KR.
+        tick_window = slicer.get_merged_window(
+            current_check, seq_len, sources=("coinbase", "kraken"),
+        )
 
-        # Extract LSTM sequence — pass list directly (no copy needed)
         seq = extract_lstm_sequence(
-            sorted_ticks,
+            tick_window,
             current_check,
             decision_minute=dm,
             seq_len=seq_len,
@@ -146,7 +121,7 @@ def extract_window_sequences(
                 "dm": dm,
             })
 
-        current_check = next_check
+        current_check += check_interval
 
     return rows
 
