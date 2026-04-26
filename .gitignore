@@ -168,3 +168,9 @@ nul
 *.swo
 node_modules/
 .cache/
+# Runtime state archives (state_reset_*.tar / dirs — local restore points only)
+archive/
+# Hand-saved config snapshots before risky edits — keep locally, not in git
+config/trading.json.before_*
+# Telegram experiment inbox (failed bridge attempt 2026-04-26)
+data/telegram_inbox.jsonl
