@@ -6,12 +6,22 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .client import KalshiClient
 
 logger = logging.getLogger(__name__)
+
+# Fallback threshold: if a market stays status=closed without a finalized
+# result for this long past its expected_expiration_time, we infer outcome
+# from last_price_dollars. Keeps dry-run PnL flowing when Kalshi is slow to
+# finalize. Live trades are still reconciled by verification_loop when Kalshi
+# eventually finalizes.
+_STUCK_FALLBACK_MINUTES = 10
+# Below this ambiguity zone around 0.5, we refuse to guess and keep waiting.
+_AMBIGUITY_BAND_LOW = 0.25
+_AMBIGUITY_BAND_HIGH = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +92,24 @@ def fetch_current_market(
     Returns None if no open market is found.
     """
     try:
+        # Retry transient 429s with exponential backoff before giving up —
+        # matches the persistence we want for fetch_event_outcome and keeps
+        # trade-entry from failing on a short rate-limit spike.
+        max_attempts = 4
+        backoff = 0.5
+        attempts = 0
         st, data = client.get_markets(series_ticker=series, status="open")
+        attempts += 1
+        while st == 429 and attempts < max_attempts:
+            time.sleep(backoff)
+            backoff *= 2
+            st, data = client.get_markets(series_ticker=series, status="open")
+            attempts += 1
         if st != 200:
-            logger.warning("markets fetch failed for %s status=%s", series, st)
+            logger.warning(
+                "markets fetch failed for %s status=%s (after %d attempt%s)",
+                series, st, attempts, "" if attempts == 1 else "s",
+            )
             return None
 
         markets = data.get("markets", []) or []
@@ -178,10 +203,55 @@ def fetch_event_outcome(
             return None
 
         markets = data.get("markets", []) or []
+        # Happy path: Kalshi has finalized — result is "yes" or "no".
         for m in markets:
             result = m.get("result")
             if result in ("yes", "no"):
                 return result
+
+        # Fallback: Kalshi is slow to finalize (status=closed, result=""). After
+        # a threshold past expected_expiration_time, infer from last_price_dollars
+        # if it's unambiguous (outside the 0.25-0.75 band). Logged as WARN so
+        # we notice when this fires.
+        now = datetime.now(timezone.utc)
+        for m in markets:
+            if m.get("status") != "closed":
+                continue
+            exp_raw = m.get("expected_expiration_time")
+            if not exp_raw:
+                continue
+            try:
+                exp_time = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            minutes_late = (now - exp_time).total_seconds() / 60.0
+            if minutes_late < _STUCK_FALLBACK_MINUTES:
+                continue  # give Kalshi more time
+
+            try:
+                last_price = float(m.get("last_price_dollars", 0.5))
+            except (ValueError, TypeError):
+                continue
+            if last_price >= _AMBIGUITY_BAND_HIGH:
+                logger.warning(
+                    "event %s stuck status=closed %.1fmin past expected_expiration "
+                    "(result=''); fallback outcome=yes from last_price=$%.4f",
+                    event_ticker, minutes_late, last_price,
+                )
+                return "yes"
+            if last_price <= _AMBIGUITY_BAND_LOW:
+                logger.warning(
+                    "event %s stuck status=closed %.1fmin past expected_expiration "
+                    "(result=''); fallback outcome=no from last_price=$%.4f",
+                    event_ticker, minutes_late, last_price,
+                )
+                return "no"
+            logger.debug(
+                "event %s stuck status=closed %.1fmin late but last_price=$%.4f "
+                "is in ambiguity band [%.2f, %.2f]; keeping trade pending",
+                event_ticker, minutes_late, last_price,
+                _AMBIGUITY_BAND_LOW, _AMBIGUITY_BAND_HIGH,
+            )
 
         logger.debug(
             "event outcome: no result for %s (%d markets checked)",

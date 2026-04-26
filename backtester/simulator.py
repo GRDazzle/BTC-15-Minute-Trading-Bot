@@ -24,6 +24,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import (
     FusedSignal,
     SignalFusionEngine,
 )
+from core.tick_window_slicer import TickWindowSlicer
 
 
 @dataclass
@@ -47,13 +48,34 @@ class BacktestSimulator:
         ml_processor: Optional[object] = None,
         min_dm: int = 0,
         ensemble_weights: Optional[tuple] = None,
+        lstm_processor: Optional[object] = None,
+        check_interval_seconds: int = 10,
+        skip_fusion: bool = False,
+        batch_lstm: bool = False,
+        slicer: Optional[TickWindowSlicer] = None,
+        slicer_lookback_seconds: int = 900,
     ):
         self.processors = processors
         self.fusion_engine = fusion_engine
         self.ml_processor = ml_processor  # MLProcessor instance (optional)
+        self.lstm_processor = lstm_processor  # LSTMProcessor instance (optional)
         self.min_dm = min_dm  # Skip signals before this decision minute
         # ensemble_weights = (ml_weight, ensemble_threshold) or None
         self.ensemble_weights = ensemble_weights
+        # Decision-zone sampling cadence; 2s to match live's WS-driven cadence
+        # (old default 10s produced coarse-grained probabilities vs live).
+        self.check_interval_seconds = check_interval_seconds
+        # Skip fusion sub-processors entirely (useful for XGB+LSTM-only blends).
+        self.skip_fusion = skip_fusion
+        # Batch all LSTM inferences at the end of probability collection
+        # (much faster than per-checkpoint calls due to GPU kernel launch overhead).
+        self.batch_lstm = batch_lstm
+        # Authoritative tick primitive — when provided, `metadata["raw_tick_buffer"]`
+        # is built via slicer.get_merged_window(check_ts, lookback_seconds) instead
+        # of the old 1200-cap deque. Keeps sweep tick-handling structurally aligned
+        # with live (kalshi_strategy.py:2005) and with training/replay.
+        self.slicer = slicer
+        self.slicer_lookback_seconds = slicer_lookback_seconds
         # SMA lookup: date_str -> (sma5, sma15, sma30)
         self._sma_lookup: dict[str, tuple] = {}
         self._sma5: Optional[float] = None
@@ -266,7 +288,9 @@ class BacktestSimulator:
         # tick_buffer (maxlen=300) covers ~75 seconds at this rate.
         resample_ms = 250
 
-        # Raw tick buffer for ML volume features (parallel to resampled tick_buffer)
+        # Raw tick buffer for ML volume features (parallel to resampled tick_buffer).
+        # Skipped when a TickWindowSlicer is provided (slicer is the source of truth).
+        use_slicer = self.slicer is not None
         raw_tick_buffer: deque[dict] = deque(maxlen=1200)
 
         # Step 1: Feed warmup ticks (resampled to 250ms bars)
@@ -281,14 +305,15 @@ class BacktestSimulator:
                 price_history.append(Decimal(str(bar["price"])))
                 tick_buffer.append(bar)
 
-            # Populate raw tick buffer from warmup
-            for tick in window.ticks_before:
-                raw_tick_buffer.append({
-                    "ts": tick.ts,
-                    "price": tick.price,
-                    "qty": tick.qty,
-                    "is_buyer": tick.is_buyer,
-                })
+            # Populate raw tick buffer from warmup (only when no slicer)
+            if not use_slicer:
+                for tick in window.ticks_before:
+                    raw_tick_buffer.append({
+                        "ts": tick.ts,
+                        "price": tick.price,
+                        "qty": tick.qty,
+                        "is_buyer": tick.is_buyer,
+                    })
 
         # Step 2: Pre-resample decision zone ticks to 250ms bars
         if window.ticks_during:
@@ -322,16 +347,17 @@ class BacktestSimulator:
                 tick_buffer.append(bar)
                 bar_idx += 1
 
-            # Feed raw ticks up to current_check for ML volume features
-            while raw_tick_idx < len(window.ticks_during) and window.ticks_during[raw_tick_idx].ts < current_check:
-                tick = window.ticks_during[raw_tick_idx]
-                raw_tick_buffer.append({
-                    "ts": tick.ts,
-                    "price": tick.price,
-                    "qty": tick.qty,
-                    "is_buyer": tick.is_buyer,
-                })
-                raw_tick_idx += 1
+            # Feed raw ticks up to current_check for ML volume features (only when no slicer)
+            if not use_slicer:
+                while raw_tick_idx < len(window.ticks_during) and window.ticks_during[raw_tick_idx].ts < current_check:
+                    tick = window.ticks_during[raw_tick_idx]
+                    raw_tick_buffer.append({
+                        "ts": tick.ts,
+                        "price": tick.price,
+                        "qty": tick.qty,
+                        "is_buyer": tick.is_buyer,
+                    })
+                    raw_tick_idx += 1
 
             # Need enough history for processors
             if len(price_history) < 20:
@@ -357,9 +383,18 @@ class BacktestSimulator:
             else:
                 momentum = 0.0
 
+            # Merged CB+KR window (matches live's kalshi_strategy.py:2005-2009)
+            if use_slicer:
+                merged_buf = self.slicer.get_merged_window(
+                    current_check, self.slicer_lookback_seconds,
+                    sources=("coinbase", "kraken"),
+                )
+            else:
+                merged_buf = list(raw_tick_buffer)
+
             metadata = {
                 "tick_buffer": list(tick_buffer),
-                "raw_tick_buffer": list(raw_tick_buffer),
+                "raw_tick_buffer": merged_buf,
                 "spot_price": float(current_price),
                 "momentum": momentum,
                 "sentiment_score": fg_score,
@@ -551,6 +586,30 @@ class BacktestSimulator:
                 "checkpoints": checkpoints,
             })
 
+        # Batched LSTM inference pass — replaces per-checkpoint LSTM calls.
+        # Collect every valid sequence across all windows, stack, run once on GPU,
+        # then scatter predictions back into each checkpoint's "lstm_p" field.
+        if self.batch_lstm and self.lstm_processor is not None:
+            import numpy as _np
+            flat_seqs = []
+            flat_refs = []  # (checkpoint_dict,) to write lstm_p back into
+            for win in results:
+                for cp in win["checkpoints"]:
+                    seq = cp.get("_lstm_seq")
+                    if seq is not None:
+                        flat_seqs.append(seq)
+                        flat_refs.append(cp)
+            if flat_seqs:
+                logger.info("Batched LSTM: running {} sequences in one pass...", len(flat_seqs))
+                stacked = _np.stack(flat_seqs).astype(_np.float32)
+                preds = self.lstm_processor.predict_proba_batch(stacked)
+                for cp, p in zip(flat_refs, preds):
+                    cp["lstm_p"] = float(p)
+            # Strip per-checkpoint sequence references to free memory
+            for win in results:
+                for cp in win["checkpoints"]:
+                    cp.pop("_lstm_seq", None)
+
         return results
 
     def _collect_window_probabilities(
@@ -562,6 +621,10 @@ class BacktestSimulator:
     ) -> list[dict]:
         """Replay a window collecting (dm, ml_p, fusion_p) at every checkpoint."""
         resample_ms = 250
+        # When no slicer is provided, fall back to the old per-tick deque (1200-cap,
+        # CB-only). Sweep callers should pass a pre-loaded slicer for parity with
+        # live/replay/training.
+        use_slicer = self.slicer is not None
         raw_tick_buffer: deque[dict] = deque(maxlen=1200)
 
         if window.ticks_before:
@@ -574,11 +637,12 @@ class BacktestSimulator:
             for bar in warmup_bars:
                 price_history.append(Decimal(str(bar["price"])))
                 tick_buffer.append(bar)
-            for tick in window.ticks_before:
-                raw_tick_buffer.append({
-                    "ts": tick.ts, "price": tick.price,
-                    "qty": tick.qty, "is_buyer": tick.is_buyer,
-                })
+            if not use_slicer:
+                for tick in window.ticks_before:
+                    raw_tick_buffer.append({
+                        "ts": tick.ts, "price": tick.price,
+                        "qty": tick.qty, "is_buyer": tick.is_buyer,
+                    })
 
         if window.ticks_during:
             decision_bars = resample_ticks(
@@ -593,7 +657,7 @@ class BacktestSimulator:
         fg_score = fg_scores.get(window.window_start.strftime("%Y-%m-%d"), 50)
 
         decision_start = window.window_start + timedelta(minutes=5)
-        check_interval = timedelta(seconds=10)
+        check_interval = timedelta(seconds=self.check_interval_seconds)
         current_check = decision_start + check_interval
         bar_idx = 0
         raw_tick_idx = 0
@@ -608,13 +672,14 @@ class BacktestSimulator:
                 tick_buffer.append(bar)
                 bar_idx += 1
 
-            while raw_tick_idx < len(window.ticks_during) and window.ticks_during[raw_tick_idx].ts < current_check:
-                tick = window.ticks_during[raw_tick_idx]
-                raw_tick_buffer.append({
-                    "ts": tick.ts, "price": tick.price,
-                    "qty": tick.qty, "is_buyer": tick.is_buyer,
-                })
-                raw_tick_idx += 1
+            if not use_slicer:
+                while raw_tick_idx < len(window.ticks_during) and window.ticks_during[raw_tick_idx].ts < current_check:
+                    tick = window.ticks_during[raw_tick_idx]
+                    raw_tick_buffer.append({
+                        "ts": tick.ts, "price": tick.price,
+                        "qty": tick.qty, "is_buyer": tick.is_buyer,
+                    })
+                    raw_tick_idx += 1
 
             if len(price_history) < 20:
                 current_check = next_check
@@ -635,9 +700,18 @@ class BacktestSimulator:
             else:
                 momentum = 0.0
 
+            # Build the merged CB+KR buffer matching live's kalshi_strategy.py:2005-2009.
+            if use_slicer:
+                merged_buf = self.slicer.get_merged_window(
+                    current_check, self.slicer_lookback_seconds,
+                    sources=("coinbase", "kraken"),
+                )
+            else:
+                merged_buf = list(raw_tick_buffer)
+
             metadata = {
                 "tick_buffer": list(tick_buffer),
-                "raw_tick_buffer": list(raw_tick_buffer),
+                "raw_tick_buffer": merged_buf,
                 "spot_price": float(current_price),
                 "momentum": momentum,
                 "sentiment_score": fg_score,
@@ -660,12 +734,42 @@ class BacktestSimulator:
                 except Exception:
                     pass
 
-            # Get fusion probability
-            fusion_p = self._get_fusion_probability(
-                current_price, price_history, metadata,
-            )
+            # Get LSTM probability (per-checkpoint path; skipped if batch_lstm=True).
+            # With batch_lstm, we only extract the sequence here and run inference once
+            # at the end over all collected sequences — much faster than per-call GPU.
+            lstm_p = 0.5
+            lstm_sequence = None
+            if self.lstm_processor is not None:
+                if self.batch_lstm:
+                    try:
+                        lstm_sequence = self.lstm_processor.extract_sequence(
+                            current_price, list(price_history), metadata,
+                        )
+                    except Exception:
+                        lstm_sequence = None
+                else:
+                    try:
+                        raw_lp = self.lstm_processor.predict_proba(
+                            current_price, list(price_history), metadata,
+                        )
+                        if raw_lp is not None:
+                            lstm_p = raw_lp
+                    except Exception:
+                        pass
 
-            checkpoints.append({"dm": dm, "ml_p": ml_p, "fusion_p": fusion_p, "signal_ts": current_check})
+            # Get fusion probability (skipped in sweep when the formula doesn't use it)
+            if self.skip_fusion:
+                fusion_p = 0.5
+            else:
+                fusion_p = self._get_fusion_probability(
+                    current_price, price_history, metadata,
+                )
+
+            checkpoints.append({
+                "dm": dm, "ml_p": ml_p, "lstm_p": lstm_p, "fusion_p": fusion_p,
+                "signal_ts": current_check,
+                "_lstm_seq": lstm_sequence,  # populated only if batch_lstm=True
+            })
             current_check = next_check
 
         return checkpoints

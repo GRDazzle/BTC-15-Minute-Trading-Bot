@@ -13,7 +13,7 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sdk.kalshi.client import KalshiClient
@@ -291,6 +291,21 @@ class KalshiExecutionAdapter:
         """
         if trade.settlement_outcome is not None:
             return trade  # already settled
+
+        # Pre-close gate: don't poll Kalshi until the window has been closed for
+        # at least 2 minutes. Before that, the market's `result` field is always
+        # empty (it's still open or in transition), so every pre-close poll is
+        # wasted and contributes to rate-limit pressure. trade.window_id is the
+        # market close_time in ISO format.
+        if trade.window_id:
+            try:
+                close_dt = datetime.fromisoformat(
+                    trade.window_id.replace("Z", "+00:00")
+                )
+                if datetime.now(timezone.utc) < close_dt + timedelta(minutes=2):
+                    return trade  # window still open (or just barely closed)
+            except (ValueError, AttributeError):
+                pass  # bad window_id — fall through and try anyway
 
         outcome = fetch_event_outcome(self.client, trade.event_ticker)
         if outcome is None:

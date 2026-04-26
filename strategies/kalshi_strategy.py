@@ -31,6 +31,7 @@ from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitP
 from core.strategy_brain.signal_processors.divergence_processor import PriceDivergenceProcessor
 from core.strategy_brain.signal_processors.kalshi_price_processor import KalshiPriceProcessor
 from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine, FusedSignal
+from core.tick_window_slicer import TickWindowSlicer
 
 try:
     from core.strategy_brain.signal_processors.ml_processor import MLProcessor
@@ -105,11 +106,20 @@ class BinanceTradeWriter:
             symbol: Binance symbol (e.g. "btcusdt")
             trade: Trade dict from WS with raw fields (agg_trade_id, etc.)
         """
-        ts_ms = trade.get("timestamp_ms")
-        if ts_ms is None:
-            return  # Missing raw fields, skip
+        # Prefer microsecond-resolution timestamp when available so CSV matches
+        # the precision live's in-memory buffer uses. `timestamp_us` is set by
+        # the WS handlers that have a native us-precision datetime; fall back
+        # to the legacy ms field for older call-sites.
+        ts_us = trade.get("timestamp_us")
+        if ts_us is None:
+            ts_ms = trade.get("timestamp_ms")
+            if ts_ms is None:
+                return  # Missing raw fields, skip
+            ts_us = ts_ms * 1000  # legacy ms path — coarse, avoid for new code
+        else:
+            ts_ms = ts_us // 1000  # only used for date-rollover path below
 
-        trade_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        trade_dt = datetime.fromtimestamp(ts_us / 1_000_000, tz=timezone.utc)
         date_str = trade_dt.strftime("%Y-%m-%d")
 
         # Close old handles on day rollover
@@ -126,7 +136,6 @@ class BinanceTradeWriter:
             self._files[key] = (fh, csv.writer(fh))
 
         _, writer = self._files[key]
-        ts_us = ts_ms * 1000  # ms -> us
         writer.writerow([
             trade["agg_trade_id"],
             trade["price"],
@@ -190,6 +199,12 @@ class AssetState:
     kraken_current_price: Optional[float] = None
     bitstamp_current_price: Optional[float] = None
 
+    # Authoritative tick primitive — time-based window used to construct
+    # metadata["raw_tick_buffer"] at inference. Fed in parallel with the deques
+    # above so existing consumers (fusion processors, price_history) keep
+    # working while LSTM/XGB input matches replay/sweep/training exactly.
+    slicer: TickWindowSlicer = field(default_factory=TickWindowSlicer)
+
     # Live Kalshi prices (updated by WebSocket or REST poller)
     kalshi_market_ticker: Optional[str] = None
     kalshi_event_ticker: Optional[str] = None
@@ -200,6 +215,15 @@ class AssetState:
     kalshi_close_time: Optional[str] = None
     kalshi_last_update: Optional[datetime] = None
     kalshi_poll_history: list = field(default_factory=list)  # recent polls for RT features
+    # Volume/OI cached from the REST poller — WS doesn't push these but archive
+    # records want them, so WS->disk records inherit the last REST value. Default
+    # "0" (not "") so KalshiPollIndex.load()'s float() never crashes on early
+    # records before the first REST poll has populated these.
+    kalshi_volume: str = "0"
+    kalshi_oi: str = "0"
+    # Dedupe key for WS->disk writes: only write a new poll record when any of
+    # (yes_ask, yes_bid, no_ask, no_bid) changes from the last written value.
+    kalshi_last_archived: Optional[tuple] = None
 
     # Per-asset processor instances (no cross-contamination)
     spike: SpikeDetectionProcessor = field(default=None)
@@ -1135,6 +1159,11 @@ class KalshiMultiAssetStrategy:
             state.tick_buffer.append({"ts": t["ts"], "price": t["price"]})
         for t in kr:
             state.kraken_tick_buffer.append(t)
+        # Mirror into slicer for time-based merged queries at inference time.
+        if cb:
+            state.slicer.extend("coinbase", cb)
+        if kr:
+            state.slicer.extend("kraken", kr)
         logger.info(
             "[prewarm-%s] Loaded %d Coinbase + %d Kraken ticks from last %ds",
             asset, len(cb), len(kr), lookback_seconds,
@@ -1250,6 +1279,15 @@ class KalshiMultiAssetStrategy:
 
                     now_iso = datetime.now(timezone.utc).isoformat()
 
+                    # Cache volume/oi from this REST poll so WS->disk records
+                    # can inherit them (WS ticker doesn't push these fields).
+                    # Normalize None/empty to "0" so the archive loader's
+                    # float() conversion downstream never chokes.
+                    vol = market_info.get("volume")
+                    oi_val = market_info.get("oi")
+                    state.kalshi_volume = str(vol) if vol not in (None, "") else "0"
+                    state.kalshi_oi = str(oi_val) if oi_val not in (None, "") else "0"
+
                     # Write poll record
                     poll_record = {
                         "type": "poll",
@@ -1262,10 +1300,11 @@ class KalshiMultiAssetStrategy:
                         "yes_ask": market_info.get("yes_ask", 0),
                         "no_bid": market_info.get("no_bid", 0),
                         "no_ask": market_info.get("no_ask", 0),
-                        "volume": str(market_info.get("volume", "")),
-                        "oi": str(market_info.get("oi", "")),
+                        "volume": state.kalshi_volume,
+                        "oi": state.kalshi_oi,
                         "outcome": "",
                         "mins_to_close": market_info.get("mins_to_close", 0),
+                        "source": "rest",  # distinguish from WS-originated records
                     }
                     writer.write(state.series, poll_record)
 
@@ -1477,22 +1516,26 @@ class KalshiMultiAssetStrategy:
             state.tick_buffer.append({"ts": ts, "price": float(price)})
 
             # Update raw tick buffer (replaces Binance aggTrade)
-            state.raw_tick_buffer.append({
+            tick = {
                 "ts": ts,
                 "price": float(trade["price"]),
                 "qty": float(trade["quantity"]),
                 "is_buyer": trade["side"] == "buy",
-            })
+            }
+            state.raw_tick_buffer.append(tick)
+            state.slicer.append("coinbase", tick)
 
-            # Persist to daily CSV for backtesting/tuning
-            ts_ms = int(ts.timestamp() * 1000)
+            # Persist to daily CSV for backtesting/tuning — preserve
+            # microsecond precision so on-disk ts matches the in-memory buffer
+            # live feeds to extract_lstm_sequence.
+            ts_us = int(ts.timestamp() * 1_000_000)
             compat_trade = {
                 "agg_trade_id": 0,
                 "price": float(trade["price"]),
                 "quantity": float(trade["quantity"]),
                 "first_id": 0,
                 "last_id": 0,
-                "timestamp_ms": ts_ms,
+                "timestamp_us": ts_us,
                 "is_buyer_maker": trade["side"] != "buy",
                 "best_price_match": True,
             }
@@ -1534,15 +1577,18 @@ class KalshiMultiAssetStrategy:
 
             state.kraken_current_price = trade["price"]
             ts = trade["timestamp"]
-            state.kraken_tick_buffer.append({
+            tick = {
                 "ts": ts,
                 "price": float(trade["price"]),
                 "qty": float(trade["quantity"]),
                 "is_buyer": trade["side"] == "buy",
-            })
+            }
+            state.kraken_tick_buffer.append(tick)
+            state.slicer.append("kraken", tick)
 
-            # Persist to daily CSV for future training
-            ts_ms = int(ts.timestamp() * 1000)
+            # Persist to daily CSV for future training — microsecond precision
+            # matches the in-memory buffer.
+            ts_us = int(ts.timestamp() * 1_000_000)
             from data_sources.kraken.websocket import ASSET_TO_PAIR as _KRAKEN_MAP
             kraken_symbol = _KRAKEN_MAP.get(asset, asset + "USD").replace("/", "")
             compat_trade = {
@@ -1551,7 +1597,7 @@ class KalshiMultiAssetStrategy:
                 "quantity": float(trade["quantity"]),
                 "first_id": 0,
                 "last_id": 0,
-                "timestamp_ms": ts_ms,
+                "timestamp_us": ts_us,
                 "is_buyer_maker": trade["side"] != "buy",
                 "best_price_match": True,
             }
@@ -1583,15 +1629,17 @@ class KalshiMultiAssetStrategy:
         def on_trade(trade: dict[str, Any]):
             state.bitstamp_current_price = trade["price"]
             ts = trade["timestamp"]
-            state.bitstamp_tick_buffer.append({
+            tick = {
                 "ts": ts,
                 "price": float(trade["price"]),
                 "qty": float(trade["quantity"]),
                 "is_buyer": trade["side"] == "buy",
-            })
+            }
+            state.bitstamp_tick_buffer.append(tick)
+            state.slicer.append("bitstamp", tick)
 
-            # Persist to daily CSV for future training
-            ts_ms = int(ts.timestamp() * 1000)
+            # Persist to daily CSV for future training — microsecond precision
+            ts_us = int(ts.timestamp() * 1_000_000)
             bitstamp_symbol = f"{asset}USD"
             compat_trade = {
                 "agg_trade_id": 0,
@@ -1599,7 +1647,7 @@ class KalshiMultiAssetStrategy:
                 "quantity": float(trade["quantity"]),
                 "first_id": 0,
                 "last_id": 0,
-                "timestamp_ms": ts_ms,
+                "timestamp_us": ts_us,
                 "is_buyer_maker": trade["side"] != "buy",
                 "best_price_match": True,
             }
@@ -1714,13 +1762,16 @@ class KalshiMultiAssetStrategy:
     async def _kalshi_ws_stream(self):
         """Stream Kalshi ticker prices via WebSocket.
 
-        Subscribes to current market tickers and updates AssetState
-        with live yes_ask/no_ask prices. Re-subscribes every 15 minutes
-        when market tickers change.
+        Subscribes to current market tickers and updates AssetState with live
+        yes_ask/no_ask prices. Re-subscribes every 15 minutes when market
+        tickers change. Also writes every changed ticker message to the poll
+        archive (dedupe by bid/ask change) so replay/sweep/training see the
+        same sub-second granularity live does.
         """
         from sdk.kalshi.websocket import KalshiWebSocket
 
         kalshi_ws = KalshiWebSocket(self.client.cfg)
+        ws_archive_writer = KalshiDataWriter()
 
         def on_ticker(msg: dict):
             """Update AssetState with live Kalshi prices."""
@@ -1741,10 +1792,11 @@ class KalshiMultiAssetStrategy:
                         state.kalshi_yes_bid = yes_bid
                         # no_ask = 100 - yes_bid
                         state.kalshi_no_ask = 100 - yes_bid
-                    state.kalshi_last_update = datetime.now(timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    state.kalshi_last_update = now
                     # Track poll history for Kalshi RT features
                     state.kalshi_poll_history.append({
-                        "ts": state.kalshi_last_update,
+                        "ts": now,
                         "yes_ask": state.kalshi_yes_ask,
                         "yes_bid": state.kalshi_yes_bid,
                         "no_ask": state.kalshi_no_ask,
@@ -1755,6 +1807,47 @@ class KalshiMultiAssetStrategy:
                     # Keep last 60 polls (~2 min at 2s interval)
                     if len(state.kalshi_poll_history) > 60:
                         state.kalshi_poll_history = state.kalshi_poll_history[-60:]
+
+                    # Archive this tick to disk — same format as REST polls so
+                    # replay/sweep/training find_poll() sees it. Dedupe on the
+                    # 4-tuple so unchanged repeats don't flood the file.
+                    archive_key = (
+                        state.kalshi_yes_ask, state.kalshi_yes_bid,
+                        state.kalshi_no_ask, state.kalshi_no_bid,
+                    )
+                    if archive_key != state.kalshi_last_archived:
+                        state.kalshi_last_archived = archive_key
+                        mtc = None
+                        if state.kalshi_close_time:
+                            try:
+                                close_dt = datetime.fromisoformat(state.kalshi_close_time)
+                                mtc = (close_dt - now).total_seconds() / 60.0
+                            except (ValueError, AttributeError):
+                                pass
+                        ws_record = {
+                            "type": "poll",
+                            "ts": now.isoformat(),
+                            "series": state.series,
+                            "event_ticker": state.kalshi_event_ticker or "",
+                            "market_ticker": market_ticker,
+                            "close_time": state.kalshi_close_time or "",
+                            "yes_bid": state.kalshi_yes_bid,
+                            "yes_ask": state.kalshi_yes_ask,
+                            "no_bid": state.kalshi_no_bid,
+                            "no_ask": state.kalshi_no_ask,
+                            "volume": state.kalshi_volume,  # inherited from REST
+                            "oi": state.kalshi_oi,
+                            "outcome": "",
+                            "mins_to_close": mtc if mtc is not None else 0,
+                            "source": "ws",
+                        }
+                        try:
+                            ws_archive_writer.write(state.series, ws_record)
+                        except Exception:
+                            logger.debug(
+                                "[kalshi-ws-archive] write failed for %s",
+                                state.series, exc_info=True,
+                            )
                     break
 
         def on_error(msg: dict):
@@ -2000,12 +2093,17 @@ class KalshiMultiAssetStrategy:
         # v13: Kalshi poll history for RT microstructure features
         metadata["kalshi_poll_history"] = list(state.kalshi_poll_history) if state.kalshi_poll_history else None
 
-        # v12: Merge Kraken ticks into the main tick buffer for aggregated features
-        # (volume, velocity, tick_intensity computed from combined Coinbase+Kraken stream)
-        if state.kraken_tick_buffer:
-            merged_buffer = list(state.raw_tick_buffer)
-            merged_buffer.extend(state.kraken_tick_buffer)
-            merged_buffer.sort(key=lambda t: t["ts"])
+        # Merged CB+KR buffer for XGB + LSTM input, via the authoritative tick
+        # primitive. Same function + same source order as replay/sweep/training —
+        # so the LSTM/XGB input is structurally identical across all four paths.
+        # Lookback 900s covers both LSTM (needs last 180s internally) and XGB
+        # (velocity_900s); extract_lstm_sequence slices to 180s itself.
+        merged_buffer = state.slicer.get_merged_window(
+            datetime.now(timezone.utc),
+            900,
+            sources=("coinbase", "kraken"),
+        )
+        if merged_buffer:
             metadata["raw_tick_buffer"] = merged_buffer
 
         # Cross-exchange divergence feature (kraken_coinbase_price_diff)
@@ -2034,11 +2132,16 @@ class KalshiMultiAssetStrategy:
             active_lstm = state.lstm_processor
             model_label = "standard"
 
-        # v9 dynamic blend: XGB + LSTM + Fusion weighted by confidence^4.5
+        # Formula C: 2-way XGB+LSTM blend, each weighted by its own confidence^k.
+        # Fusion dropped per _align2s alignment work (2026-04-24). Both sweep and
+        # replay use this exact formula, so live's decisions match their predictions.
+        #   xgb_w_raw  = xgb_conf ^ k_xgb
+        #   lstm_w_raw = lstm_conf ^ k_lstm
+        #   ensemble_p = (xgb_w_raw * ml_p + lstm_w_raw * lstm_p) / (xgb_w_raw + lstm_w_raw)
         if active_weights is not None and active_ml is not None:
-            xgb_min_w, ens_threshold = active_weights
+            _legacy_min_w, ens_threshold = active_weights
 
-            # XGB standalone prediction (no stacking — lstm_p is NOT a feature)
+            # XGB standalone prediction
             ml_p = active_ml.predict_proba(
                 state.current_price, list(state.price_history), metadata,
             )
@@ -2053,30 +2156,35 @@ class KalshiMultiAssetStrategy:
                     state.current_price, list(state.price_history), metadata,
                 )
 
-            # Fusion probability (SpikeDetection + TickVelocity + ...)
-            fusion_p = self._get_fusion_probability(state, metadata)
+            # Fusion no longer contributes; kept as neutral 0.5 for legacy log columns only.
+            fusion_p = 0.5
 
-            # Dynamic weights: w = min + (max - min) * confidence^k
-            # k_xgb and k_lstm can be tuned independently (fallback to shared
-            # dynamic_k, then 4.5 default).
+            # Confidence-scaled weights (Formula C)
             shared_k = self._get_ensemble_param(asset, model_label, "dynamic_k", 4.5)
             k_xgb = self._get_ensemble_param(asset, model_label, "dynamic_k_xgb", shared_k)
             k_lstm = self._get_ensemble_param(asset, model_label, "dynamic_k_lstm", shared_k)
             xgb_conf = abs(ml_p - 0.5) * 2.0
-            xgb_max_w = self._get_ensemble_param(asset, model_label, "xgb_max_w", 0.60)
-            dyn_xgb_w = xgb_min_w + (xgb_max_w - xgb_min_w) * (xgb_conf ** k_xgb)
+            xgb_w_raw = xgb_conf ** k_xgb
 
             if lstm_p is not None:
                 lstm_conf = abs(lstm_p - 0.5) * 2.0
-                lstm_min_w = self._get_ensemble_param(asset, model_label, "lstm_min_w", 0.10)
-                lstm_max_w = self._get_ensemble_param(asset, model_label, "lstm_max_w", 0.40)
-                dyn_lstm_w = lstm_min_w + (lstm_max_w - lstm_min_w) * (lstm_conf ** k_lstm)
-                dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w - dyn_lstm_w)
-                ensemble_p = dyn_xgb_w * ml_p + dyn_lstm_w * lstm_p + dyn_fusion_w * fusion_p
+                lstm_w_raw = lstm_conf ** k_lstm
+                total_w = xgb_w_raw + lstm_w_raw
+                if total_w < 1e-9:
+                    ensemble_p = 0.5  # both models neutral
+                    dyn_xgb_w = 0.0
+                    dyn_lstm_w = 0.0
+                else:
+                    ensemble_p = (xgb_w_raw * ml_p + lstm_w_raw * lstm_p) / total_w
+                    dyn_xgb_w = xgb_w_raw / total_w
+                    dyn_lstm_w = lstm_w_raw / total_w
+                dyn_fusion_w = 0.0
             else:
+                # No LSTM: pass XGB through
+                ensemble_p = ml_p
+                dyn_xgb_w = 1.0
                 dyn_lstm_w = 0.0
-                dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w)
-                ensemble_p = dyn_xgb_w * ml_p + dyn_fusion_w * fusion_p
+                dyn_fusion_w = 0.0
 
             # Decision
             if ensemble_p >= ens_threshold:
@@ -2444,16 +2552,22 @@ class KalshiMultiAssetStrategy:
     # -- trade CSV logging -----------------------------------------------------
 
     def _ensure_trade_log(self):
-        """Create the dry CSV file with headers if it doesn't exist."""
-        if self.TRADE_LOG_PATH.exists():
+        """Create the dry CSV file with headers if missing or empty.
+
+        A 0-byte file (post state-wipe) still returns True from .exists() but
+        has no header — if we skip writing the header, subsequent settlement
+        passes eat the first trade row via `next(reader)` and never update it,
+        leaving a stale drift marker in the manager.
+        """
+        if self.TRADE_LOG_PATH.exists() and self.TRADE_LOG_PATH.stat().st_size > 0:
             return
         self.TRADE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(self.TRADE_LOG_PATH, "w", newline="") as f:
             csv.writer(f).writerow(self.TRADE_LOG_FIELDS)
 
     def _ensure_trade_log_live(self):
-        """Create the live CSV file with headers if it doesn't exist."""
-        if self.TRADE_LOG_LIVE_PATH.exists():
+        """Create the live CSV file with headers if missing or empty."""
+        if self.TRADE_LOG_LIVE_PATH.exists() and self.TRADE_LOG_LIVE_PATH.stat().st_size > 0:
             return
         self.TRADE_LOG_LIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(self.TRADE_LOG_LIVE_PATH, "w", newline="") as f:
@@ -2644,9 +2758,14 @@ class KalshiMultiAssetStrategy:
     # -- balance CSV logging ---------------------------------------------------
 
     def _ensure_balance_log(self, live: bool = False):
-        """Create the balance CSV with headers if it doesn't exist."""
+        """Create the balance CSV with headers if missing or empty.
+
+        A 0-byte file (post state-wipe) still returns True from .exists() but
+        has no header — downstream readers that assume a header row would
+        lose the first data row.
+        """
         path = self.BALANCE_LOG_LIVE_PATH if live else self.BALANCE_LOG_PATH
-        if path.exists():
+        if path.exists() and path.stat().st_size > 0:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="") as f:
@@ -2782,9 +2901,26 @@ class KalshiMultiAssetStrategy:
     # -- settlement polling ----------------------------------------------------
 
     async def _settlement_loop(self):
-        """Poll outcomes for pending trades after their windows close."""
+        """Poll outcomes for pending trades after their windows close.
+
+        Also prunes each asset's TickWindowSlicer of ticks older than 30min so
+        memory stays bounded during long-running sessions. The 30min horizon
+        covers LSTM's 180s window and XGB's 900s velocity lookback with plenty
+        of margin for clock skew.
+        """
+        prune_horizon = timedelta(seconds=1800)
         while self._running:
             try:
+                # Prune old ticks from slicers
+                prune_cutoff = datetime.now(timezone.utc) - prune_horizon
+                for state in self.states.values():
+                    try:
+                        state.slicer.prune_before(prune_cutoff)
+                    except Exception:
+                        logger.exception(
+                            "[settlement-loop] Slicer prune failed for %s", state.asset,
+                        )
+
                 for state in self.states.values():
                     settled = []
                     for trade in state.pending_settlements:

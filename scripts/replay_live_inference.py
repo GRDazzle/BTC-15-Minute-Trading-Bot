@@ -36,7 +36,6 @@ Limitations:
   - No hedge-on-flip; one trade per window (live keeps re-evaluating).
 """
 import argparse
-import bisect
 import csv
 import json
 import sys
@@ -57,6 +56,7 @@ _loguru_logger.add(sys.stderr, level="WARNING")
 
 from core.strategy_brain.signal_processors.ml_processor import MLProcessor
 from core.strategy_brain.signal_processors.lstm_processor import LSTMProcessor
+from core.tick_window_slicer import TickWindowSlicer
 from ml.kalshi_features import KalshiPollIndex, window_start_to_event_ticker
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "trading.json"
@@ -69,11 +69,12 @@ OUTPUT_CSV = PROJECT_ROOT / "output" / "replay_trades.csv"
 KALSHI_FEE_CENTS = 2  # matches execution adapter
 
 
-def _load_config(asset: str) -> dict:
+def _load_config(asset: str, config_key: str = "ensemble") -> dict:
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     a = cfg["assets"][asset]
-    ens = a["ensemble"]
+    # Fall back to "ensemble" if the requested key doesn't exist
+    ens = a.get(config_key) or a.get("ensemble", {})
     return {
         "ml_weight": ens["ml_weight"],
         "threshold": ens["threshold"],
@@ -128,14 +129,6 @@ def _load_aggtrades(base_dir: Path, asset: str, quote: str, date: datetime.date)
     return out
 
 
-def _merge_sorted(*streams: list[list[dict]]) -> list[dict]:
-    merged = []
-    for s in streams:
-        merged.extend(s)
-    merged.sort(key=lambda t: t["ts"])
-    return merged
-
-
 def _iter_windows(start_utc: datetime, end_utc: datetime):
     """Yield 15-min (window_start, window_end) UTC pairs covering the range.
     Aligned to :00 :15 :30 :45."""
@@ -147,23 +140,34 @@ def _iter_windows(start_utc: datetime, end_utc: datetime):
 
 
 def _v9_blend(ml_p: float, lstm_p: float | None, fusion_p: float, cfg: dict):
-    """Replicates strategies/kalshi_strategy.py v9 dynamic blend."""
-    xgb_min_w = cfg["ml_weight"]
-    xgb_max_w = cfg["xgb_max_w"]
-    k_xgb = cfg["dynamic_k_xgb"]
-    k_lstm = cfg["dynamic_k_lstm"]
+    """2-way XGB+LSTM blend; each model weighted by its own confidence^k.
+
+    Formula (matches pnl_sweep's sweep_combo_pnl):
+      xgb_conf  = |ml_p - 0.5| * 2
+      lstm_conf = |lstm_p - 0.5| * 2
+      xgb_w_raw  = xgb_conf ^ k_xgb
+      lstm_w_raw = lstm_conf ^ k_lstm
+      ensemble_p = (xgb_w_raw * ml_p + lstm_w_raw * lstm_p) / (xgb_w_raw + lstm_w_raw)
+
+    Whichever model is more confident gets more say. No ml_weight, no fusion.
+    fusion_p is kept in the signature for legacy log columns but not used.
+    """
+    k_xgb = cfg.get("dynamic_k_xgb", 4.5)
+    k_lstm = cfg.get("dynamic_k_lstm", 4.5)
     xgb_conf = abs(ml_p - 0.5) * 2.0
-    dyn_xgb_w = xgb_min_w + (xgb_max_w - xgb_min_w) * (xgb_conf ** k_xgb)
-    if lstm_p is not None:
-        lstm_conf = abs(lstm_p - 0.5) * 2.0
-        dyn_lstm_w = cfg["lstm_min_w"] + (cfg["lstm_max_w"] - cfg["lstm_min_w"]) * (lstm_conf ** k_lstm)
-        dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w - dyn_lstm_w)
-        ensemble_p = dyn_xgb_w * ml_p + dyn_lstm_w * lstm_p + dyn_fusion_w * fusion_p
-    else:
-        dyn_lstm_w = 0.0
-        dyn_fusion_w = max(0.0, 1.0 - dyn_xgb_w)
-        ensemble_p = dyn_xgb_w * ml_p + dyn_fusion_w * fusion_p
-    return ensemble_p, dyn_xgb_w, dyn_lstm_w, dyn_fusion_w
+    if lstm_p is None:
+        return ml_p, 1.0, 0.0, 0.0  # no LSTM: pass XGB through
+    lstm_conf = abs(lstm_p - 0.5) * 2.0
+    xgb_w_raw = xgb_conf ** k_xgb
+    lstm_w_raw = lstm_conf ** k_lstm
+    total_w = xgb_w_raw + lstm_w_raw
+    if total_w < 1e-9:
+        return 0.5, 0.0, 0.0, 0.0  # both uncertain
+    ensemble_p = (xgb_w_raw * ml_p + lstm_w_raw * lstm_p) / total_w
+    # Normalize for logging: report each model's share of total weight
+    xgb_share = xgb_w_raw / total_w
+    lstm_share = lstm_w_raw / total_w
+    return ensemble_p, xgb_share, lstm_share, 0.0
 
 
 def _series_from_asset(asset: str) -> str:
@@ -227,10 +231,13 @@ def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
             current += timedelta(days=1)
             continue
 
-        merged = _merge_sorted(cb_ticks, kr_ticks)
-        merged_ts = [t["ts"] for t in merged]
-        kr_only = sorted(kr_ticks, key=lambda t: t["ts"])
-        kr_ts = [t["ts"] for t in kr_only]
+        # Authoritative tick primitive — same one live/sweep/training will use.
+        # Keeps semantics structurally aligned instead of via parallel code paths.
+        slicer = TickWindowSlicer()
+        if cb_ticks:
+            slicer.extend("coinbase", sorted(cb_ticks, key=lambda t: t["ts"]))
+        if kr_ticks:
+            slicer.extend("kraken", sorted(kr_ticks, key=lambda t: t["ts"]))
 
         day_start = datetime.combine(current, time(0, 0), tzinfo=timezone.utc)
         day_end = day_start + timedelta(days=1)
@@ -244,21 +251,17 @@ def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
 
             n_windows += 1
 
-            # Skip windows that have no ticks around them
-            if not merged:
-                continue
-            if window_end < merged[0]["ts"] or window_start > merged[-1]["ts"]:
-                continue
-
             # Event ticker uses window close_time (= window_end)
             event_ticker = window_start_to_event_ticker(asset, window_end)
             outcome = poll_idx.get_outcome(event_ticker)
 
-            # Window open price: first tick at/after window_start
-            wop_idx = bisect.bisect_left(merged_ts, window_start)
-            if wop_idx >= len(merged):
+            # Window open price: first tick at/after window_start across sources.
+            wop_tick = slicer.get_first_at_or_after(
+                window_start, sources=("coinbase", "kraken"),
+            )
+            if wop_tick is None or wop_tick["ts"] >= window_end:
                 continue
-            window_open_price = merged[wop_idx]["price"]
+            window_open_price = wop_tick["price"]
 
             decision_start = window_start + timedelta(minutes=5)
             # Walk decision zone in 2s steps
@@ -277,22 +280,19 @@ def replay_asset(asset: str, from_date: datetime.date, to_date: datetime.date,
                     check_ts += timedelta(seconds=2)
                     continue
 
-                # Slice last 900s of merged ticks
-                cutoff = check_ts - timedelta(seconds=900)
-                lo = bisect.bisect_left(merged_ts, cutoff)
-                hi = bisect.bisect_right(merged_ts, check_ts)
-                if hi - lo < 20:
-                    check_ts += timedelta(seconds=2)
-                    continue
-                tick_buffer = merged[lo:hi]
-                if not tick_buffer:
+                # Merged CB+KR buffer for the last 900s — matches live's
+                # metadata["raw_tick_buffer"] construction at kalshi_strategy.py:2005.
+                tick_buffer = slicer.get_merged_window(
+                    check_ts, 900, sources=("coinbase", "kraken"),
+                )
+                if len(tick_buffer) < 20:
                     check_ts += timedelta(seconds=2)
                     continue
 
-                # Kraken-only slice
-                kr_lo = bisect.bisect_left(kr_ts, cutoff)
-                kr_hi = bisect.bisect_right(kr_ts, check_ts)
-                kraken_tick_buffer = kr_only[kr_lo:kr_hi]
+                # Kraken-only view for cross-exchange features.
+                kraken_tick_buffer = slicer.get_merged_window(
+                    check_ts, 900, sources=("kraken",),
+                )
 
                 current_price = tick_buffer[-1]["price"]
                 price_history = [t["price"] for t in tick_buffer]
@@ -460,9 +460,31 @@ def main():
                     help="Load a staging XGB model (e.g. _align2s -> BTC_align2s_xgb.json)")
     ap.add_argument("--lstm-suffix", default="",
                     help="Load a staging LSTM model (same pattern)")
+    ap.add_argument("--config-key", default="ensemble",
+                    help="Which config key to read (e.g. ensemble_align2s). "
+                         "Default 'ensemble' reads production config.")
+    ap.add_argument("--override-ml-weight", type=float, default=None)
+    ap.add_argument("--override-threshold", type=float, default=None)
+    ap.add_argument("--override-max-price", type=int, default=None)
+    ap.add_argument("--override-min-dm", type=int, default=None)
+    ap.add_argument("--override-k-xgb", type=float, default=None)
+    ap.add_argument("--override-k-lstm", type=float, default=None)
+    ap.add_argument("--override-xgb-max-w", type=float, default=None)
+    ap.add_argument("--override-lstm-min-w", type=float, default=None)
+    ap.add_argument("--override-lstm-max-w", type=float, default=None)
     args = ap.parse_args()
 
+    # Parse after_ts / before_ts FIRST so they apply in all modes
     after_ts = before_ts = None
+    if args.after_ts:
+        after_ts = datetime.fromisoformat(args.after_ts)
+        if after_ts.tzinfo is None:
+            after_ts = after_ts.replace(tzinfo=timezone.utc)
+    if args.before_ts:
+        before_ts = datetime.fromisoformat(args.before_ts)
+        if before_ts.tzinfo is None:
+            before_ts = before_ts.replace(tzinfo=timezone.utc)
+
     if args.hours_ago is not None:
         now = datetime.now(timezone.utc)
         after_ts = now - timedelta(hours=args.hours_ago)
@@ -472,12 +494,6 @@ def main():
     elif args.date:
         d = datetime.strptime(args.date, "%Y-%m-%d").date()
         from_date = to_date = d
-        if args.after_ts:
-            after_ts = datetime.fromisoformat(args.after_ts).replace(tzinfo=timezone.utc) \
-                if "+" not in args.after_ts else datetime.fromisoformat(args.after_ts)
-        if args.before_ts:
-            before_ts = datetime.fromisoformat(args.before_ts).replace(tzinfo=timezone.utc) \
-                if "+" not in args.before_ts else datetime.fromisoformat(args.before_ts)
     else:
         if not args.from_date or not args.to_date:
             ap.error("Specify --hours-ago, --date, or both --from and --to")
@@ -502,10 +518,28 @@ def main():
         summaries = []
         for asset in assets:
             try:
-                cfg = _load_config(asset)
+                cfg = _load_config(asset, config_key=args.config_key)
             except KeyError:
                 print(f"No config for {asset}, skipping")
                 continue
+            # Apply CLI overrides so we can sweep params without editing config
+            overrides = {
+                "ml_weight": args.override_ml_weight,
+                "threshold": args.override_threshold,
+                "max_price_cents": args.override_max_price,
+                "min_dm": args.override_min_dm,
+                "dynamic_k_xgb": args.override_k_xgb,
+                "dynamic_k_lstm": args.override_k_lstm,
+                "xgb_max_w": args.override_xgb_max_w,
+                "lstm_min_w": args.override_lstm_min_w,
+                "lstm_max_w": args.override_lstm_max_w,
+            }
+            for k, v in overrides.items():
+                if v is not None:
+                    cfg[k] = v
+            if any(v is not None for v in overrides.values()):
+                ov = {k: v for k, v in overrides.items() if v is not None}
+                print(f"  config overrides for {asset}: {ov}")
             s = replay_asset(asset, from_date, to_date, cfg, writer,
                              balance=args.balance,
                              after_ts=after_ts, before_ts=before_ts,
