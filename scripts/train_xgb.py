@@ -58,8 +58,16 @@ def load_feature_list(asset: str) -> list[str]:
     return list(FEATURE_NAMES)
 
 
-def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None, exclude_hours: list[int] | None = None, data_suffix: str = "") -> pd.DataFrame:
-    """Load training data CSV for an asset."""
+def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None,
+              exclude_hours: list[int] | None = None, data_suffix: str = "",
+              exclude_from_date: str | None = None,
+              exclude_to_date: str | None = None) -> pd.DataFrame:
+    """Load training data CSV for an asset.
+
+    Optional `exclude_from_date` / `exclude_to_date` (YYYY-MM-DD) drops any
+    rows whose `window_start` falls inside [from, to] inclusive — used for
+    walk-forward training where a specific fold must be held out.
+    """
     path = DATA_DIR / f"{asset.upper()}_features{data_suffix}.csv"
     if not path.exists():
         raise FileNotFoundError(
@@ -68,6 +76,21 @@ def load_data(asset: str, min_dm: int = 0, max_dm: int | None = None, exclude_ho
         )
     df = pd.read_csv(path)
     print(f"Loaded {len(df)} rows from {path}")
+
+    # Walk-forward fold exclusion: drop rows whose window_END (close_time,
+    # = window_start + 15 min) is inside [exclude_from_date, exclude_to_date].
+    # We filter on close, not start, because pnl_sweep.py filters kalshi_windows
+    # by close_time — labels "belong to" the close date (Kalshi settles there).
+    # Aligning both on close prevents the 23:45->00:00 boundary window from
+    # landing in fold-N for training but fold-N+1 for sweep (and vice versa).
+    if exclude_from_date or exclude_to_date:
+        before = len(df)
+        ts_end = pd.to_datetime(df["window_start"], utc=True) + pd.Timedelta(minutes=15)
+        lo = pd.Timestamp(exclude_from_date, tz="UTC") if exclude_from_date else pd.Timestamp.min.tz_localize("UTC")
+        hi = pd.Timestamp(exclude_to_date, tz="UTC") + pd.Timedelta(days=1) if exclude_to_date else pd.Timestamp.max.tz_localize("UTC")
+        mask = (ts_end >= lo) & (ts_end < hi)
+        df = df[~mask].reset_index(drop=True)
+        print(f"Excluded [{exclude_from_date}..{exclude_to_date}] by close_time: {before} -> {len(df)} rows")
 
     # Filter out noisy early decision minutes
     if min_dm > 0:
@@ -394,21 +417,30 @@ def train_asset(
     exclude_hours: list[int] | None = None,
     model_suffix: str = "",
     data_suffix: str = "",
+    exclude_from_date: str | None = None,
+    exclude_to_date: str | None = None,
 ) -> None:
     """Full training pipeline for one asset."""
     global FEATURE_NAMES  # Override with per-asset trimmed list if available
 
     dm_range = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
     suffix_label = f" (suffix='{model_suffix}')" if model_suffix else ""
+    excl_label = ""
+    if exclude_from_date or exclude_to_date:
+        excl_label = f" [excl {exclude_from_date}..{exclude_to_date}]"
     print(f"\n{'='*60}")
-    print(f"Training XGBoost for {asset} [{dm_range}]{suffix_label}")
+    print(f"Training XGBoost for {asset} [{dm_range}]{suffix_label}{excl_label}")
     print(f"{'='*60}")
 
     # Load per-asset trimmed feature list (falls back to full FEATURE_NAMES)
     asset_features = load_feature_list(asset)
     FEATURE_NAMES = asset_features  # Override global for this training run
 
-    df = load_data(asset, min_dm=min_dm, max_dm=max_dm, exclude_hours=exclude_hours, data_suffix=data_suffix)
+    df = load_data(
+        asset, min_dm=min_dm, max_dm=max_dm,
+        exclude_hours=exclude_hours, data_suffix=data_suffix,
+        exclude_from_date=exclude_from_date, exclude_to_date=exclude_to_date,
+    )
 
     # Optional window deduplication
     if dedup != "none":
@@ -471,6 +503,16 @@ def main():
         "--data-suffix", type=str, default="",
         help="Suffix for training data file (e.g. '_weekday' -> BTC_features_weekday.csv)",
     )
+    parser.add_argument(
+        "--exclude-from-date", type=str, default=None,
+        help="YYYY-MM-DD: drop rows whose window CLOSE falls on/after this date "
+             "(walk-forward). Filters by close_time to match pnl_sweep.py.",
+    )
+    parser.add_argument(
+        "--exclude-to-date", type=str, default=None,
+        help="YYYY-MM-DD: drop rows whose window CLOSE falls on/before this date "
+             "(inclusive). Filters by close_time to match pnl_sweep.py.",
+    )
     args = parser.parse_args()
 
     # Parse exclude hours
@@ -489,6 +531,8 @@ def main():
             exclude_hours=exclude_hours,
             model_suffix=args.model_suffix,
             data_suffix=args.data_suffix,
+            exclude_from_date=args.exclude_from_date,
+            exclude_to_date=args.exclude_to_date,
         )
 
 

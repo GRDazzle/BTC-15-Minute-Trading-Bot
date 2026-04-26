@@ -45,26 +45,89 @@ def train_asset(
     hidden_size: int = 64,
     num_layers: int = 2,
     dropout: float = 0.3,
+    exclude_from_date: str | None = None,
+    exclude_to_date: str | None = None,
 ) -> None:
     """Train LSTM for one asset."""
-    data_path = DATA_DIR / f"{asset.upper()}_lstm_sequences{data_suffix}.npz"
-    if not data_path.exists():
-        print(f"No LSTM training data for {asset}. Run generate_lstm_training_data.py first.")
+    # Two accepted formats:
+    #   (1) New split format: {ASSET}_lstm_X{suffix}.npy  +  {ASSET}_lstm_meta{suffix}.npz
+    #       — X is written via memmap-backed streaming at regen time to avoid
+    #         OOM on large assets (1M+ sequences).
+    #   (2) Legacy single npz: {ASSET}_lstm_sequences{suffix}.npz
+    #       — kept for backward compat with old regen outputs.
+    split_X = DATA_DIR / f"{asset.upper()}_lstm_X{data_suffix}.npy"
+    split_meta = DATA_DIR / f"{asset.upper()}_lstm_meta{data_suffix}.npz"
+    legacy_npz = DATA_DIR / f"{asset.upper()}_lstm_sequences{data_suffix}.npz"
+
+    if split_X.exists() and split_meta.exists():
+        data_path = split_X  # for logging
+        # np.load() without mmap_mode reads the file fully into a new writable
+        # ndarray — no need to .copy(). Saves an extra 19 GB temp for BTC-scale X.
+        X = np.load(split_X)
+        meta = np.load(split_meta, allow_pickle=True)
+        y = meta["y"].copy()
+        window_starts = meta["window_starts"].copy()
+        dms = meta["dms"].copy()
+        meta.close()
+    elif legacy_npz.exists():
+        data_path = legacy_npz
+        data = np.load(legacy_npz, allow_pickle=True)
+        X = data["X"].copy()  # Copy to own memory (avoid mmap issues on Windows)
+        y = data["y"].copy()
+        window_starts = data["window_starts"].copy()
+        dms = data["dms"].copy()
+        data.close()  # Release the npz file handle
+    else:
+        print(f"No LSTM training data for {asset}. Run generate_aligned_training_data.py first.")
         return
 
-    data = np.load(data_path, allow_pickle=True)
-    X = data["X"].copy()  # Copy to own memory (avoid mmap issues on Windows)
-    y = data["y"].copy()
-    window_starts = data["window_starts"].copy()
-    dms = data["dms"].copy()
-    data.close()  # Release the npz file handle
-
     dm_label = f"dm {min_dm}-{max_dm}" if max_dm is not None else f"dm {min_dm}+"
+    excl_label = ""
+    if exclude_from_date or exclude_to_date:
+        excl_label = f" [excl {exclude_from_date}..{exclude_to_date}]"
 
     print(f"\n{'='*60}")
-    print(f"Training LSTM v4 for {asset} [{dm_label}]")
+    print(f"Training LSTM v4 for {asset} [{dm_label}]{excl_label}")
     print(f"{'='*60}")
     print(f"Loaded {len(y)} sequences from {data_path}")
+
+    # Walk-forward fold exclusion — drop sequences whose window CLOSE
+    # (= window_start + 15 min) is inside [exclude_from_date, exclude_to_date].
+    # Filter by close, not start, to match pnl_sweep.py (labels belong to close
+    # date — Kalshi settles there). Prevents boundary-window leakage.
+    if exclude_from_date or exclude_to_date:
+        from datetime import datetime, timedelta, timezone
+        def _parse(s):
+            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc) if s else None
+        lo = _parse(exclude_from_date) if exclude_from_date else None
+        hi = None
+        if exclude_to_date:
+            hi_dt = _parse(exclude_to_date)
+            # Inclusive end: next day midnight
+            hi = hi_dt + timedelta(days=1)
+
+        def _in_excluded(ws_str: str) -> bool:
+            try:
+                ws = datetime.fromisoformat(ws_str)
+                if ws.tzinfo is None:
+                    ws = ws.replace(tzinfo=timezone.utc)
+            except Exception:
+                return False
+            we = ws + timedelta(minutes=15)  # window close_time
+            if lo is not None and we < lo:
+                return False
+            if hi is not None and we >= hi:
+                return False
+            return True
+
+        before = len(y)
+        excl_mask = np.array([_in_excluded(str(w)) for w in window_starts])
+        keep = ~excl_mask
+        X = X[keep]
+        y = y[keep]
+        window_starts = window_starts[keep]
+        dms = dms[keep]
+        print(f"Excluded [{exclude_from_date}..{exclude_to_date}] by close_time: {before} -> {len(y)} sequences")
 
     # Filter by dm range
     mask = dms >= min_dm
@@ -94,6 +157,13 @@ def train_asset(
     X_train, y_train = X[train_mask], y[train_mask]
     X_val, y_val = X[val_mask], y[val_mask]
     X_test, y_test = X[test_mask], y[test_mask]
+    # Cache shape before freeing X — used later for input_size + model metadata.
+    seq_len_actual = X.shape[1]
+    n_features = X.shape[2]
+    # Memory-critical: for large assets (BTC/ETH ~1.25M seqs × 180 × 21 × 4 =
+    # ~19 GB), keeping X alive alongside the 3 split arrays doubles peak RAM.
+    # X is no longer needed — split copies are independent — so free it now.
+    del X
 
     bullish = int(y.sum())
     bearish = len(y) - bullish
@@ -104,20 +174,24 @@ def train_asset(
           f"test={len(X_test)} ({len(test_windows)} win)")
 
     # StandardScaler normalization — fit on train only
-    n_features = X.shape[2]
     X_train_flat = X_train.reshape(-1, n_features)
     scaler_mean = X_train_flat.mean(axis=0).astype(np.float32)
     scaler_std = X_train_flat.std(axis=0).astype(np.float32)
     scaler_std[scaler_std == 0] = 1.0  # avoid div by zero
 
-    X_train = (X_train - scaler_mean) / scaler_std
-    X_val = (X_val - scaler_mean) / scaler_std
-    X_test = (X_test - scaler_mean) / scaler_std
+    # In-place scaling + nan_to_num so we don't materialize intermediate arrays
+    # (each would be another 13/3/3 GB for BTC's ~1.25M sequence train split).
+    X_train -= scaler_mean
+    X_train /= scaler_std
+    X_val -= scaler_mean
+    X_val /= scaler_std
+    X_test -= scaler_mean
+    X_test /= scaler_std
 
-    # Replace any NaN/inf from normalization
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=1e6, neginf=-1e6)
-    X_val = np.nan_to_num(X_val, nan=0.0, posinf=1e6, neginf=-1e6)
-    X_test = np.nan_to_num(X_test, nan=0.0, posinf=1e6, neginf=-1e6)
+    # nan_to_num in-place via copy=False
+    np.nan_to_num(X_train, copy=False, nan=0.0, posinf=1e6, neginf=-1e6)
+    np.nan_to_num(X_val, copy=False, nan=0.0, posinf=1e6, neginf=-1e6)
+    np.nan_to_num(X_test, copy=False, nan=0.0, posinf=1e6, neginf=-1e6)
 
     print(f"Normalized features (scaler fitted on {len(X_train_flat)} train samples)")
 
@@ -138,7 +212,7 @@ def train_asset(
     val_loader = DataLoader(val_ds, batch_size=batch_size)
 
     # Model
-    input_size = X.shape[2]
+    input_size = n_features
     model = PriceLSTM(
         input_size=input_size,
         hidden_size=hidden_size,
@@ -308,19 +382,24 @@ def train_asset(
         "train_samples": len(X_train),
         "val_samples": len(X_val),
         "test_samples": len(X_test),
-        "seq_len": X.shape[1],
-        "num_features": X.shape[2],
+        "seq_len": seq_len_actual,
+        "num_features": n_features,
         "scaler_mean": scaler_mean.tolist(),
         "scaler_std": scaler_std.tolist(),
     })
     print(f"\nModel saved: {model_path}")
+    sys_mod = __import__("sys")
+    sys_mod.stdout.flush()
+    sys_mod.stderr.flush()
 
-    # Free GPU/CPU memory
-    del model
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Force immediate process exit AFTER the model save. PyTorch's CUDA
+    # tensor destructors (running during `del model`, normal Python GC, or
+    # interpreter shutdown) crash the C runtime on Windows with
+    # STATUS_STACK_BUFFER_OVERRUN (0xC0000409 = exit code 3221226505) even
+    # AFTER the model file is on disk. os._exit(0) skips ALL Python shutdown
+    # paths so the destructors never run. Model save is the only thing that
+    # mattered — the orchestrator wants exit 0 to mean "model file exists".
+    __import__("os")._exit(0)
 
 
 def main():
@@ -336,6 +415,12 @@ def main():
     parser.add_argument("--num-layers", type=int, default=2, help="LSTM layers")
     parser.add_argument("--data-suffix", type=str, default="",
                         help="Suffix for training data file (e.g. '_weekday')")
+    parser.add_argument("--exclude-from-date", type=str, default=None,
+                        help="YYYY-MM-DD: drop sequences whose window CLOSE is on/after this "
+                             "date. Filters by close_time to match pnl_sweep.py.")
+    parser.add_argument("--exclude-to-date", type=str, default=None,
+                        help="YYYY-MM-DD: drop sequences whose window CLOSE is on/before this "
+                             "date (inclusive). Filters by close_time to match pnl_sweep.py.")
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.asset.split(",")]
@@ -351,7 +436,19 @@ def main():
             lr=args.lr,
             hidden_size=args.hidden_size,
             num_layers=args.num_layers,
+            exclude_from_date=args.exclude_from_date,
+            exclude_to_date=args.exclude_to_date,
         )
+
+    # Bypass Python's normal shutdown — PyTorch + CUDA finalization on Windows
+    # crashes with STATUS_STACK_BUFFER_OVERRUN (0xC0000409 / exit 3221226505)
+    # AFTER all models are saved. os._exit(0) skips atexit handlers and the
+    # C-level CUDA destructors that trigger the crash. Model files are on
+    # disk before this point — process exit is just paperwork.
+    import os, sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
